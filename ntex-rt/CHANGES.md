@@ -1,14 +1,52 @@
 # Changes
 
+## [3.14.0] - 2026-05-11
+
+* Add System::get_value() API for system-wide storage access.
+
+## [3.13.1] - 2026-05-09
+
+* Add remove_all_items() helper, removes all arbiter's items
+
+## [3.13.0] - 2026-05-08
+
+* Add with_item() helper method
+
+## [3.12.1] - 2026-04-02
+
+* Update to ntex-error 2.0
+
+## [3.12.0] - 2026-03-21
+
+* Changes `ThreadPool::execute` behavior to not err on an exhausted threadpool
+
+## [3.11.0] - 2026-03-21
+
+* Expose `ThreadPool` type as part of the public api
+
+## [3.10.0] - 2026-03-07
+
+* Set start backtrace code line for ntex-error
+
+## [3.9.0] - 2026-03-02
+
+* Make task callbacks process wide
+
+## [3.8.0] - 2026-02-16
+
+* Export `get_item()` and `set_item()` methods
+
+* Deprecate Arbiter's spawn related helpers
+
+## [3.7.1] - 2026-02-13
+
+* Export JoinHandle for neon runtime
+
 ## [3.7.0] - 2026-02-04
 
 * Unify JoinHandle for all runtimes
 
 ## [3.6.0] - 2026-02-02
-
-* Update compio to 0.18
-
-## [3.5.0] - 2026-02-01
 
 * Update compio to 0.18
 

@@ -213,7 +213,6 @@ async fn test_slow_request2() {
     let mut data = vec![0; 1024];
     let _ = stream.read(&mut data);
     assert_eq!(&data[..17], b"HTTP/1.1 200 OK\r\n");
-
     let _ = stream.write_all(DATA);
     let mut data = String::new();
     let _ = stream.read_to_string(&mut data);
@@ -269,8 +268,11 @@ async fn test_http1_keepalive_timeout() {
     sleep(Millis(1100)).await;
 
     let mut data = vec![0; 1024];
-    let res = stream.read(&mut data).unwrap();
-    assert_eq!(res, 0);
+    let _ = stream.read(&mut data).unwrap();
+    assert_eq!(
+        &data[..49],
+        b"HTTP/1.1 408 Request Timeout\r\ncontent-length: 0\r\n"
+    );
 }
 
 /// Keep-alive must occure only while waiting complete request
@@ -318,8 +320,11 @@ async fn test_http1_keepalive_close() {
     assert_eq!(&data[..17], b"HTTP/1.1 200 OK\r\n");
 
     let mut data = vec![0; 1024];
-    let res = stream.read(&mut data).unwrap();
-    assert_eq!(res, 0);
+    let _ = stream.read(&mut data).unwrap();
+    assert_eq!(
+        &data[..49],
+        b"HTTP/1.1 408 Request Timeout\r\ncontent-length: 0\r\n"
+    );
 }
 
 #[ntex::test]
@@ -336,8 +341,11 @@ async fn test_http10_keepalive_default_close() {
     assert_eq!(&data[..17], b"HTTP/1.0 200 OK\r\n");
 
     let mut data = vec![0; 1024];
-    let res = stream.read(&mut data).unwrap();
-    assert_eq!(res, 0);
+    let _ = stream.read(&mut data).unwrap();
+    assert_eq!(
+        &data[..49],
+        b"HTTP/1.0 408 Request Timeout\r\ncontent-length: 0\r\n"
+    );
 }
 
 #[ntex::test]
@@ -361,8 +369,11 @@ async fn test_http10_keepalive() {
     assert_eq!(&data[..17], b"HTTP/1.0 200 OK\r\n");
 
     let mut data = vec![0; 1024];
-    let res = stream.read(&mut data).unwrap();
-    assert_eq!(res, 0);
+    let _ = stream.read(&mut data).unwrap();
+    assert_eq!(
+        &data[..49],
+        b"HTTP/1.0 408 Request Timeout\r\ncontent-length: 0\r\n"
+    );
 }
 
 #[ntex::test]
@@ -381,8 +392,11 @@ async fn test_http1_keepalive_disabled() {
     assert_eq!(&data[..17], b"HTTP/1.1 200 OK\r\n");
 
     let mut data = vec![0; 1024];
-    let res = stream.read(&mut data).unwrap();
-    assert_eq!(res, 0);
+    let _ = stream.read(&mut data).unwrap();
+    assert_eq!(
+        &data[..49],
+        b"HTTP/1.1 408 Request Timeout\r\ncontent-length: 0\r\n"
+    );
 }
 
 /// Payload timer should not fire aftre dispatcher has read whole payload
@@ -806,7 +820,7 @@ async fn test_h1_client_drop() -> io::Result<()> {
                 let _st = SetOnDrop(count, tx.lock().unwrap().take());
                 assert!(req.peer_addr().is_some());
                 assert_eq!(req.version(), Version::HTTP_11);
-                sleep(Millis(50000)).await;
+                sleep(Millis(150000)).await;
                 Ok::<_, io::Error>(Response::Ok().finish())
             }
         })

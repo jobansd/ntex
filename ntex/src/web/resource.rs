@@ -45,6 +45,8 @@ type ResourcePipeline<F, Err> =
 ///
 /// If no matching route could be found, *405* response code get returned.
 /// Default behavior could be overriden with `default_resource()` method.
+#[derive(derive_more::Debug)]
+#[debug("Resource({rdef:?})")]
 pub struct Resource<Err: ErrorRenderer, M = Identity, T = Filter<Err>> {
     middleware: M,
     filter: ServiceChainFactory<T, WebRequest<Err>, SharedCfg>,
@@ -361,7 +363,11 @@ where
         }
 
         let state = self.state.take().map(|state| {
-            AppState::new(state, Some(config.state().clone()), config.state().config())
+            AppState::new(
+                state,
+                Some(config.state().clone()),
+                config.state().0.config.clone(),
+            )
         });
 
         let router_factory = ResourceRouterFactory {
@@ -420,6 +426,8 @@ where
 }
 
 /// Resource service
+#[derive(derive_more::Debug)]
+#[debug("ResourceServiceFactory")]
 pub struct ResourceServiceFactory<Err: ErrorRenderer, M, F> {
     middleware: M,
     filter: F,
@@ -446,8 +454,8 @@ where
     type InitError = ();
 
     async fn create(&self, cfg: SharedCfg) -> Result<Self::Service, Self::InitError> {
-        let filter = self.filter.create(cfg).await?;
-        let routing = self.routing.create(cfg).await?;
+        let filter = self.filter.create(cfg.clone()).await?;
+        let routing = self.routing.create(cfg.clone()).await?;
         Ok(self.middleware.create(chain(filter).and_then(routing), cfg))
     }
 }
@@ -480,6 +488,8 @@ impl<Err: ErrorRenderer> ServiceFactory<WebRequest<Err>, SharedCfg>
     }
 }
 
+#[derive(derive_more::Debug)]
+#[debug("ResourceRouter")]
 pub struct ResourceRouter<Err: ErrorRenderer> {
     state: Option<AppState>,
     routes: Vec<RouteService<Err>>,

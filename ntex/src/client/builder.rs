@@ -7,7 +7,7 @@ use crate::http::header::{self, HeaderName, HeaderValue};
 use crate::service::{Identity, Middleware, Service, ServiceFactory, Stack, boxed};
 use crate::{SharedCfg, time::Millis};
 
-use super::error::{ClientBuilderError, SendRequestError};
+use super::error::{ClientBuilderError, ClientError};
 use super::sender::Sender;
 use super::service::{ServiceRequest, ServiceResponse};
 use super::{Client, ClientConfig, Connector, cfg::ClientConfigInner};
@@ -202,11 +202,11 @@ impl<M> ClientBuilder<M> {
     where
         T: Into<SharedCfg>,
         M: Middleware<Sender, ClientConfig>,
-        M::Service: Service<ServiceRequest, Response = ServiceResponse, Error = SendRequestError>
+        M::Service: Service<ServiceRequest, Response = ServiceResponse, Error = ClientError>
             + 'static,
     {
         let cfg = cfg.into();
-        self.config.cfg = cfg;
+        self.config.cfg = cfg.clone();
         let config = ClientConfig::new(self.config);
 
         let svc = self

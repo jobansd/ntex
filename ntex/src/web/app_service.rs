@@ -25,6 +25,8 @@ type FnStateFactory = Box<dyn Fn(Extensions) -> BoxFuture<'static, Result<Extens
 
 /// Service factory to convert `Request` to a `WebRequest<S>`.
 /// It also executes state factories.
+#[derive(derive_more::Debug)]
+#[debug("AppFactory")]
 pub struct AppFactory<T, F, Err: ErrorRenderer>
 where
     F: ServiceFactory<
@@ -76,7 +78,7 @@ where
             )))
         });
 
-        let filter_fut = self.filter.create(cfg);
+        let filter_fut = self.filter.create(cfg.clone());
         let state_factories = self.state_factories.clone();
         let mut extensions = self.extensions.borrow_mut().take().unwrap_or_default();
         let middleware = self.middleware.clone();
@@ -126,7 +128,7 @@ where
         // create http services
         for (path, factory, guards) in &mut services.iter() {
             let service = factory
-                .create(cfg)
+                .create(cfg.clone())
                 .await
                 .map_err(|()| log::error!("Cannot construct app service"))?;
             router.rdef(path.clone(), service).2 = guards.borrow_mut().take();
@@ -136,7 +138,7 @@ where
             router: router.finish(),
             default: Some(
                 default
-                    .create(cfg)
+                    .create(cfg.clone())
                     .await
                     .map_err(|()| log::error!("Cannot construct default service"))?,
             ),
@@ -160,6 +162,8 @@ where
 }
 
 /// Service to convert `Request` to a `WebRequest<Err>`
+#[derive(derive_more::Debug)]
+#[debug("AppFactoryService")]
 pub struct AppFactoryService<T, Err>
 where
     T: Service<WebRequest<Err>, Response = WebResponse, Error = Err::Container>,
@@ -257,6 +261,8 @@ impl<Err: ErrorRenderer> Service<WebRequest<Err>> for AppRouting<Err> {
 }
 
 /// Web app service
+#[derive(derive_more::Debug)]
+#[debug("AppService")]
 pub struct AppService<F, Err: ErrorRenderer> {
     filter: F,
     routing: AppRouting<Err>,

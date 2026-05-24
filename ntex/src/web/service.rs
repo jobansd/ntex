@@ -48,13 +48,13 @@ type HttpServiceFactory<Err: ErrorRenderer> =
     boxed::BoxServiceFactory<SharedCfg, WebRequest<Err>, WebResponse, Err::Container, ()>;
 
 #[derive(Debug, Clone)]
-pub(crate) struct AppState(Rc<AppStateInner>);
+pub(crate) struct AppState(pub(crate) Rc<AppStateInner>);
 
 #[derive(Debug)]
-struct AppStateInner {
+pub(crate) struct AppStateInner {
     ext: Extensions,
     parent: Option<AppState>,
-    config: Cfg<WebAppConfig>,
+    pub(crate) config: Cfg<WebAppConfig>,
 }
 
 impl AppState {
@@ -70,8 +70,12 @@ impl AppState {
         }))
     }
 
-    pub(crate) fn config(&self) -> Cfg<WebAppConfig> {
-        self.0.config
+    pub(crate) fn id(&self) -> usize {
+        self.0.config.id()
+    }
+
+    pub(crate) fn config(&self) -> &WebAppConfig {
+        &self.0.config
     }
 
     pub(crate) fn get<T: 'static>(&self) -> Option<&T> {
@@ -97,6 +101,8 @@ impl AppState {
 }
 
 /// Application service configuration
+#[derive(derive_more::Debug)]
+#[debug("WebServiceConfig")]
 pub struct WebServiceConfig<Err: ErrorRenderer> {
     state: AppState,
     root: bool,
@@ -150,7 +156,7 @@ impl<Err: ErrorRenderer> WebServiceConfig<Err> {
     }
 
     /// Service configuration
-    pub fn config(&self) -> Cfg<WebAppConfig> {
+    pub fn config(&self) -> &WebAppConfig {
         self.state.config()
     }
 

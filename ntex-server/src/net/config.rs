@@ -1,4 +1,4 @@
-use std::{cell::Cell, cell::RefCell, fmt, io, marker, mem, net, rc::Rc};
+use std::{cell::RefCell, fmt, io, marker, mem, net, rc::Rc};
 
 use ntex_io::Io;
 use ntex_service::{IntoServiceFactory, ServiceFactory, cfg::SharedCfg};
@@ -14,13 +14,13 @@ pub struct Config(Rc<InnerServiceConfig>);
 
 #[derive(Debug)]
 pub(super) struct InnerServiceConfig {
-    pub(super) config: Cell<Option<SharedCfg>>,
+    pub(super) config: RefCell<SharedCfg>,
 }
 
 impl Default for Config {
     fn default() -> Self {
         Self(Rc::new(InnerServiceConfig {
-            config: Cell::new(None),
+            config: RefCell::new(SharedCfg::default()),
         }))
     }
 }
@@ -28,12 +28,12 @@ impl Default for Config {
 impl Config {
     /// Set io config for the service.
     pub fn config<T: Into<SharedCfg>>(&self, cfg: T) -> &Self {
-        self.0.config.set(Some(cfg.into()));
+        *self.0.config.borrow_mut() = cfg.into();
         self
     }
 
-    pub(super) fn get_config(&self) -> Option<SharedCfg> {
-        self.0.config.get()
+    pub(super) fn get_config(&self) -> SharedCfg {
+        self.0.config.borrow().clone()
     }
 }
 
@@ -49,7 +49,8 @@ struct Socket {
 
 pub(super) struct ServiceConfigInner {
     token: Token,
-    apply: Option<Box<dyn OnWorkerStart>>,
+    on_start_set: bool,
+    on_start: Vec<Box<dyn OnWorkerStart>>,
     sockets: Vec<Socket>,
     backlog: i32,
 }
@@ -70,10 +71,11 @@ impl ServiceConfig {
             token,
             backlog,
             sockets: Vec::new(),
-            apply: Some(OnWorkerStartWrapper::create(|_| {
+            on_start_set: false,
+            on_start: vec![OnWorkerStartWrapper::create(|_| {
                 not_configured();
                 Ready::Ok::<_, &str>(())
-            })),
+            })],
         })))
     }
 
@@ -131,9 +133,9 @@ impl ServiceConfig {
         let mut inner = self.0.borrow_mut();
         for sock in &mut inner.sockets {
             if sock.name == name.as_ref() {
-                sock.config = cfg;
+                sock.config = cfg.clone();
                 for item in &mut sock.sockets {
-                    item.2 = cfg;
+                    item.2 = cfg.clone();
                 }
             }
         }
@@ -149,7 +151,12 @@ impl ServiceConfig {
         F: AsyncFn(ServiceRuntime) -> Result<(), E> + Send + Clone + 'static,
         E: fmt::Display + 'static,
     {
-        self.0.borrow_mut().apply = Some(OnWorkerStartWrapper::create(f));
+        let mut inner = self.0.borrow_mut();
+        if !inner.on_start_set {
+            inner.on_start.clear();
+            inner.on_start_set = true;
+        }
+        inner.on_start.push(OnWorkerStartWrapper::create(f));
         self
     }
 
@@ -170,7 +177,7 @@ impl ServiceConfig {
                     tokens: s
                         .sockets
                         .iter()
-                        .map(|(token, _, tag)| (*token, *tag))
+                        .map(|(token, _, cfg)| (*token, cfg.clone()))
                         .collect(),
                 },
             );
@@ -187,33 +194,39 @@ impl ServiceConfig {
             sockets,
             Box::new(ConfiguredService {
                 names,
-                rt: inner.apply.take().unwrap(),
+                on_start: mem::take(&mut inner.on_start),
             }),
         )
     }
 }
 
 struct ConfiguredService {
-    rt: Box<dyn OnWorkerStart>,
     names: HashMap<String, Entry>,
+    on_start: Vec<Box<dyn OnWorkerStart>>,
 }
 
 impl FactoryService for ConfiguredService {
     fn clone_factory(&self) -> FactoryServiceType {
         Box::new(Self {
-            rt: self.rt.clone(),
             names: self.names.clone(),
+            on_start: self.on_start.iter().map(|cb| (*cb).clone()).collect(),
         })
     }
 
     fn create(&self) -> BoxFuture<'static, Result<Vec<NetService>, ()>> {
         // configure services
         let rt = ServiceRuntime::new(self.names.clone());
-        let cfg_fut = self.rt.run(ServiceRuntime(rt.0.clone()));
+        let on_start: Vec<_> = self
+            .on_start
+            .iter()
+            .map(|cb| cb.run(ServiceRuntime(rt.0.clone())))
+            .collect();
 
         // construct services
         Box::pin(async move {
-            cfg_fut.await?;
+            for fut in on_start {
+                fut.await?;
+            }
             rt.validate();
 
             let names = mem::take(&mut rt.0.borrow_mut().names);
@@ -225,7 +238,7 @@ impl FactoryService for ConfiguredService {
                     for entry in names.values() {
                         if entry.idx == services.len() {
                             res.push(NetService {
-                                config: entry.config,
+                                config: entry.config.clone(),
                                 name: std::sync::Arc::from(entry.name.clone()),
                                 tokens: entry.tokens.clone(),
                                 factory: svc,

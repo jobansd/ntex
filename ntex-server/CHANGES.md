@@ -1,5 +1,17 @@
 # Changes
 
+## [3.9.0] - 2026-02-17
+
+* Use new ntex-rt api
+
+## [3.8.0] - 2026-02-16
+
+* SharedCfg is not Copy
+
+## [3.7.0] - 2026-02-12
+
+* Allow to set multiple ServiceConfig::on_worker_start() callbacks
+
 ## [3.6.0] - 2026-01-28
 
 * Use system name for workers

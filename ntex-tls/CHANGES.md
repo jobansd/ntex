@@ -1,5 +1,21 @@
 # Changes
 
+## [3.6.2] - 2026-03-22
+
+* Init connect/accept process before adding to filters
+
+## [3.5.2] - 2026-03-12
+
+* Fix openssl filter buffering
+
+## [3.4.0] - 2026-03-08
+
+* Use ntex_error::Error for connect service
+
+## [3.3.0] - 2026-02-16
+
+* SharedCfg is not Copy
+
 ## [3.2.1] - 2026-02-05
 
 * Fix openssl disconnect handling

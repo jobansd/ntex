@@ -12,6 +12,8 @@ use super::response::Response;
 use super::{h1, h2};
 
 /// `ServiceFactory` HTTP1.1/HTTP2 transport implementation
+#[derive(derive_more::Debug)]
+#[debug("HttpService")]
 pub struct HttpService<
     F,
     S,
@@ -248,12 +250,12 @@ where
     async fn create(&self, cfg: SharedCfg) -> Result<Self::Service, Self::InitError> {
         let service = self
             .srv
-            .create(cfg)
+            .create(cfg.clone())
             .await
             .map_err(|e| log::error!("Cannot construct publish service: {e:?}"))?;
         let control = self
             .h1_control
-            .create(cfg)
+            .create(cfg.clone())
             .await
             .map_err(|e| log::error!("Cannot construct control service: {e:?}"))?;
 
@@ -273,6 +275,8 @@ where
 }
 
 /// `Service` implementation for http transport
+#[derive(derive_more::Debug)]
+#[debug("HttpServiceHandler")]
 pub struct HttpServiceHandler<F, S, B, C1, C2> {
     cfg: SharedCfg,
     config: Rc<DispatcherConfig<S, C1>>,
@@ -343,7 +347,7 @@ where
                 let _ = rx.await;
             }
 
-            log::trace!("Shutting down is complected",);
+            log::trace!("Shutting down is complected");
         }
 
         join(
@@ -364,11 +368,15 @@ where
         let result = if io.query::<types::HttpProtocol>().get()
             == Some(types::HttpProtocol::Http2)
         {
-            let control = self.h2_control.create(self.cfg).await.map_err(|e| {
-                DispatchError::Control(crate::util::str_rc_error(format!(
-                    "Cannot construct control service: {e:?}"
-                )))
-            })?;
+            let control = self
+                .h2_control
+                .create(self.cfg.clone())
+                .await
+                .map_err(|e| {
+                    DispatchError::Control(crate::util::str_rc_error(format!(
+                        "Cannot construct control service: {e:?}"
+                    )))
+                })?;
             let inflight = {
                 let mut inflight = self.inflight.borrow_mut();
                 inflight.insert(io.get_ref());
@@ -376,7 +384,8 @@ where
             };
 
             log::trace!(
-                "New http2 connection {id}, peer address {:?}, in-flight: {inflight}",
+                "{}: New http2 connection {id}, peer address {:?}, in-flight: {inflight}",
+                io.tag(),
                 io.query::<types::PeerAddr>().get(),
             );
 
@@ -389,7 +398,8 @@ where
             };
 
             log::trace!(
-                "New http1 connection {id}, peer address {:?}, in-flight: {inflight}",
+                "{}: New http1 connection {id}, peer address {:?}, in-flight: {inflight}",
+                io.tag(),
                 io.query::<types::PeerAddr>().get(),
             );
             h1::handle_io(id, io, self.config.clone()).await

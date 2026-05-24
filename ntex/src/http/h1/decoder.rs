@@ -1,22 +1,27 @@
-#![allow(clippy::borrow_interior_mutable_const)]
-use std::{cell::Cell, marker::PhantomData, mem, task::Poll};
+use std::{
+    cell::Cell, cmp, collections::VecDeque, fmt, marker::PhantomData, mem, task::Poll,
+};
 
 use ntex_http::header::{HeaderName, HeaderValue};
 use ntex_http::{Method, StatusCode, Uri, Version, header};
 
 use crate::codec::Decoder;
-use crate::http::error::DecodeError;
-use crate::http::header::HeaderMap;
+use crate::http::config::HttpServiceConfig;
 use crate::http::message::{ConnectionType, ResponseHead};
-use crate::http::request::Request;
+use crate::http::{error::DecodeError, header::HeaderMap, request::Request};
+use crate::service::cfg::Cfg;
 use crate::util::{Bytes, BytesMut};
-
-const MAX_HEADERS: usize = 96;
-const MAX_BUFFER_SIZE: usize = 32_768;
 
 #[derive(Debug)]
 /// Incoming messagd decoder
-pub(crate) struct MessageDecoder<T: MessageType>(PhantomData<T>);
+pub(crate) struct MessageDecoder<T: MessageType> {
+    _t: PhantomData<T>,
+    cfg: Cfg<HttpServiceConfig>,
+}
+
+thread_local! {
+    static BUF: Cell<Option<Box<HeadersBuf>>> = Cell::new(Some(Box::new(HeadersBuf::new())));
+}
 
 #[derive(Debug, PartialEq, Eq)]
 /// Incoming request type
@@ -26,15 +31,21 @@ pub enum PayloadType {
     Stream(PayloadDecoder),
 }
 
-impl<T: MessageType> Default for MessageDecoder<T> {
-    fn default() -> Self {
-        MessageDecoder(PhantomData)
+impl<T: MessageType> MessageDecoder<T> {
+    pub(crate) fn new(cfg: Cfg<HttpServiceConfig>) -> Self {
+        MessageDecoder {
+            cfg,
+            _t: PhantomData,
+        }
     }
 }
 
 impl<T: MessageType> Clone for MessageDecoder<T> {
     fn clone(&self) -> Self {
-        MessageDecoder(PhantomData)
+        MessageDecoder {
+            cfg: self.cfg.clone(),
+            _t: PhantomData,
+        }
     }
 }
 
@@ -43,7 +54,11 @@ impl<T: MessageType> Decoder for MessageDecoder<T> {
     type Error = DecodeError;
 
     fn decode(&self, src: &mut BytesMut) -> Result<Option<Self::Item>, Self::Error> {
-        T::decode(src)
+        let mut buf = BUF.with(|buf| buf.take().unwrap());
+        buf.set_max_headers(self.cfg.max_headers);
+        let result = T::decode(src, &mut buf, self.cfg.max_headers, self.cfg.max_buf_size);
+        BUF.with(move |v| v.set(Some(buf)));
+        result
     }
 }
 
@@ -65,26 +80,31 @@ impl PayloadLength {
         matches!(self, Self::None)
     }
 
+    #[allow(clippy::borrow_interior_mutable_const)]
     /// Returns true if variant is represents zero-length (not none) payload.
     fn is_zero(&self) -> bool {
         self == &ZERO
     }
 }
 
-pub(crate) trait MessageType: Sized {
+pub(crate) trait MessageType: fmt::Debug + Sized {
     fn set_connection_type(&mut self, ctype: Option<ConnectionType>);
 
     fn set_expect(&mut self);
 
     fn headers_mut(&mut self) -> &mut HeaderMap;
 
-    fn decode(src: &mut BytesMut) -> Result<Option<(Self, PayloadType)>, DecodeError>;
+    fn decode(
+        src: &mut BytesMut,
+        buf: &mut HeadersBuf,
+        max_headers: usize,
+        max_buf_size: usize,
+    ) -> Result<Option<(Self, PayloadType)>, DecodeError>;
 
     fn set_headers(
         &mut self,
-        slice: &Bytes,
         version: Version,
-        raw_headers: &[HeaderIndex],
+        buf: &mut HeadersBuf,
     ) -> Result<PayloadLength, DecodeError> {
         let mut ka = None;
         let mut has_upgrade = false;
@@ -93,94 +113,84 @@ pub(crate) trait MessageType: Sized {
         let mut seen_te = false;
         let mut content_length = None;
 
-        {
-            let headers = self.headers_mut();
+        let headers = self.headers_mut();
 
-            for idx in raw_headers {
-                let name = HeaderName::from_bytes(&slice[idx.name.0..idx.name.1]).unwrap();
-
-                // Unsafe: httparse check header value for valid utf-8
-                let value = unsafe {
-                    HeaderValue::from_shared_unchecked(
-                        slice.slice(idx.value.0..idx.value.1),
-                    )
-                };
-                match name {
-                    header::CONTENT_LENGTH if content_length.is_some() || chunked => {
-                        log::trace!("multiple Content-Length not allowed");
+        while let Some((name, value)) = buf.take() {
+            match name {
+                header::CONTENT_LENGTH if content_length.is_some() || chunked => {
+                    log::trace!("multiple Content-Length not allowed");
+                    return Err(DecodeError::Header);
+                }
+                header::CONTENT_LENGTH => match value.to_str() {
+                    Ok(s) if s.trim_start().starts_with('+') => {
+                        log::trace!("illegal Content-Length: {s:?}");
                         return Err(DecodeError::Header);
                     }
-                    header::CONTENT_LENGTH => match value.to_str() {
-                        Ok(s) if s.trim_start().starts_with('+') => {
+                    Ok(s) => {
+                        if let Ok(len) = s.parse::<u64>() {
+                            // accept 0 lengths here and remove them in `decode` after all
+                            // headers have been processed to prevent request smuggling issues
+                            content_length = Some(len);
+                        } else {
                             log::trace!("illegal Content-Length: {s:?}");
                             return Err(DecodeError::Header);
                         }
-                        Ok(s) => {
-                            if let Ok(len) = s.parse::<u64>() {
-                                // accept 0 lengths here and remove them in `decode` after all
-                                // headers have been processed to prevent request smuggling issues
-                                content_length = Some(len);
-                            } else {
-                                log::trace!("illegal Content-Length: {s:?}");
-                                return Err(DecodeError::Header);
-                            }
-                        }
-                        Err(_) => {
-                            log::trace!("illegal Content-Length: {value:?}");
-                            return Err(DecodeError::Header);
-                        }
-                    },
-                    // transfer-encoding
-                    header::TRANSFER_ENCODING if seen_te => {
-                        log::trace!("Transfer-Encoding header usage is not allowed");
+                    }
+                    Err(_) => {
+                        log::trace!("illegal Content-Length: {value:?}");
                         return Err(DecodeError::Header);
                     }
-                    header::TRANSFER_ENCODING if version == Version::HTTP_11 => {
-                        seen_te = true;
-                        if let Ok(s) = value.to_str().map(str::trim) {
-                            if s.eq_ignore_ascii_case("chunked") && content_length.is_none()
-                            {
-                                chunked = true;
-                            } else if s.eq_ignore_ascii_case("identity") {
-                                // allow silently since multiple TE headers are already checked
-                            } else {
-                                log::trace!("illegal Transfer-Encoding: {s:?}");
-                                return Err(DecodeError::Header);
-                            }
+                },
+                // transfer-encoding
+                header::TRANSFER_ENCODING if seen_te => {
+                    log::trace!("Transfer-Encoding header usage is not allowed");
+                    return Err(DecodeError::Header);
+                }
+                header::TRANSFER_ENCODING if version == Version::HTTP_11 => {
+                    seen_te = true;
+                    if let Ok(s) = value.to_str().map(str::trim) {
+                        if s.eq_ignore_ascii_case("chunked") && content_length.is_none() {
+                            chunked = true;
+                        } else if s.eq_ignore_ascii_case("identity") {
+                            // allow silently since multiple TE headers are already checked
                         } else {
+                            log::trace!("illegal Transfer-Encoding: {s:?}");
                             return Err(DecodeError::Header);
                         }
+                    } else {
+                        return Err(DecodeError::Header);
                     }
-                    // connection keep-alive state
-                    header::CONNECTION => {
-                        ka = if let Ok(val) = value.to_str() {
-                            connection_type(val)
-                        } else {
-                            None
-                        };
-                    }
-                    header::UPGRADE => {
-                        has_upgrade = true;
-                        // check content-length, some clients (dart)
-                        // sends "content-length: 0" with websocket upgrade
-                        if let Ok(val) = value.to_str().map(str::trim)
-                            && val.eq_ignore_ascii_case("websocket")
-                        {
-                            content_length = None;
-                        }
-                    }
-                    header::EXPECT => {
-                        let bytes = value.as_bytes();
-                        if bytes.len() >= 4 && &bytes[0..4] == b"100-" {
-                            expect = true;
-                        }
-                    }
-                    _ => (),
                 }
-
-                headers.append(name, value);
+                // connection keep-alive state
+                header::CONNECTION => {
+                    ka = if let Ok(val) = value.to_str() {
+                        connection_type(val)
+                    } else {
+                        None
+                    };
+                }
+                header::UPGRADE => {
+                    has_upgrade = true;
+                    // check content-length, some clients (dart)
+                    // sends "content-length: 0" with websocket upgrade
+                    if let Ok(val) = value.to_str().map(str::trim)
+                        && val.eq_ignore_ascii_case("websocket")
+                    {
+                        content_length = None;
+                    }
+                }
+                header::EXPECT => {
+                    let bytes = value.as_bytes();
+                    if bytes.len() >= 4 && &bytes[0..4] == b"100-" {
+                        expect = true;
+                    }
+                }
+                _ => (),
             }
+
+            headers.append(name, value);
         }
+
         self.set_connection_type(ka);
         if expect {
             self.set_expect();
@@ -220,16 +230,16 @@ impl MessageType for Request {
         &mut self.head_mut().headers
     }
 
-    fn decode(src: &mut BytesMut) -> Result<Option<(Self, PayloadType)>, DecodeError> {
-        let mut headers: [mem::MaybeUninit<HeaderIndex>; MAX_HEADERS] = uninit_array();
-
+    fn decode(
+        src: &mut BytesMut,
+        buf: &mut HeadersBuf,
+        max_headers: usize,
+        max_buf_size: usize,
+    ) -> Result<Option<(Self, PayloadType)>, DecodeError> {
         let (len, method, uri, ver, headers) = {
-            let mut parsed: [mem::MaybeUninit<httparse::Header<'_>>; MAX_HEADERS] =
-                uninit_array();
-
             let mut req = httparse::Request::new(&mut []);
 
-            match req.parse_with_uninit_headers(src, &mut parsed)? {
+            match req.parse_with_uninit_headers(src, buf.headers())? {
                 httparse::Status::Complete(len) => {
                     let method = Method::from_bytes(req.method.unwrap().as_bytes())
                         .map_err(|_| DecodeError::Method)?;
@@ -239,29 +249,29 @@ impl MessageType for Request {
                     } else {
                         Version::HTTP_10
                     };
-
-                    (
-                        len,
-                        method,
-                        uri,
-                        version,
-                        HeaderIndex::record(src, req.headers, &mut headers),
-                    )
+                    let headers = req.headers.len();
+                    if headers >= max_headers {
+                        log::trace!("Max headers reached ({headers}), closing ");
+                        return Err(DecodeError::MaxHeaders);
+                    }
+                    (len, method, uri, version, headers)
                 }
                 httparse::Status::Partial => {
-                    if src.len() >= MAX_BUFFER_SIZE {
+                    return if src.len() >= max_buf_size {
                         log::trace!("MAX_BUFFER_SIZE unprocessed data reached, closing");
-                        return Err(DecodeError::TooLarge(src.len()));
-                    }
-                    return Ok(None);
+                        Err(DecodeError::TooLarge(src.len()))
+                    } else {
+                        Ok(None)
+                    };
                 }
             }
         };
+        buf.record(headers, &src.split_to(len));
 
         let mut msg = Request::new();
 
         // convert headers
-        let mut length = msg.set_headers(&src.split_to(len), ver, headers)?;
+        let mut length = msg.set_headers(ver, buf)?;
 
         // disallow HTTP/1.0 POST requests that do not contain a Content-Length headers
         // see https://datatracker.ietf.org/doc/html/rfc1945#section-7.2.2
@@ -317,18 +327,18 @@ impl MessageType for ResponseHead {
         &mut self.headers
     }
 
-    fn decode(src: &mut BytesMut) -> Result<Option<(Self, PayloadType)>, DecodeError> {
-        let mut headers: [mem::MaybeUninit<HeaderIndex>; MAX_HEADERS] = uninit_array();
-
+    fn decode(
+        src: &mut BytesMut,
+        buf: &mut HeadersBuf,
+        max_headers: usize,
+        max_buf_size: usize,
+    ) -> Result<Option<(Self, PayloadType)>, DecodeError> {
         let (len, ver, status, headers) = {
-            let mut parsed: [mem::MaybeUninit<httparse::Header<'_>>; MAX_HEADERS] =
-                uninit_array();
-
             let mut res = httparse::Response::new(&mut []);
             match httparse::ParserConfig::default().parse_response_with_uninit_headers(
                 &mut res,
                 src,
-                &mut parsed,
+                buf.headers(),
             )? {
                 httparse::Status::Complete(len) => {
                     let version = if res.version.unwrap() == 1 {
@@ -338,16 +348,16 @@ impl MessageType for ResponseHead {
                     };
                     let status = StatusCode::from_u16(res.code.unwrap())
                         .map_err(|_| DecodeError::Status)?;
+                    let headers = res.headers.len();
+                    if headers >= max_headers {
+                        log::trace!("Max headers reached ({headers}), closing ");
+                        return Err(DecodeError::MaxHeaders);
+                    }
 
-                    (
-                        len,
-                        version,
-                        status,
-                        HeaderIndex::record(src, res.headers, &mut headers),
-                    )
+                    (len, version, status, headers)
                 }
                 httparse::Status::Partial => {
-                    return if src.len() >= MAX_BUFFER_SIZE {
+                    return if src.len() >= max_buf_size {
                         log::error!("MAX_BUFFER_SIZE unprocessed data reached, closing");
                         Err(DecodeError::TooLarge(src.len()))
                     } else {
@@ -356,12 +366,12 @@ impl MessageType for ResponseHead {
                 }
             }
         };
+        buf.record(headers, &src.split_to(len));
 
-        let mut msg = ResponseHead::new(status);
-        msg.version = ver;
+        let mut msg = ResponseHead::new(status, ver);
 
         // convert headers
-        let mut length = msg.set_headers(&src.split_to(len), ver, headers)?;
+        let mut length = msg.set_headers(ver, buf)?;
 
         // Remove CL value if 0 now that all headers and HTTP/1.0 special cases are processed.
         // Protects against some request smuggling attacks.
@@ -443,40 +453,66 @@ fn connection_type(val: &str) -> Option<ConnectionType> {
     None
 }
 
-#[derive(Clone, Copy)]
-pub(crate) struct HeaderIndex {
-    pub(crate) name: (usize, usize),
-    pub(crate) value: (usize, usize),
+pub(crate) struct HeadersBuf {
+    size: usize,
+    headers: Vec<httparse::Header<'static>>,
+    indices: VecDeque<(HeaderName, HeaderValue)>,
 }
 
-impl HeaderIndex {
-    pub(crate) fn record<'a>(
-        bytes: &[u8],
-        headers: &[httparse::Header<'_>],
-        indices: &'a mut [mem::MaybeUninit<HeaderIndex>],
-    ) -> &'a [HeaderIndex] {
+impl HeadersBuf {
+    fn new() -> Self {
+        Self {
+            size: 0,
+            headers: Vec::new(),
+            indices: VecDeque::new(),
+        }
+    }
+
+    fn set_max_headers(&mut self, size: usize) {
+        let size = cmp::max(size, self.size);
+        if self.size != size {
+            self.size = size;
+            while self.headers.len() < size {
+                self.headers.push(httparse::EMPTY_HEADER);
+            }
+            if self.indices.capacity() < size {
+                self.indices.reserve_exact(size - self.indices.capacity());
+            }
+        }
+    }
+
+    fn headers<'a>(&mut self) -> &mut [mem::MaybeUninit<httparse::Header<'a>>] {
+        unsafe {
+            let maybe_init: &mut [mem::MaybeUninit<_>] = core::slice::from_raw_parts_mut(
+                self.headers.as_mut_ptr().cast(),
+                self.headers.capacity(),
+            );
+            maybe_init
+        }
+    }
+
+    fn record(&mut self, len: usize, bytes: &Bytes) {
+        self.indices.clear();
+
         let bytes_ptr = bytes.as_ptr() as usize;
+        self.headers[..len].iter().for_each(|header| {
+            let name_start = header.name.as_ptr() as usize - bytes_ptr;
+            let name_end = name_start + header.name.len();
+            let name = HeaderName::from_bytes(&bytes[name_start..name_end]).unwrap();
 
-        let init_len = headers
-            .iter()
-            .zip(indices.iter_mut())
-            .map(|(header, indices)| {
-                let name_start = header.name.as_ptr() as usize - bytes_ptr;
-                let name_end = name_start + header.name.len();
-                let value_start = header.value.as_ptr() as usize - bytes_ptr;
-                let value_end = value_start + header.value.len();
+            // Unsafe: httparse checks header value for valid utf-8
+            let value_start = header.value.as_ptr() as usize - bytes_ptr;
+            let value_end = value_start + header.value.len();
+            let value = unsafe {
+                HeaderValue::from_shared_unchecked(bytes.slice(value_start..value_end))
+            };
 
-                indices.write(HeaderIndex {
-                    name: (name_start, name_end),
-                    value: (value_start, value_end),
-                })
-            })
-            .count();
+            self.indices.push_back((name, value));
+        });
+    }
 
-        // SAFETY:
-        //
-        // The total initialized items are counted by iterator.
-        unsafe { &*(&raw const indices[..init_len] as *const [HeaderIndex]) }
+    fn take(&mut self) -> Option<(HeaderName, HeaderValue)> {
+        self.indices.pop_front()
     }
 }
 
@@ -770,11 +806,6 @@ impl ChunkedState {
     }
 }
 
-fn uninit_array<T, const LEN: usize>() -> [mem::MaybeUninit<T>; LEN] {
-    // SAFETY: An uninitialized `[mem::MaybeUninit<_>; LEN]` is valid.
-    unsafe { mem::MaybeUninit::uninit().assume_init() }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -809,7 +840,7 @@ mod tests {
 
     macro_rules! parse_ready {
         ($e:expr) => {{
-            match MessageDecoder::<Request>::default().decode($e) {
+            match MessageDecoder::<Request>::new(Cfg::default()).decode($e) {
                 Ok(Some((msg, _))) => msg,
                 Ok(_) => unreachable!("Eof during parsing http request"),
                 Err(err) => unreachable!("Error during parsing http request: {:?}", err),
@@ -819,7 +850,7 @@ mod tests {
 
     macro_rules! expect_parse_err {
         ($e:expr) => {{
-            match MessageDecoder::<Request>::default().decode($e) {
+            match MessageDecoder::<Request>::new(Cfg::default()).decode($e) {
                 Err(_) => (),
                 _ => unreachable!("Error expected"),
             }
@@ -830,7 +861,7 @@ mod tests {
     fn test_parse() {
         let mut buf = BytesMut::from("GET /test HTTP/1.1\r\n\r\n");
 
-        let reader = MessageDecoder::<Request>::default();
+        let reader = MessageDecoder::<Request>::new(Cfg::default());
         match reader.decode(&mut buf) {
             Ok(Some((req, _))) => {
                 assert_eq!(req.version(), Version::HTTP_11);
@@ -861,7 +892,7 @@ mod tests {
     fn test_parse_partial() {
         let mut buf = BytesMut::from("PUT /test HTTP/1");
 
-        let reader = MessageDecoder::<Request>::default();
+        let reader = MessageDecoder::<Request>::new(Cfg::default());
         assert!(reader.decode(&mut buf).unwrap().is_none());
 
         buf.extend(b".1\r\n\r\n");
@@ -879,7 +910,7 @@ mod tests {
             abc",
         );
 
-        let reader = MessageDecoder::<Request>::default();
+        let reader = MessageDecoder::<Request>::new(Cfg::default());
         let (req, _) = reader.decode(&mut buf).unwrap().unwrap();
         assert_eq!(req.version(), Version::HTTP_10);
         assert_eq!(*req.method(), Method::GET);
@@ -891,7 +922,7 @@ mod tests {
             \r\n",
         );
 
-        let reader = MessageDecoder::<Request>::default();
+        let reader = MessageDecoder::<Request>::new(Cfg::default());
         let (req, _) = reader.decode(&mut buf).unwrap().unwrap();
         assert_eq!(req.version(), Version::HTTP_10);
         assert_eq!(*req.method(), Method::GET);
@@ -904,7 +935,7 @@ mod tests {
             abc",
         );
 
-        let reader = MessageDecoder::<Request>::default();
+        let reader = MessageDecoder::<Request>::new(Cfg::default());
         let (req, _) = reader.decode(&mut buf).unwrap().unwrap();
         assert_eq!(req.version(), Version::HTTP_10);
         assert_eq!(*req.method(), Method::GET);
@@ -920,7 +951,7 @@ mod tests {
             abc",
         );
 
-        let reader = MessageDecoder::<Request>::default();
+        let reader = MessageDecoder::<Request>::new(Cfg::default());
         let (req, _) = reader.decode(&mut buf).unwrap().unwrap();
         assert_eq!(req.version(), Version::HTTP_10);
         assert_eq!(*req.method(), Method::POST);
@@ -932,7 +963,7 @@ mod tests {
             \r\n",
         );
 
-        let reader = MessageDecoder::<Request>::default();
+        let reader = MessageDecoder::<Request>::new(Cfg::default());
         let (req, _) = reader.decode(&mut buf).unwrap().unwrap();
         assert_eq!(req.version(), Version::HTTP_10);
         assert_eq!(*req.method(), Method::POST);
@@ -942,7 +973,7 @@ mod tests {
             "POST /test3 HTTP/1.0\r\n\
             \r\n",
         );
-        let reader = MessageDecoder::<Request>::default();
+        let reader = MessageDecoder::<Request>::new(Cfg::default());
         let err = reader.decode(&mut buf).unwrap_err();
         assert!(err.to_string().contains("Header"));
     }
@@ -951,7 +982,7 @@ mod tests {
     fn test_parse_body() {
         let mut buf = BytesMut::from("GET /test HTTP/1.1\r\nContent-Length: 4\r\n\r\nbody");
 
-        let reader = MessageDecoder::<Request>::default();
+        let reader = MessageDecoder::<Request>::new(Cfg::default());
         let (req, pl) = reader.decode(&mut buf).unwrap().unwrap();
         let pl = pl.unwrap();
         assert_eq!(req.version(), Version::HTTP_11);
@@ -968,7 +999,7 @@ mod tests {
         let mut buf =
             BytesMut::from("\r\nGET /test HTTP/1.1\r\nContent-Length: 4\r\n\r\nbody");
 
-        let reader = MessageDecoder::<Request>::default();
+        let reader = MessageDecoder::<Request>::new(Cfg::default());
         let (req, pl) = reader.decode(&mut buf).unwrap().unwrap();
         let pl = pl.unwrap();
         assert_eq!(req.version(), Version::HTTP_11);
@@ -983,7 +1014,7 @@ mod tests {
     #[test]
     fn test_parse_partial_eof() {
         let mut buf = BytesMut::from("GET /test HTTP/1.1\r\n");
-        let reader = MessageDecoder::<Request>::default();
+        let reader = MessageDecoder::<Request>::new(Cfg::default());
         assert!(reader.decode(&mut buf).unwrap().is_none());
 
         buf.extend(b"\r\n");
@@ -997,7 +1028,7 @@ mod tests {
     fn test_headers_split_field() {
         let mut buf = BytesMut::from("GET /test HTTP/1.1\r\n");
 
-        let reader = MessageDecoder::<Request>::default();
+        let reader = MessageDecoder::<Request>::new(Cfg::default());
         assert! { reader.decode(&mut buf).unwrap().is_none() }
 
         buf.extend(b"t");
@@ -1027,7 +1058,7 @@ mod tests {
              Set-Cookie: c1=cookie1\r\n\
              Set-Cookie: c2=cookie2\r\n\r\n",
         );
-        let reader = MessageDecoder::<Request>::default();
+        let reader = MessageDecoder::<Request>::new(Cfg::default());
         let (req, _) = reader.decode(&mut buf).unwrap().unwrap();
 
         let val: Vec<_> = req
@@ -1248,7 +1279,7 @@ mod tests {
              upgrade: websocket\r\n\r\n\
              some raw data",
         );
-        let reader = MessageDecoder::<Request>::default();
+        let reader = MessageDecoder::<Request>::new(Cfg::default());
         let (req, pl) = reader.decode(&mut buf).unwrap().unwrap();
         assert_eq!(req.head().connection_type(), ConnectionType::Upgrade);
         assert!(req.upgrade());
@@ -1266,6 +1297,20 @@ mod tests {
         assert_eq!(
             req.headers().get("x-test").unwrap().as_bytes(),
             "тест".as_bytes()
+        );
+    }
+
+    #[test]
+    fn test_http_request_empty_header() {
+        let mut buf = BytesMut::from(
+            "GET /test HTTP/1.1\r\n\
+             x-test: \r\n\r\n",
+        );
+        let req = parse_ready!(&mut buf);
+
+        assert_eq!(
+            req.headers().get("x-test").unwrap().as_bytes(),
+            "".as_bytes()
         );
     }
 
@@ -1297,7 +1342,7 @@ mod tests {
             "GET /test HTTP/1.1\r\n\
              transfer-encoding: chunked\r\n\r\n",
         );
-        let reader = MessageDecoder::<Request>::default();
+        let reader = MessageDecoder::<Request>::new(Cfg::default());
         let (req, pl) = reader.decode(&mut buf).unwrap().unwrap();
         let pl = pl.unwrap();
         assert!(req.chunked().unwrap());
@@ -1320,7 +1365,7 @@ mod tests {
             "GET /test HTTP/1.1\r\n\
              transfer-encoding: chunked\r\n\r\n",
         );
-        let reader = MessageDecoder::<Request>::default();
+        let reader = MessageDecoder::<Request>::new(Cfg::default());
         let (req, pl) = reader.decode(&mut buf).unwrap().unwrap();
         let pl = pl.unwrap();
         assert!(req.chunked().unwrap());
@@ -1351,7 +1396,7 @@ mod tests {
              transfer-encoding: chunked\r\n\r\n",
         );
 
-        let reader = MessageDecoder::<Request>::default();
+        let reader = MessageDecoder::<Request>::new(Cfg::default());
         let (req, pl) = reader.decode(&mut buf).unwrap().unwrap();
         let pl = pl.unwrap();
         assert!(req.chunked().unwrap());
@@ -1396,7 +1441,7 @@ mod tests {
               transfer-encoding: chunked\r\n\r\n",
         );
 
-        let reader = MessageDecoder::<Request>::default();
+        let reader = MessageDecoder::<Request>::new(Cfg::default());
         let (msg, pl) = reader.decode(&mut buf).unwrap().unwrap();
         let pl = pl.unwrap();
         assert!(msg.chunked().unwrap());
@@ -1414,7 +1459,7 @@ mod tests {
     fn test_response_http10_read_until_eof() {
         let mut buf = BytesMut::from("HTTP/1.0 200 Ok\r\n\r\ntest data");
 
-        let reader = MessageDecoder::<ResponseHead>::default();
+        let reader = MessageDecoder::<ResponseHead>::new(Cfg::default());
         let (_msg, pl) = reader.decode(&mut buf).unwrap().unwrap();
         let pl = pl.unwrap();
 
@@ -1558,7 +1603,7 @@ mod tests {
              0\r\n",
         );
 
-        let reader = MessageDecoder::<Request>::default();
+        let reader = MessageDecoder::<Request>::new(Cfg::default());
         let (_msg, pl) = reader.decode(&mut buf).unwrap().unwrap();
         let pl = pl.unwrap();
 

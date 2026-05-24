@@ -3,8 +3,7 @@
 #![allow(
     clippy::missing_fields_in_debug,
     clippy::must_use_candidate,
-    clippy::missing_errors_doc,
-    clippy::cast_possible_truncation
+    clippy::missing_errors_doc
 )]
 use std::{rc::Rc, task::Context};
 
@@ -96,7 +95,7 @@ pub trait Service<Req> {
     /// Responses given by the service.
     type Response;
 
-    /// Errors produced by the service when polling readiness or executing call.
+    /// Errors produced by the service when checking readiness or executing call.
     type Error;
 
     /// Processes a request and returns the response asynchronously.

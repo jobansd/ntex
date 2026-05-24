@@ -293,7 +293,6 @@ where
         let tcp = net::TcpListener::bind("127.0.0.1:0").unwrap();
         let local_addr = tcp.local_addr().unwrap();
 
-        let system = sys.system();
         sys.run(move || {
             let srv = crate::server::build()
                 .listen("test", tcp, async move |_| factory().await)?
@@ -303,7 +302,7 @@ where
                 .run();
 
             crate::rt::spawn(async move {
-                tx.send((system, srv, local_addr)).unwrap();
+                tx.send((System::current(), srv, local_addr)).unwrap();
             });
             Ok(())
         })
@@ -318,6 +317,7 @@ where
 /// Test server controller
 pub struct TestServer {
     id: Uuid,
+    cfg: SharedCfg,
     addr: net::SocketAddr,
     client: Client,
     system: System,
@@ -333,10 +333,21 @@ impl TestServer {
         timeout: Seconds,
         connect_timeout: Millis,
     ) -> Self {
-        let client = Self::create_client(timeout, connect_timeout).await;
+        let cfg: SharedCfg = SharedCfg::new("TEST-CLIENT")
+            .add(IoConfig::new().set_connect_timeout(connect_timeout))
+            .add(TlsConfig::new().set_handshake_timeout(timeout))
+            .add(
+                ntex_h2::ServiceConfig::new()
+                    .set_max_header_list_size(256 * 1024)
+                    .set_max_header_continuation_frames(96),
+            )
+            .into();
+
+        let client = Self::create_client(cfg.clone()).await;
 
         TestServer {
             id,
+            cfg,
             addr,
             client,
             system,
@@ -350,13 +361,7 @@ impl TestServer {
         timeout: Seconds,
         connect_timeout: Millis,
     ) -> Self {
-        self.client = Self::create_client(timeout, connect_timeout).await;
-        self
-    }
-
-    /// Set client timeout
-    async fn create_client(timeout: Seconds, connect_timeout: Millis) -> Client {
-        let cfg: SharedCfg = SharedCfg::new("TEST-CLIENT")
+        self.cfg = SharedCfg::new("TEST-CLIENT")
             .add(IoConfig::new().set_connect_timeout(connect_timeout))
             .add(TlsConfig::new().set_handshake_timeout(timeout))
             .add(
@@ -365,7 +370,12 @@ impl TestServer {
                     .set_max_header_continuation_frames(96),
             )
             .into();
+        self.client = Self::create_client(self.cfg.clone()).await;
+        self
+    }
 
+    /// Set client timeout
+    async fn create_client(cfg: SharedCfg) -> Client {
         let connector = {
             #[cfg(feature = "openssl")]
             {
@@ -446,7 +456,7 @@ impl TestServer {
         WsClient::builder(self.url(path))
             .address(self.addr)
             .timeout(Seconds(30))
-            .build(SharedCfg::default())
+            .build(self.cfg.clone())
             .await
             .unwrap()
             .connect()
@@ -486,7 +496,7 @@ impl TestServer {
             .timeout(Seconds(30))
             .openssl(builder.build())
             .take()
-            .build(SharedCfg::default())
+            .build(self.cfg.clone())
             .await
             .unwrap()
             .connect()
