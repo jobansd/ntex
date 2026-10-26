@@ -16,24 +16,18 @@ members = [
   "ntex-service",
   "ntex-tls",
   "ntex-util",
+  "urly",
 ]
-
-[workspace.package]
-authors = ["ntex contributors <team@ntex.rs>"]
-repository = "https://github.com/ntex-rs/ntex"
-documentation = "https://docs.rs/ntex/"
-license = "MIT OR Apache-2.0"
-edition = "2024"
-rust-version = "1.88"
 
 [workspace.lints.rust]
 async_fn_in_trait = { level = "allow", priority = -1 }
+unknown_lints = { level = "allow", priority = -1 }
 rust_2018_idioms = "deny"
 warnings = "deny"
 unreachable_pub = "deny"
 missing_debug_implementations = "deny"
 
-unexpected_cfgs = { level = "warn", priority = -2, check-cfg = ['cfg(docsrs_dep)'] }
+unexpected_cfgs = { level = "warn", priority = -2, check-cfg = ['cfg(docsrs)', 'cfg(docsrs_dep)'] }
 
 [patch.crates-io]
 ntex = { path = "ntex" }
@@ -51,64 +45,68 @@ ntex-service = { path = "ntex-service" }
 ntex-tls = { path = "ntex-tls" }
 ntex-macros = { path = "ntex-macros" }
 ntex-util = { path = "ntex-util" }
+urly = { path = "urly" }
 
 [workspace.dependencies]
-ntex = "3.9.6"
-ntex-bytes = "1.7.0"
-ntex-codec = "1.2.1"
-ntex-error = "2.2.0"
-ntex-h2 = "3.11.1"
-ntex-http = "1.2.0"
-ntex-dispatcher = "3.2.0"
-ntex-io = "3.12.2"
-ntex-net = "3.12.0"
-ntex-macros = "3.2.0"
-ntex-router = "1.0.0"
-ntex-rt = "3.14.1"
-ntex-server = "3.9.0"
-ntex-service = "4.6.0"
-ntex-tls = "3.6.1"
-ntex-util = "3.6.1"
+ntex = "4.4.0"
+ntex-bytes = "1.14.0"
+ntex-codec = "2.0.0"
+ntex-dispatcher = "4.4.0"
+ntex-error = "3.1.0"
+ntex-h2 = "4.4.0"
+ntex-http = "2.1.0"
+ntex-io = "4.6.0"
+ntex-macros = "4.2.0"
+ntex-net = "4.7.0"
+ntex-router = "2.1.0"
+ntex-rt = "4.4.0"
+ntex-server = "4.3.0"
+ntex-service = "5.3.0"
+ntex-tls = "4.4.0"
+ntex-util = "4.5.0"
+urly = "1.1.0"
 
-ntex-polling = "3.10.0"
-ntex-io-uring = "0.7.120"
+ntex-io-uring = "1.0.0"
+ntex-httparse = "2.3.0"
+ntex-polling = "4.2.0"
 
 async-channel = "2"
-async-task = "4.5.0"
 atomic-waker = "1.1"
+event-listener = "5"
+atoi_simd = "0.18.1"
 backtrace = "0.3.76"
 bytes = "1.11.0"
 bincode = "1.3.3"
 base64 = "0.22"
-cookie = "0.18"
 coo-kie = { version = "0.18", package = "cookie" }
-core_affinity = "0.8"
 bitflags = "2"
-cfg_aliases = "0.2.1"
 cfg-if = "1.0.0"
 crossbeam-channel = "0.5.8"
-crossbeam-queue = "0.3.8"
 ctrlc = "3.4"
 derive_more = "2.0.1"
 encoding_rs = "0.8"
 env_logger = { version = "0.11", default-features = false }
+flate2 = { version = "1.1.3", default-features = false, features = ["zlib-rs", "runtime_detection"] }
 foldhash = "0.2.0"
-futures = "0.3.31"
-futures-core = { version = "0.3.31", default-features = false, features = ["alloc"] }
-futures-util = { version = "0.3.31", default-features = false, features = ["alloc"] }
+futures = "0.3.33"
+futures-core = { version = "0.3.33", default-features = false, features = ["alloc"] }
+futures-util = { version = "0.3.33", default-features = false, features = ["alloc"] }
 futures-timer = "3.0"
-http = "1.3.1"
+fastrand = "2.3"
+hashbrown = { version = "0.17.1", features = ["serde"] }
+http = "1.5.0"
 httparse = "1.10.1"
 httpdate = "1.0"
 itoa = "1.0.18"
-libc = "0.2.164"
+libc = "0.2.189"
 log = "0.4"
 mime = "0.3"
+nix = "0.31.3"
 oneshot = { version = "0.2.1", features = ["std", "async"] }
-openssl = "0.10"
 tls_openssl = { version = "0.10", package = "openssl" }
+openssl-sys = "0.9"
+foreign-types-shared = "0.1"
 parking_lot = "0.12.5"
-percent-encoding = "2.3"
 pin-project-lite = "0.2"
 proc-macro2 = "1.0.105"
 quote = "1.0.43"
@@ -116,36 +114,28 @@ rand = "0.9"
 regex = { version = "1.11", default-features = false, features = ["std"] }
 rustls-pemfile = "2"
 tls_rustls = { version = "0.23", package = "rustls", default-features = false }
-nohash-hasher = "0.2.0"
-nanorand = { version = "0.8", default-features = false, features = [
-    "std",
-    "wyrand",
-    "entropy"
-] }
 scoped-tls = "1.0.1"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 serde_test = "1.0"
 serde_derive = "1.0"
 serde_urlencoded = "0.7"
-signal-hook = "0.3"
+signal-hook = "0.4.4"
 simdutf8 = "0.1.5"
-sha1 = "0.10"
 slab = "0.4.9"
 socket2 = "0.6.1"
-swap-buffer-queue = "0.2.1"
 variadics_please = "1.1"
-windows-sys = "0.52.0"
-time = "0.3"
+unsynn = { version = "0.3", default-features = false, features = ["proc_macro2"] }
+windows-sys = "0.61.0"
+time = "0.3.54"
 thiserror = "2"
-tok-io = { version = "1", package = "tokio", default-features = false }
+tok-io = { version = "1.45", package = "tokio", default-features = false }
 webpki-roots = "1.0"
-url = "2.5.2"
-url-pkg = { version = "2.5.2", package = "url" }
 uuid = { version = "1.19", features = ["v7"] }
+zstd = "0.13"
 
-compio-buf = "0.8.0"
-compio-io = "0.9.0"
-compio-net = "0.11.0"
-compio-driver = "0.11.1"
-compio-runtime = "0.11.0"
+compio-buf = "0.8.3"
+compio-io = "0.10.1"
+compio-net = "0.12.2"
+compio-driver = "0.12.4"
+compio-runtime = "0.12.3"

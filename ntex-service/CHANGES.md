@@ -1,5 +1,126 @@
 # Changes
 
+## [5.3.0] - 2026-10-21
+
+* Reduce the initial readiness waiter reservation for small pipelines
+
+* Keep up to two readiness notification wakers inline to avoid wake-buffer allocations
+
+* Fix deadlock when a readiness check inside a service call waited for another binding's
+  pipeline readiness check that was itself waiting for resources held by the call
+
+* Reuse readiness observers across check retries, and avoid allocating and redundant self-wakes when waking pipeline readiness checks
+
+* Reuse readiness waiter buffers when waking queued readiness checks
+
+* Avoid allocations when notifying a single readiness scope without dependents, and avoid hashing small dependency graphs
+
+* Yield instead of spinning when a service readiness check keeps invalidating its own readiness
+
+* Remove `Ctx::poll_fn()` and `Ctx::poll_once()`
+
+* Release readiness-check ownership when a service readiness check panics, so other bindings do not wait forever
+
+* Add `Pipeline::is_ready()` and `PipelineState::is_ready()`, report valid shared readiness without running a check
+
+* Share notification-invalidated readiness across all pipeline calls and bindings,
+  including `PipelineState` handles with different state values. Calls no longer
+  consume readiness. Retain one pending checker with cancellation handoff, and
+  let callers continue pipeline-owned checks when the original poller stops.
+
+* Add `ServiceBinding`. `Ctx::call` consults its nearest
+  upstream cache; a miss checks only the target service without marking that
+  scope ready. Direct binding calls check their own cache, including through
+  transparent adapters.
+
+* Deprecate `Ctx::call_nowait` in favor of cache-aware `Ctx::call`, including
+  after an explicit readiness check. The deprecated method retains its
+  signature and readiness-bypass semantics during compatibility; it is not
+  silently changed to wait. Primitive `Service::call` is not deprecated.
+
+* Add `ready(svc)` and `ready_factory(fac)` for explicit per-service readiness
+  caching and call-time checks. `AndThen`, `Then`, and `Apply` store raw children
+  without adding bindings. Their calls forward directly; wrap children with
+  `ready` to revalidate their independent readiness after an await or another
+  call. Wrapper clones and factory-created services get fresh bindings.
+
+* Add `ReadyNotifier` sources and internal readiness scopes with persistent
+  subscriptions, generation-checked caching, and dependency invalidation.
+
+* Add reusable `ReadyCallback` handles and `on_notify` registration on `BindCtx`,
+  pipelines, and their bindings. Callbacks run only when `ReadyNotifier::notify`
+  reaches the registered scope, including through children, after all affected
+  scopes are invalidated. Registrations persist for the scope's lifetime and
+  deduplicate the same callback identity. Delivery reuses registered storage
+  without a callback snapshot allocation or handle cloning. Nested notifications
+  still invalidate all affected scopes but coalesce callback delivery on scopes
+  already invoking callbacks; new registrations are retained.
+
+* Add synchronous `Service::bind` and a borrowed `BindCtx<'_>`.
+  Register all notifier sources with `BindCtx::subscribe` and all children
+  with `BindCtx::bind` during service initialization. Runtime `Ctx` cannot
+  register dependencies directly. The default hook is a no-op for leaves; composites
+  must forward binding explicitly, using `forward_bind!` or `forward_pl_bind!`
+  where appropriate. An unregistered `ServiceBinding` panics rather than
+  lazily wiring itself. Readiness callbacks continue to receive only `&St`.
+
+* Add `Ctx::create` to create and bind lazy children to the current scope.
+  Successful creation invalidates the scope and its ancestors; factory errors
+  and cancellation do not bind a service. Created services are returned
+  unchanged, with independent readiness caching remaining opt-in.
+
+* Expose `bind_to(&BindCtx)` on pipelines and their runtime handles for explicit
+  readiness dependency binding. `forward_pl_bind!` uses this public API.
+
+* Avoid boxed readiness futures on valid cached `ready()` calls for pipelines,
+  bindings, and state-taking pipelines. Cached calls add no readiness
+  allocations; call dispatch and type-erasure boxing remain unchanged.
+  Deduplicate queued wake-ups so repeated pending polls do not grow the waiter
+  list.
+
+## [5.2.0] - 2026-10-06
+
+* Do not check readiness for inner services calls, readiness
+  is checked before call and cover inner service.
+
+* Remove `Pipeline::call_nowait()` and `PipelineBinding::call_nowait()`
+
+* A pipeline call skips the readiness check if the last pipeline readiness check succeeded
+  and no other call consumed it
+
+* `AndThen` and `Apply` skip the inner service readiness check only if no call entered
+  the inner service since its readiness was checked
+
+## [5.1.1] - 2026-10-06
+
+* Do not re-clone the readiness waker on every poll
+
+## [5.1.0] - 2026-09-30
+
+* Fix use-after-free when a pipeline is dropped with pending readiness or shutdown future
+
+* Fix use-after-free when a pending `PipelineCall` outlives its pipeline and is dropped
+
+## [5.0.1] - 2026-09-18
+
+* Api docs improvements
+
+## [5.0.0] - 2026-09-13
+
+* Introduce service state management.
+
+* Replace `Cfg` paramater in ServiceFactory with `St`
+
+* Replace `Cfg` paramater in Middleware with `St`
+
+* Added .readiness() callback
+
+* Added .shutdown() callback
+
+* Added PipelineFactory, PipelineState, PipelineStateBinding
+
+* Remove Service::poll() method
+
 ## [4.6.0] - 2026-03-05
 
 * Add `service` name to `SharedCfg`

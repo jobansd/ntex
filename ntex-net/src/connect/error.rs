@@ -2,13 +2,6 @@ use std::io;
 
 use ntex_error::ErrorDiagnostic;
 
-#[derive(thiserror::Error, Debug, Copy, Clone)]
-pub enum ConnectServiceError {
-    /// Cannot create connect service
-    #[error("Cannot create connect service")]
-    CannotCreateService,
-}
-
 #[derive(thiserror::Error, Debug)]
 pub enum ConnectError {
     /// Failed to resolve the hostname
@@ -28,7 +21,7 @@ pub enum ConnectError {
     Unresolved,
 
     /// Connection io error
-    #[error("{0}")]
+    #[error("Tcp connect")]
     Io(#[from] io::Error),
 }
 
@@ -41,16 +34,8 @@ impl Clone for ConnectError {
             ConnectError::NoRecords => ConnectError::NoRecords,
             ConnectError::InvalidInput => ConnectError::InvalidInput,
             ConnectError::Unresolved => ConnectError::Unresolved,
-            ConnectError::Io(err) => {
-                ConnectError::Io(io::Error::new(err.kind(), format!("{err}")))
-            }
+            ConnectError::Io(err) => ConnectError::Io(io::Error::new(err.kind(), format!("{err}"))),
         }
-    }
-}
-
-impl From<ConnectServiceError> for io::Error {
-    fn from(err: ConnectServiceError) -> io::Error {
-        io::Error::other(err)
     }
 }
 
@@ -95,9 +80,9 @@ mod tests {
         assert_eq!(err.signature(), "ntex-connect-Unresolved");
 
         let err = ConnectError::Io(io::Error::new(io::ErrorKind::InvalidInput, "test"));
-        assert_eq!(err.signature(), "io-InvalidInput");
+        assert_eq!(err.signature(), "std-io-InvalidInput");
 
         let err = ConnectError::Io(io::Error::other("test"));
-        assert_eq!(err.signature(), "io-Error");
+        assert_eq!(err.signature(), "std-io-Error");
     }
 }

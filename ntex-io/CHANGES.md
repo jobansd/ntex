@@ -1,5 +1,431 @@
 # Changes
 
+## [4.6.0] - Unreleased
+
+* Store owned runtime-local wake handles in tagged I/O waiters, reusable wake
+  buffers, and the persistent write task without growing their storage.
+
+## [4.5.0] - 2026-10-21
+
+* Add `tracker` feature and `IoConfig::set_buf_tracker()`, memory attribution
+  of read buffers to a `BytesTracker`, per connection or shared by a configuration
+
+* Add `IoRef::buf_tracker()` and `IoContext::buf_tracker()`, the tracker charged
+  with the read buffers of a connection, a per-connection tracker is created on first use.
+  `Io::set_config()` moves the read buffers held by the connection to the new tracker
+
+* Enable write backpressure when deferred filter processing grows the output past the
+  high watermark, for example a filter that expands its input
+
+* Add `IoMetrics`, per-thread I/O statistics of an I/O configuration: read and write
+  backpressure counts, active connections and connection-time under backpressure, bytes
+  held in read and write buffers. A configuration has its own metrics in the thread's
+  `IoMetricsGroup` if enabled with `IoConfig::set_metrics()` or registered with
+  `IoMetricsGroup::register()`, other connections report to `IoMetricsGroup::other()`.
+  `IoConfig::metrics()` returns the metrics a configuration reports to, connections move to
+  the new configuration's metrics on `Io::set_config()`. `IoMetricsGroup::snapshot()`
+  returns one `IoConfigMetrics` per configuration with its own metrics
+
+* Add `CloseReason`, `IoRef::set_close_reason()` and `IoRef::close_reason()`, the first
+  reported reason is kept. `IoMetricsSnapshot::closed` counts closed connections by reason,
+  `CloseReason::Custom1` to `Custom8` are counted in `CloseStats::custom` for application
+  metrics
+
+* Add `IoMetricsSnapshot::read_buffers_held` and `read_buffer_capacity`, connections that
+  keep a read buffer allocated for unconsumed input and the memory those buffers keep, a
+  whole page for a pooled buffer. Read buffer gauges are cleared once the `Io` is dropped,
+  not when the connection state is released
+
+* Add `IoMetricsSnapshot::bytes_read` and `bytes_written`, and the eager write counters
+  `eager_writes`, `eager_writes_partial` and `scheduled_writes`
+
+* The I/O timer clock starts at `ntex_util::time::now()`, `TimerHandle::remains()`
+  could report an extra second when the clock started in the middle of a runtime turn
+
+* The write task pauses while a filter holds output back, for example application data
+  during a TLS handshake, it spun with empty writes before. New output or processed input
+  resumes it, in the transport shutdown phase it waits for the shutdown deadline
+
+* `Io::seal()`, `Io::boxed()`, `Io::add_filter()` and `Io::map_filter()` move the connection
+  state without allocating a placeholder state, `Io::boxed()` no longer seals twice
+
+* Free output that can no longer be delivered when the transport reports the connection
+  stopped or the connection is force-closed, it was kept until `Io` was dropped. Buffered
+  input stays readable
+
+* Wakes and waiter registrations made from filter callbacks or wakers are no longer lost,
+  and filter callbacks that drop the `Io` no longer keep the connection state alive
+
+* A cancelled full flush no longer suppresses the wake of a later partial flush once
+  output drops below the write backpressure threshold
+
+* Breaking: `Filter::poll_ready()` replaces `Filter::poll_read_ready()` and
+  `Filter::poll_write_ready()`, the transport read task polls it. A chain that is not ready
+  pauses transport reads, transport writes are not paused, eager and scheduled writes could
+  bypass the write readiness before. Input and output the chain holds are processed again
+  once it is ready, an error ends the connection like any filter error
+
+* A filter error no longer terminates the connection. The chain gets one last write pass,
+  then it is not called again and filter shutdown is skipped: output that reached the
+  transport, for example a TLS alert, is delivered within the shutdown deadline, it was
+  written only as far as the current write went. Application output the chain had not
+  encoded is discarded, `Io::shutdown()` reports the filter error
+
+* Breaking: `IoRef::is_filter_paused()` replaces `IoRef::is_read_filter_paused()` and
+  `IoRef::is_write_filter_paused()`
+
+* Resuming paused reads and entering the transport shutdown phase update the connection
+  state before waking the I/O tasks, a waker that polled the read task inline saw the stale
+  pause and the read task stalled
+
+* A panic in `IoStream::start()` no longer leaks the connection state, `Io::new()` owns the
+  state before the stream starts
+
+* A transport query that stops the connection no longer reinstalls the transport handle,
+  which kept the connection state alive
+
+## [4.4.0] - 2026-10-12
+
+* Add `IoContext::read_buf_size()`, the size of the input the buffer from `take_read_buf()`
+  already holds
+
+* Scheduled writes run on a persistent per-thread task, was a task spawned per batch
+
+## [4.3.0] - 2026-10-07
+
+* Read buffers are ntex-bytes pages, empty buffers return to the ntex-bytes page cache shared
+  with write pages
+
+* Adaptive read page size: each connection starts at the min read page size, grows to fit read
+  batches and shrinks after several small ones, up to the max, `Size4..Size64` by default.
+  Read backpressure does not depend on it.
+
+* The default read backpressure watermark is the `Size32` capacity, was `Size16`
+
+* Add `IoConfig::set_read_size(min, max)`, `IoConfig::read_size_min()`,
+  `IoConfig::read_size_max()`, `IoConfig::set_read_backpressure()`,
+  `IoConfig::read_backpressure()` and `IoConfig::write_backpressure()`
+
+* Breaking: Remove `IoConfig::set_read_buf()`, use `IoConfig::set_read_size()` and
+  `IoConfig::set_read_backpressure()`
+
+* Breaking: Rename `IoConfig::set_write_buf()` to `IoConfig::set_write_backpressure()`
+
+* Breaking: Remove `IoConfig::write_buf()`, use `IoConfig::write_backpressure()`
+
+* Breaking: Rename `IoConfig::write_page_size()` to `IoConfig::write_size()` and
+  `IoConfig::set_write_page_size()` to `IoConfig::set_write_size()`
+
+* Breaking: Remove `BufConfig` and `IoConfig::read_buf()`
+
+* Breaking: Remove `cfg::set_read_buf_cache_limit()` and `cfg::read_buf_cache_limit()`, use
+  `ntex_bytes::set_page_cache_size()`
+
+* Frames split from a read buffer return its page to the cache once the last one is dropped
+
+* Breaking: Remove `IoRef::resize_read_buf()` and `IoContext::resize_read_buf()`, use
+  `BytesMut::reserve_more()`, read buffers grow once less than `BytePageSize::low()` of their
+  page size remains
+
+## [4.2.1] - 2026-10-05
+
+* Add `IoRef::is_write_filter_paused()`, transport writes stay paused while the filter chain is
+  not ready for them although the io state allows writes, the dispatcher is notified when the
+  pause starts and ends
+
+* Add `IoRef::is_read_filter_paused()`, transport reads stay paused while the filter chain is
+  not ready for them although the io state allows reads, the dispatcher is notified when the
+  pause starts and ends
+
+## [4.2.0] - 2026-10-04
+
+* `Io::take()` is unsafe, the filter and `IoRef` borrowed from the `Io` were freed with
+  the returned `Io`
+
+* Dropping an `Io` while its filter chain is in use panics, the connection is closed and
+  the filter is leaked; previously the filter was freed while in use
+
+* Filter chain buffers are stored inline, a connection without a filter layer no longer
+  allocates a buffer list, write buffers are accessed without moving them out
+
+* Add `IoRef::read_dst_size()`, returns the read destination size without changing the read
+  state
+
+* `Io::poll_recv_decode()` reports a dispatcher timeout and write back-pressure before
+  decoding, the decode result was dropped with the error. Neither is reported once the
+  connection is closing, buffered input is decoded before `PeerGone`
+
+## [4.1.0] - 2026-10-01
+
+* The read buffer cache checks only the most recently released buffer instead of
+  scanning the whole cache for one that fits
+
+* `Io::send()`, `Io::flush()` and `IoRef::write_ready()` are bounded by
+  `IoConfig::write_timeout()` and fail with `TimedOut` when it expires
+
+* `Io::recv()` returns a dispatcher timeout that fires while it waits for write
+  back-pressure to be released
+
+* Reading pauses while output a filter produced during read processing, for example
+  WebSocket pong replies, keeps the write buffer at the high watermark, until it drains
+  to half of it or the dispatcher asks for more input with `read_more()` or `read_notify()`,
+  output a filter holds back, for example application data during a TLS renegotiation,
+  does not count
+
+* Add `Waiter`, `IoRef::waiter()` and `IoRef::wake()`, tasks wait on a tag of
+  the I/O stream until it is woken, waiters complete once the stream is closed
+
+* Disconnect and write back-pressure waiters are stored in a tagged slab based waker list,
+  a dropped disconnect waiter releases its registration
+
+* Remove `OnDisconnect`, `IoRef::on_disconnect()` returns `Waiter<'static>`
+
+* Add `IoRef::write_ready()`, waits until write back-pressure is released, any number of
+  producers can wait, the write task wakes them without the dispatcher
+
+* Fix busy loop during graceful shutdown, a pending read woke the read task
+  while filters were shutting down, until the shutdown deadline
+
+* The I/O timer caches only timer sets for up to 512 streams, a set grown by a burst of timers
+  is dropped instead of retaining its capacity
+
+* The I/O timer ticker resets one sleep timer for every tick instead of creating a new one
+
+* Growing a read buffer beyond the high watermark compacts a unique buffer in place or
+  reallocates it, before it always allocated a new buffer and copied the data
+
+* A filter added over a sealed `Io` is stored typed, so `Io::filter()` and `Io::map_filter()`
+  on it no longer panic with "Filter is sealed", e.g. a TLS handshake over `IoBoxed`
+
+* `Io<Sealed>::map_filter()` no longer panics with "Filter is sealed"
+
+* A panic in the `Io::map_filter()` closure closes the connection, before it stayed open
+  without a filter until the peer went away
+
+* The `dyn Filter` pointer of a typed filter is derived from the raw box pointer, the reference
+  it was taken from before is invalidated by `Box::into_raw` under Stacked Borrows
+
+* `IoContext` is `#[repr(transparent)]`, making the internal `&IoRef` to `&IoContext` cast sound
+
+* `Io::add_filter` no longer creates a `&mut IoState` that overlaps other accesses
+
+* The filter stack reserves room for two filter layers up front, installing a filter no longer
+  reallocates the stack
+
+* Read buffers larger than `high` grow by doubling their capacity, by at most 1 MiB at once,
+  instead of in steps of `high`, so buffering a large frame no longer copies it once per step
+
+* The read buffer cache no longer keeps buffers that share their allocation with split off
+  data, it neither pins whole allocations for decoded frames nor hands out small leftovers
+
+* The innermost buffer of the filter stack allocates its write pages on demand,
+  a connection no longer allocates a write buffer it never uses
+
+* Fix `Io::poll_shutdown()` waking the transport tasks on every poll, which kept the compio
+  runtime from polling for I/O completions and stalled the shutdown until its timeout
+
+* Fix dispatcher timers expiring a second late and drifting, the timer ticks
+  at whole seconds of the clock; a `t` seconds timer expires after at least `t`
+  and less than `t + 1` seconds, or after `t` seconds if no other timers are
+  pending
+
+* `TimerHandle::remains()` rounds the remaining time up
+
+* Read buffers are cached in one per-thread cache shared by all configurations
+  and bounded by the capacity it holds, 1 MiB by default, see
+  `cfg::set_read_buf_cache_limit()`. The least recently released buffers are
+  freed first
+
+* Breaking: `IoConfig::set_read_buf()` no longer takes a cache size
+
+* Size the read buffer through `BufConfig::resize_min()` when a read completes
+  while earlier input is still unconsumed, so the merged buffer stays cacheable
+
+* Release buffered input and output when `Io` is dropped, instead of keeping it
+  until the transport and every `IoRef` let go of the connection state
+
+* `BufConfig::resize()` and `resize_min()` move buffered data into a cached
+  buffer of capacity `high` when it fits, instead of allocating a larger buffer
+  that could not be cached again
+
+* Fix output written by a filter that fails on read during shutdown being lost when the filter
+  is stacked over another filter
+
+* Fix output written by a pending filter shutdown not reaching the transport when the filter
+  is stacked over another filter
+
+* Fix a filter shutdown waiting for peer input not being polled again after that input is read
+
+* Rename `IoStatusUpdate::KeepAlive` to `IoStatusUpdate::Timeout`, it reports any
+  dispatcher timer expiration
+
+* Keep the I/O manager in a thread local instead of the arbiter storage, it is
+  reset when the arbiter shuts down
+
+* Fix filter shutdown waiting for the shutdown timeout when the input it
+  needs, such as the peer's TLS close_notify, arrived during the shutdown.
+  Reads in the filter shutdown phase now re-poll the shutdown
+
+* Decode with `Decoder::decode_eof()` once the transport reached eof
+
+* Add IoContext::shutdown_timeout() so io backends can bound their own
+  socket close by the connection's shutdown timeout
+
+* Add IoConfig::set_write_timeout() for bounding how long write
+  backpressure may stay enabled
+
+* IoConfig::set_shutdown_timeout() panics on a zero timeout. A zero timeout
+  used to disable the deadline, which let a peer that never reads hold the
+  connection open forever during a graceful shutdown
+
+* Read back-pressure blocks filter shutdown even after the dispatcher has
+  taken the buffered input. Readiness used to ask for reads that would pause,
+  so readiness based transports never re-armed read interest and the shutdown
+  waited for the shutdown timeout
+
+* Drop the filter callbacks together with the Io. Callbacks that held an
+  IoRef used to keep the connection state alive through a reference cycle
+
+* IoRef::register_filter_callbacks() discards the callbacks once the
+  connection is closed or its Io has been dropped
+
+* Add IoRef::is_active(), which reports that the connection is still in its
+  active state. It becomes false as soon as any kind of close starts, whether
+  it was closed locally, force-terminated, or the transport reported the peer
+  as gone
+
+* IoRef::is_closed() now reports that closing has finished and the backend
+  released the underlying socket. It used to become true part way through a
+  close, so callers that want that meaning should use !IoRef::is_active()
+
+* Readiness::Terminate is reported only for an explicit IoRef::terminate().
+  A transport failure, a filter failure or an expired shutdown deadline used
+  to abort the connection as well, a graceful close that was already draining
+  was turned into a reset. They now report Readiness::Close
+
+* Dropping an Io terminates the connection when output it accepted has not
+  reached the transport, a service that returned without shutting down
+  discarded whatever it had encoded yet the peer saw a clean end of stream.
+  Once everything has been flushed the connection is still closed gracefully,
+  so a service that finished its work ends with a normal FIN
+
+* Fix NullFilter reporting Readiness::Terminate unconditionally, which aborted
+  every dropped Io regardless of the io state and made a peer see a reset
+  where it should have seen a clean end of stream
+
+* Add Readiness::Terminate, reported when a connection is force-closed through
+  IoRef::terminate() or aborted by an error. Readiness::Close now means a
+  graceful close only, so a transport can tell the two apart
+
+* Wake the write task when the write buffer drains during the transport
+  shutdown phase, only poll_write_ready() can report that the phase is over so
+  a backend that drives reads and writes from separate tasks could stall until
+  the shutdown timeout elapsed
+
+* Io::recv() reports a truncated stream as UnexpectedEof instead of Ok(None),
+  a peer that closed its write half while the codec still held a partial item
+  is no longer indistinguishable from a clean end of stream. Input left over
+  after a locally started shutdown is not treated as truncation
+
+* Add IoContext::with_read_buf(), it hands the read buffer to the transport in
+  place instead of handing out a detached buffer that has to be appended back,
+  so a readiness based backend no longer pays a buffer swap and a copy for
+  every read
+* Pause the read side during the transport shutdown phase, the filters are done
+  by then so no further input can be used. The receive queue is discarded by the
+  transport itself, just before it closes the connection
+* Apply read back-pressure during the filter shutdown phase, Io::poll_shutdown()
+  cleared the back-pressure flag on every poll, so a peer that kept sending
+  could grow the read buffer without bound and the blocked shutdown detection
+  could never fire. Only the read pause is cleared now
+* Rename IoConfig::disconnect_timeout()/set_disconnect_timeout() to
+  shutdown_timeout()/set_shutdown_timeout(), it bounds the graceful shutdown
+  process rather than an abrupt disconnect
+* Remove Handle::notify(), FilterCtx::notify() and IoContext::notify(), nothing
+  triggered that path, read readiness is derived from connection flags and every
+  transition that changes it already wakes the read task
+* Account for output owned by the transport in the total write buffer size, a
+  completion based backend takes pages out of the write buffer and keeps them
+  until the operation completes. Those bytes now count towards flush
+  completion, write back-pressure and the shutdown drain, previously a full
+  flush could report success and back-pressure could be released while output
+  had not reached the peer yet
+* IoContext::update_write_status() takes the number of bytes written to the
+  peer, so that a backend holding write pages can report their progress
+* Drain buffered output during graceful shutdown instead of discarding it, the
+  transport shutdown phase now writes out whatever the filters produced before
+  closing the connection
+* Bound both graceful shutdown phases with a single shutdown timeout,
+  previously the transport shutdown phase was unbounded
+* Do not terminate the connection when a read fails while filters are shutting
+  down, the transport shutdown phase still drains buffered output
+* Replace Readiness::Shutdown and Readiness::Terminate with a single
+  Readiness::Close, io backends handled both identically. It requires closing
+  both directions of the connection; buffered output is drained before it is
+  reported for a graceful shutdown
+* Release read back-pressure and any read pause when IoRef::with_read_src() or
+  IoRef::with_buf() drain the application read destination, previously the
+  connection could stall permanently
+* Remove FilterCtx::new_read_bytes(), it had no consumers
+* Remove Io::pause(), the pause it installed could be silently cancelled
+* IoContext::update_write_status() takes io::Result<()> instead of io::Result<bool>
+* Release the transport handle when a direct write or notify callback terminates the connection
+* Io::poll_shutdown() no longer discards the read-ready flag
+* Io::poll_status_update() releases write back-pressure without reporting another
+  WriteBackpressure update, matching Io::poll_flush()
+* Add IoRef::is_rd_backpressure(), the read counterpart of is_wr_backpressure()
+* Report a clean read EOF to the filter chain exactly once
+* Complete filter shutdown after a clean peer EOF instead of waiting for the disconnect
+  timeout, no further input can arrive
+* Rename Io::read() to Io::read_exact(), it fills the whole buffer
+* Do not discard buffered output when filter shutdown cannot complete, wait for the write
+  buffer to drain (bounded by the disconnect timeout) before closing the transport
+* Rename buffer accessors to name their side of the chain:
+  IoRef::with_read_buf() to with_read_dst(),
+      with_write_buf() to with_write_src(),
+      with_read_src_buf() to with_read_src(),
+      with_write_dst_buf() to with_write_dst(),
+  IoContext::with_write_buf() to with_write_dst()
+* Remove IoContext::shutdown(), it is unreachable in every transport impl
+* Rename IoContext::get_read_buf() to take_read_buf() and
+  IoContext::update_read_status() to release_read_buf(), the pair moves the read
+  buffer out of the io state and back, the old names did not say so
+* Fix api consistency for IoContext::release_read_buf()
+* Fix peer EOF force-terminates instead of gracefully closing
+* Io::shutdown().await waits until physical transport shutdown
+* Added distinct IO_TERMINATING state for force-close and transport failures
+* Zero disconnect timeout disables the forced filter-shutdown deadline
+* Stopped timer clears any pending timeout notification
+* Filter shutdown timeout returns io::ErrorKind::TimedOut
+* Disconnect waiters resolve only after the backend closes connection
+* Backpressure remains active until the buffer reaches half of the high watermark
+* Fix read_notify() can wait forever after EOF with buffered data
+* Fix, recalculate buf size after shortcut write
+
+## [4.0.1] - 2026-09-18
+
+* Api docs improvements
+
+## [4.0.0] - 2026-09-14
+
+* Migrate to ntex-service 5
+
+## [3.13.1] - 2026-06-21
+
+* Handle disconnect during Io::read() call
+
+## [3.13.0] - 2026-06-18
+
+* Refactor io callbacks management and add filter callbacks
+
+## [3.12.4] - 2026-06-16
+
+* Add IoRef::with_write_dst_buf() helper method
+
+## [3.12.3] - 2026-06-15
+
+* Do not abort the write-buffer flush during graceful shutdown when filter shutdown has completed but read backpressure is active; this dropped a buffered response tail
+
 ## [3.12.2] - 2026-05-22
 
 * Do not use invalid io while adding new filter

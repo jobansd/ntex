@@ -2,7 +2,9 @@ use std::fmt;
 
 use base64::{Engine, engine::general_purpose::STANDARD as base64};
 
-/// Operation codes as part of rfc6455.
+use super::error::HandshakeError;
+
+/// WebSocket frame operation codes defined by RFC 6455.
 #[derive(Debug, Eq, PartialEq, Clone, Copy)]
 pub enum OpCode {
     /// Indicates a continuation frame of a fragmented message.
@@ -17,8 +19,6 @@ pub enum OpCode {
     Ping,
     /// Indicates a pong control frame.
     Pong,
-    /// Indicates an invalid opcode was received.
-    Bad,
 }
 
 impl fmt::Display for OpCode {
@@ -30,7 +30,6 @@ impl fmt::Display for OpCode {
             OpCode::Close => write!(f, "CLOSE"),
             OpCode::Ping => write!(f, "PING"),
             OpCode::Pong => write!(f, "PONG"),
-            OpCode::Bad => write!(f, "BAD"),
         }
     }
 }
@@ -44,25 +43,29 @@ impl From<OpCode> for u8 {
             OpCode::Close => 8,
             OpCode::Ping => 9,
             OpCode::Pong => 10,
-            OpCode::Bad => {
-                log::error!("Attempted to convert invalid opcode to u8. This is a bug.");
-                8 // if this somehow happens, a close frame will help us tear down quickly
-            }
         }
     }
 }
 
-impl From<u8> for OpCode {
-    fn from(byte: u8) -> OpCode {
+impl TryFrom<u8> for OpCode {
+    type Error = ();
+
+    fn try_from(byte: u8) -> Result<OpCode, Self::Error> {
         match byte {
-            0 => OpCode::Continue,
-            1 => OpCode::Text,
-            2 => OpCode::Binary,
-            8 => OpCode::Close,
-            9 => OpCode::Ping,
-            10 => OpCode::Pong,
-            _ => OpCode::Bad,
+            0 => Ok(OpCode::Continue),
+            1 => Ok(OpCode::Text),
+            2 => Ok(OpCode::Binary),
+            8 => Ok(OpCode::Close),
+            9 => Ok(OpCode::Ping),
+            10 => Ok(OpCode::Pong),
+            _ => Err(()),
         }
+    }
+}
+
+impl OpCode {
+    pub(crate) fn is_control(self) -> bool {
+        matches!(self, OpCode::Close | OpCode::Ping | OpCode::Pong)
     }
 }
 
@@ -84,11 +87,10 @@ pub enum CloseCode {
     /// endpoint that understands only text data MAY send this if it
     /// receives a binary message).
     Unsupported,
-    /// Indicates an abnormal closure. If the abnormal closure was due to an
-    /// error, this close code will not be used. Instead, the `on_error` method
-    /// of the handler will be called with the error. However, if the connection
-    /// is simply dropped, without an error, this close code will be sent to the
-    /// handler.
+    /// Indicates that the connection closed without a close control frame.
+    ///
+    /// This code is reserved for local reporting and cannot be sent in a
+    /// close frame.
     Abnormal,
     /// Indicates that an endpoint is terminating the connection
     /// because it has received data within a message that was not
@@ -125,9 +127,16 @@ pub enum CloseCode {
     /// connect to a different IP (when multiple targets exist), or
     /// reconnect to the same IP when a user has performed an action.
     Again,
-    #[doc(hidden)]
+    /// Indicates that an upstream server returned an invalid response.
+    BadGateway,
+    /// Indicates that the TLS handshake failed.
+    ///
+    /// This code is reserved for local reporting and cannot be sent in a
+    /// close frame.
     Tls,
-    #[doc(hidden)]
+    /// An unrecognized or application-defined close code.
+    ///
+    /// Only values in the range 3000 through 4999 can be sent.
     Other(u16),
 }
 
@@ -146,6 +155,7 @@ impl From<CloseCode> for u16 {
             CloseCode::Error => 1011,
             CloseCode::Restart => 1012,
             CloseCode::Again => 1013,
+            CloseCode::BadGateway => 1014,
             CloseCode::Tls => 1015,
             CloseCode::Other(code) => code,
         }
@@ -167,18 +177,26 @@ impl From<u16> for CloseCode {
             1011 => CloseCode::Error,
             1012 => CloseCode::Restart,
             1013 => CloseCode::Again,
+            1014 => CloseCode::BadGateway,
             1015 => CloseCode::Tls,
             _ => CloseCode::Other(code),
         }
     }
 }
 
+impl CloseCode {
+    pub(crate) fn is_valid(self) -> bool {
+        !matches!(self, CloseCode::Abnormal | CloseCode::Tls)
+            && !matches!(self, CloseCode::Other(code) if !(3000..=4999).contains(&code))
+    }
+}
+
 #[derive(Debug, Eq, PartialEq, Clone)]
-/// Reason for closing the connection
+/// Reason supplied in a WebSocket close control frame.
 pub struct CloseReason {
-    /// Exit code
+    /// Close status code.
     pub code: CloseCode,
-    /// Optional description of the exit code
+    /// Optional human-readable description.
     pub description: Option<String>,
 }
 
@@ -200,27 +218,119 @@ impl<T: Into<String>> From<(CloseCode, T)> for CloseReason {
     }
 }
 
-static WS_GUID: &str = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11";
+// SHA-1 hashing algorithm initial hash values.
+const H0: u32 = 0x6745_2301;
+const H1: u32 = 0xEFCD_AB89;
+const H2: u32 = 0x98BA_DCFE;
+const H3: u32 = 0x1032_5476;
+const H4: u32 = 0xC3D2_E1F0;
+const WS_GUID: &str = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11";
 
-// TODO: hash is always same size, we don't need String
-pub fn hash_key(key: &[u8]) -> String {
-    use sha1::Digest;
-    let mut hasher = sha1::Sha1::new();
+#[allow(clippy::many_single_char_names)]
+/// Computes the `Sec-WebSocket-Accept` value for a client handshake key.
+///
+/// # Errors
+///
+/// Returns [`HandshakeError::BadWebsocketKey`] when `key` is longer than
+/// 32 bytes.
+pub fn hash_key(key: &[u8]) -> Result<String, HandshakeError> {
+    if key.len() > 32 {
+        return Err(HandshakeError::BadWebsocketKey);
+    }
+    let mut input = [0; 192];
+    let klen = key.len();
+    let len = klen + 36;
+    input[..klen].copy_from_slice(key);
+    input[klen..len].copy_from_slice(WS_GUID.as_bytes());
 
-    hasher.update(key);
-    hasher.update(WS_GUID.as_bytes());
+    // Initialize variables to the SHA-1's initial hash values.
+    let (mut h0, mut h1, mut h2, mut h3, mut h4) = (H0, H1, H2, H3, H4);
+    let (mut a, mut b, mut c, mut d, mut e);
 
-    base64.encode(&hasher.finalize()[..])
+    // Pad the key
+    let msg = pad_message(len, &mut input);
+
+    // Process each 512-bit chunk of the padded message.
+    for chunk in msg.chunks(64) {
+        // Get the message schedule
+        let mut schedule = [0u32; 80];
+        for (i, block) in chunk.chunks(4).enumerate() {
+            schedule[i] = u32::from_be_bytes(block.try_into().unwrap());
+        }
+        for i in 16..80 {
+            schedule[i] = schedule[i - 3] ^ schedule[i - 8] ^ schedule[i - 14] ^ schedule[i - 16];
+            schedule[i] = schedule[i].rotate_left(1);
+        }
+
+        a = h0;
+        b = h1;
+        c = h2;
+        d = h3;
+        e = h4;
+
+        // Main loop of the SHA-1 algorithm
+        for (i, sch) in schedule.iter().enumerate() {
+            let (f, k) = match i {
+                0..=19 => ((b & c) | ((!b) & d), 0x5A82_7999),
+                20..=39 => (b ^ c ^ d, 0x6ED9_EBA1),
+                40..=59 => ((b & c) | (b & d) | (c & d), 0x8F1B_BCDC),
+                _ => (b ^ c ^ d, 0xCA62_C1D6),
+            };
+
+            let temp = a
+                .rotate_left(5)
+                .wrapping_add(f)
+                .wrapping_add(e)
+                .wrapping_add(k)
+                .wrapping_add(*sch);
+            e = d;
+            d = c;
+            c = b.rotate_left(30);
+            b = a;
+            a = temp;
+        }
+
+        // Add the compressed chunk to the current hash value.
+        h0 = h0.wrapping_add(a);
+        h1 = h1.wrapping_add(b);
+        h2 = h2.wrapping_add(c);
+        h3 = h3.wrapping_add(d);
+        h4 = h4.wrapping_add(e);
+    }
+
+    let mut hash = [0u8; 20];
+    hash[0..4].copy_from_slice(&h0.to_be_bytes());
+    hash[4..8].copy_from_slice(&h1.to_be_bytes());
+    hash[8..12].copy_from_slice(&h2.to_be_bytes());
+    hash[12..16].copy_from_slice(&h3.to_be_bytes());
+    hash[16..20].copy_from_slice(&h4.to_be_bytes());
+
+    Ok(base64.encode(hash))
+}
+
+fn pad_message(len: usize, input: &mut [u8]) -> &[u8] {
+    let mut cur = len + 1;
+    let bit_length = len as u64 * 8;
+
+    input[len] = 0x80;
+    while (cur * 8) % 512 != 448 {
+        input[cur] = 0;
+        cur += 1;
+    }
+    let orig_len = &bit_length.to_be_bytes();
+    let total = cur + orig_len.len();
+    input[cur..total].copy_from_slice(orig_len);
+    &input[..total]
 }
 
 #[cfg(test)]
 #[allow(unused_imports, unused_variables, dead_code)]
-mod test {
+mod tests {
     use super::*;
 
     macro_rules! opcode_into {
         ($from:expr => $opcode:pat) => {
-            match OpCode::from($from) {
+            match OpCode::try_from($from).unwrap() {
                 e @ $opcode => (),
                 e => unreachable!("{:?}", e),
             }
@@ -245,7 +355,7 @@ mod test {
         opcode_into!(8 => OpCode::Close);
         opcode_into!(9 => OpCode::Ping);
         opcode_into!(10 => OpCode::Pong);
-        opcode_into!(99 => OpCode::Bad);
+        assert!(OpCode::try_from(99).is_err());
     }
 
     #[test]
@@ -259,13 +369,6 @@ mod test {
     }
 
     #[test]
-    #[should_panic]
-    #[allow(clippy::should_panic_without_expect)]
-    fn test_from_opcode_debug() {
-        opcode_from!(OpCode::Bad => 99);
-    }
-
-    #[test]
     fn test_from_opcode_display() {
         assert_eq!(format!("{}", OpCode::Continue), "CONTINUE");
         assert_eq!(format!("{}", OpCode::Text), "TEXT");
@@ -273,12 +376,11 @@ mod test {
         assert_eq!(format!("{}", OpCode::Close), "CLOSE");
         assert_eq!(format!("{}", OpCode::Ping), "PING");
         assert_eq!(format!("{}", OpCode::Pong), "PONG");
-        assert_eq!(format!("{}", OpCode::Bad), "BAD");
     }
 
     #[test]
     fn test_hash_key() {
-        let hash = hash_key(b"hello actix-web");
+        let hash = hash_key(b"hello actix-web").unwrap();
         assert_eq!(&hash, "cR1dlyUUJKp0s/Bel25u5TgvC3E=");
     }
 
@@ -296,8 +398,13 @@ mod test {
         assert_eq!(CloseCode::from(1011u16), CloseCode::Error);
         assert_eq!(CloseCode::from(1012u16), CloseCode::Restart);
         assert_eq!(CloseCode::from(1013u16), CloseCode::Again);
+        assert_eq!(CloseCode::from(1014u16), CloseCode::BadGateway);
         assert_eq!(CloseCode::from(1015u16), CloseCode::Tls);
-        assert_eq!(CloseCode::from(2000u16), CloseCode::Other(2000));
+        assert_eq!(CloseCode::from(3000u16), CloseCode::Other(3000));
+        assert!(!CloseCode::from(1005u16).is_valid());
+        assert!(!CloseCode::from(1006u16).is_valid());
+        assert!(!CloseCode::from(1015u16).is_valid());
+        assert!(!CloseCode::from(2000u16).is_valid());
     }
 
     #[test]
@@ -314,7 +421,15 @@ mod test {
         assert_eq!(1011u16, Into::<u16>::into(CloseCode::Error));
         assert_eq!(1012u16, Into::<u16>::into(CloseCode::Restart));
         assert_eq!(1013u16, Into::<u16>::into(CloseCode::Again));
+        assert_eq!(1014u16, Into::<u16>::into(CloseCode::BadGateway));
         assert_eq!(1015u16, Into::<u16>::into(CloseCode::Tls));
-        assert_eq!(2000u16, Into::<u16>::into(CloseCode::Other(2000)));
+        assert_eq!(3000u16, Into::<u16>::into(CloseCode::Other(3000)));
+        assert!(!CloseCode::Other(2000).is_valid());
+    }
+
+    #[test]
+    fn test_hash_key_too_long() {
+        assert_eq!(hash_key(&[b'a'; 33]), Err(HandshakeError::BadWebsocketKey));
+        assert!(hash_key(&[b'a'; 32]).is_ok());
     }
 }

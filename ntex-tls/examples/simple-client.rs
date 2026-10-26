@@ -1,7 +1,6 @@
 use std::io;
 
-use ntex::service::{Pipeline, ServiceFactory};
-use ntex::{SharedCfg, codec, connect, util::Bytes, util::Either};
+use ntex::{Pipeline, SharedCfg, codec, connect, util::Bytes, util::Either};
 use tls_openssl::ssl::{self, SslFiletype, SslMethod, SslVerifyMode};
 
 #[ntex::main]
@@ -10,22 +9,24 @@ async fn main() -> io::Result<()> {
 
     println!("Connecting to openssl server: 127.0.0.1:8443");
 
-    // load ssl keys
+    // the example certificate doubles as a client certificate, the echo
+    // server prints it
     let mut builder = ssl::SslConnector::builder(SslMethod::tls()).unwrap();
     builder
-        .set_private_key_file("./examples/key.pem", SslFiletype::PEM)
+        .set_private_key_file(
+            concat!(env!("CARGO_MANIFEST_DIR"), "/examples/key.pem"),
+            SslFiletype::PEM,
+        )
         .unwrap();
     builder
-        .set_certificate_chain_file("./examples/cert.pem")
+        .set_certificate_chain_file(concat!(env!("CARGO_MANIFEST_DIR"), "/examples/cert.pem"))
         .unwrap();
     builder.set_verify(SslVerifyMode::NONE);
 
     // openssl connector
     let connector = Pipeline::new(
-        connect::openssl::SslConnector::new(builder.build())
-            .create(SharedCfg::default())
-            .await
-            .unwrap(),
+        SharedCfg::default(),
+        connect::openssl::SslConnector::new(builder.build()),
     );
 
     let io = connector.call("127.0.0.1:8443".into()).await.unwrap();

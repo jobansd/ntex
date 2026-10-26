@@ -1,16 +1,23 @@
 #![allow(clippy::missing_panics_doc, clippy::box_collection)]
-use std::{borrow::Borrow, cell::Cell, cmp, collections::VecDeque, fmt, io, mem, ops, ptr};
+use std::{borrow::Borrow, cell::Cell, cmp, collections::VecDeque, fmt, io, mem, ops};
 
-use crate::{BufMut, BytePageSize, ByteString, Bytes, BytesMut};
-use crate::{buf::UninitSlice, storage::StorageVec};
+use crate::{Buf, BufMut, BytePageSize, ByteString, Bytes, BytesMut};
+use crate::{buf::UninitSlice, stvec::StorageVec};
 
+/// A growable sequence of byte pages.
+///
+/// Data is stored in fixed-capacity pages selected by [`BytePageSize`]. This
+/// avoids reallocating and copying one large contiguous buffer as data grows.
 pub struct BytePages {
     st: Option<Box<Inner>>,
-    current: StorageVec,
+    current: Option<StorageVec>,
 }
 
+#[derive(Debug)]
 struct Inner {
     size: BytePageSize,
+    /// Total length of `pages`, so `len()` does not walk them.
+    len: usize,
     pages: VecDeque<BytePage>,
 }
 
@@ -19,33 +26,45 @@ thread_local! {
 }
 const CACHE_SIZE: usize = 128;
 
+/// Appended data up to this size is copied into the current page.
+const APPEND_COPY_LIMIT: usize = 4096;
+
 impl BytePages {
     /// Creates a new `BytePages` with the specified page size.
     ///
-    /// The returned `BytePages` will be hold one page with
-    /// specified capacity.
+    /// Pages are allocated lazily using the specified capacity category.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `size` is [`BytePageSize::Unset`].
     pub fn new(size: BytePageSize) -> Self {
-        debug_assert!(size != BytePageSize::Unset, "Page cannot be Unset");
+        assert!(size != BytePageSize::Unset, "Page size cannot be Unset");
 
-        let st = CACHE.with(move |c| {
-            let mut cache = c.take().unwrap();
-
-            let item = if let Some(mut item) = cache.pop() {
-                item.size = size;
+        // the cache is unavailable while the thread-local is being destroyed
+        let cached = CACHE
+            .try_with(|c| {
+                let mut cache = c.take()?;
+                let item = cache.pop();
+                c.set(Some(cache));
                 item
-            } else {
-                Box::new(Inner {
-                    size,
-                    pages: VecDeque::with_capacity(8),
-                })
-            };
-            c.set(Some(cache));
+            })
+            .ok()
+            .flatten();
+
+        let st = if let Some(mut item) = cached {
+            item.size = size;
             item
-        });
+        } else {
+            Box::new(Inner {
+                size,
+                len: 0,
+                pages: VecDeque::with_capacity(8),
+            })
+        };
 
         BytePages {
             st: Some(st),
-            current: StorageVec::sized(size),
+            current: None,
         }
     }
 
@@ -53,21 +72,45 @@ impl BytePages {
         &self.st.as_ref().unwrap().pages
     }
 
-    fn pages_mut(&mut self) -> &mut VecDeque<BytePage> {
-        &mut self.st.as_mut().unwrap().pages
+    // Pages are only added and removed through these methods, which keep
+    // `Inner::len` up to date. A page in the list is never modified in place.
+    fn push_front(&mut self, page: BytePage) {
+        let st = self.st.as_mut().unwrap();
+        st.len += page.len();
+        st.pages.push_front(page);
     }
 
-    /// Get size of the page.
+    fn pop_front(&mut self) -> Option<BytePage> {
+        let st = self.st.as_mut().unwrap();
+        let page = st.pages.pop_front()?;
+        st.len -= page.len();
+        Some(page)
+    }
+
+    fn push_back(&mut self, page: BytePage) {
+        let st = self.st.as_mut().unwrap();
+        st.len += page.len();
+        st.pages.push_back(page);
+    }
+
+    /// Returns the capacity category used for new pages.
     pub fn page_size(&self) -> BytePageSize {
         self.st.as_ref().unwrap().size
     }
 
     /// Sets the page size for new pages.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `size` is [`BytePageSize::Unset`].
     pub fn set_page_size(&mut self, size: BytePageSize) {
+        assert!(size != BytePageSize::Unset, "Page size cannot be Unset");
         self.st.as_mut().unwrap().size = size;
     }
 
-    /// Insert a page to the front of the collection.
+    /// Inserts a non-empty page at the front of the collection.
+    ///
+    /// Returns whether a page was inserted.
     pub fn prepend<T>(&mut self, buf: T) -> bool
     where
         BytePage: From<T>,
@@ -76,39 +119,46 @@ impl BytePages {
         if p.is_empty() {
             false
         } else {
-            self.pages_mut().push_front(p);
+            self.push_front(p);
             true
         }
     }
 
-    /// Appends a new page to the back of the collection.
+    /// Appends a page to the back of the collection.
+    ///
+    /// Empty pages are ignored. If the current page holds no data and `buf` is
+    /// a unique buffer with spare capacity, it becomes the new current page.
+    /// Data of up to 4 KiB is copied into the current page, and into new
+    /// pages as needed. Larger data is added as a separate page without
+    /// copying: the filled part of the current page is split off in front of
+    /// it, and the spare capacity of the current page stays available for
+    /// later writes.
     pub fn append<T>(&mut self, buf: T)
     where
         BytePage: From<T>,
     {
         let p = BytePage::from(buf);
-        let remaining = self.current.remaining();
-
-        if p.len() <= remaining {
-            self.put_slice(p.as_ref());
-        } else if self.current.len() == 0 {
-            match p.into_storage() {
-                Ok(st) => {
-                    self.current = st;
+        if !p.is_empty() {
+            if self.current_len() == 0 {
+                match p.into_storage() {
+                    Ok(st) => {
+                        self.current = Some(st);
+                    }
+                    Err(page) => {
+                        // add buffer to the page list
+                        self.push_back(page);
+                    }
                 }
-                Err(page) => {
-                    // add buffer to stack
-                    self.pages_mut().push_back(page);
+            } else if p.len() <= APPEND_COPY_LIMIT {
+                self.put_slice(p.as_ref());
+            } else {
+                // the spare capacity of the current page is kept
+                if let Some(st) = self.current.as_mut() {
+                    let head = st.split_to(st.len());
+                    self.push_back(<BytePage as From<Bytes>>::from(Bytes { storage: head }));
                 }
+                self.push_back(p);
             }
-        } else {
-            // push current storage to stack
-            let storage = StorageVec::sized(self.page_size());
-            let page: BytePage = From::from(mem::replace(&mut self.current, storage));
-            let pages = self.pages_mut();
-            pages.push_back(page);
-            // add buffer to stack
-            pages.push_back(p);
         }
     }
 
@@ -123,75 +173,166 @@ impl BytePages {
     }
 
     #[inline]
-    /// Gets the total number of pages.
+    /// Returns the total number of buffered bytes.
     pub fn len(&self) -> usize {
-        self.pages()
-            .iter()
-            .fold(self.current.len(), |c, page| c + page.len())
+        self.st.as_ref().unwrap().len + self.current_len()
+    }
+
+    fn current_len(&self) -> usize {
+        self.current
+            .as_ref()
+            .map(StorageVec::len)
+            .unwrap_or_default()
+    }
+
+    // spare capacity of the current page
+    fn spare(&self) -> usize {
+        self.current
+            .as_ref()
+            .map(StorageVec::remaining)
+            .unwrap_or_default()
     }
 
     #[inline]
-    /// Checks if the `BytePages` instance is empty.
+    /// Returns `true` if no bytes are buffered.
     pub fn is_empty(&self) -> bool {
-        for p in self.pages() {
-            if !p.is_empty() {
-                return false;
-            }
-        }
-        self.current.len() == 0
+        self.len() == 0
     }
 
     #[inline]
-    /// Returns the total number of pages contained in this object.
+    /// Returns the number of allocated pages containing buffered data.
     pub fn num_pages(&self) -> usize {
-        if self.current.len() == 0 {
+        if self.current_len() == 0 {
             self.pages().len()
         } else {
             self.pages().len() + 1
         }
     }
 
-    /// Returns the first page from the collection.
+    /// Removes and returns the first page from the collection.
+    ///
+    /// The current writable page is returned last. Returns `None` if there are
+    /// no pages with data, an empty current page keeps its spare capacity for
+    /// later writes.
     pub fn take(&mut self) -> Option<BytePage> {
-        if let Some(page) = self.pages_mut().pop_front() {
+        if let Some(page) = self.pop_front() {
             Some(page)
-        } else if self.current.len() == 0 {
+        } else if self.current_len() == 0 {
             None
         } else {
-            let storage = StorageVec::sized(self.page_size());
-            Some(BytePage::from(mem::replace(&mut self.current, storage)))
+            self.current.take().map(BytePage::from)
+        }
+    }
+
+    /// Returns an iterator over the buffered data, one slice per page.
+    ///
+    /// The current writable page is yielded last, if it holds data. The
+    /// pages are stored on the heap, so their data stays at the same address
+    /// when `self` is moved, until `self` is modified or dropped.
+    pub fn iter(&self) -> impl Iterator<Item = &[u8]> {
+        self.pages().iter().map(BytePage::as_ref).chain(
+            self.current
+                .as_ref()
+                .map(StorageVec::as_ref)
+                .filter(|s| !s.is_empty()),
+        )
+    }
+
+    /// Advance the internal cursor.
+    ///
+    /// Afterwards `self` contains elements `[cnt, len)`. Fully consumed pages
+    /// are dropped, the current writable page keeps its spare capacity.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `cnt > len`.
+    pub fn advance_to(&mut self, mut cnt: usize) {
+        assert!(
+            cnt <= self.len(),
+            "cannot advance past the end of the buffer, cnt:{cnt} len:{}",
+            self.len()
+        );
+
+        while cnt > 0
+            && let Some(mut page) = self.pop_front()
+        {
+            if cnt < page.len() {
+                page.advance_to(cnt);
+                self.push_front(page);
+                return;
+            }
+            cnt -= page.len();
+        }
+        if cnt > 0
+            && let Some(st) = self.current.as_mut()
+        {
+            // SAFETY: `cnt <= st.len()`, checked by the assert above
+            unsafe { st.set_start(cnt) };
         }
     }
 
     #[inline]
-    /// Copies all pages into another `BytePages` instance.
+    /// Appends all buffered data to another [`BytePages`] value, `self` is
+    /// left unchanged.
     ///
-    /// Depending on the underlying storage, this operation might be `O(1)` or could
-    /// involve a memory copy.
+    /// Pages are shared with `pages` rather than copied, unless they are small
+    /// enough to be copied into the current page of `pages`, see
+    /// [`append`](Self::append).
     pub fn copy_to(&self, pages: &mut BytePages) {
         for p in self.pages() {
             pages.append(p.clone());
         }
 
-        if self.current.len() != 0 {
-            pages.append(BytePage::from(Bytes::copy_from_slice(
-                self.current.as_ref(),
-            )));
+        if let Some(st) = &self.current {
+            // an immutable view, `st` stays the only handle that can write
+            // to the spare capacity
+            pages.append(Bytes {
+                storage: st.shallow_freeze(),
+            });
         }
     }
 
-    #[inline]
-    /// Moves all pages to another `BytePages` instance.
+    /// Moves all buffered data to the back of another [`BytePages`] value,
+    /// leaving `self` empty.
+    ///
+    /// Pages are moved as is, without copying or merging. The filled part of
+    /// the current page of `pages` is split off in front of the moved data,
+    /// its spare capacity stays available for later writes. The current page
+    /// of `self` is moved as a regular page.
     pub fn move_to(&mut self, pages: &mut BytePages) {
-        while let Some(page) = self.take() {
-            pages.append(page);
+        if self.is_empty() {
+            return;
+        }
+
+        if let Some(st) = pages.current.as_mut()
+            && st.len() != 0
+        {
+            let head = st.split_to(st.len());
+            pages.push_back(<BytePage as From<Bytes>>::from(Bytes { storage: head }));
+        }
+
+        let src = self.st.as_mut().unwrap();
+        let dst = pages.st.as_mut().unwrap();
+        if dst.pages.is_empty() {
+            mem::swap(&mut src.pages, &mut dst.pages);
+            dst.len = mem::take(&mut src.len);
+        } else {
+            while let Some(page) = self.pop_front() {
+                pages.push_back(page);
+            }
+        }
+
+        if self.current_len() != 0
+            && let Some(st) = self.current.take()
+        {
+            pages.push_back(BytePage::from(st));
         }
     }
 
     /// Splits the buffer into two at the given index.
     ///
-    /// Afterwards, `self` contains elements `[at, len)`, and the returned `BytePage`
-    /// contains elements `[0, at)`.
+    /// Afterwards, `self` contains elements `[at, len)`, and the returned [`BytePages`]
+    /// contains elements `[0, at)`. If `at > len`, all data is moved.
     ///
     /// Depending on the underlying storage, this operation might be `O(1)` or could
     /// involve a memory copy.
@@ -204,32 +345,36 @@ impl BytePages {
 
     /// Splits the buffer, adding the resulting items to the supplied pages object.
     ///
-    /// Afterwards, `self` contains elements `[at, len)`, and the supplied `BytePage`
-    /// contains elements `[0, at)`.
+    /// Afterwards, `self` contains elements `[at, len)`, and elements `[0, at)`
+    /// are appended to `to`. If `at > len`, all data is moved.
     ///
     /// Depending on the underlying storage, this operation might be `O(1)` or could
     /// involve a memory copy.
     pub fn split_into(&mut self, mut at: usize, to: &mut BytePages) {
-        {
-            let pages = self.pages_mut();
-
-            while let Some(mut page) = pages.pop_front() {
-                let len = cmp::min(page.len(), at);
-                to.append(page.split_to(len));
-
-                if !page.is_empty() {
-                    pages.push_front(page);
-                    return;
-                }
-                at -= len;
-            }
-        }
-        if at > 0
-            && let Some(mut page) = self.take()
-        {
+        while let Some(mut page) = self.pop_front() {
             let len = cmp::min(page.len(), at);
             to.append(page.split_to(len));
-            self.append(page);
+
+            if !page.is_empty() {
+                self.push_front(page);
+                return;
+            }
+            at -= len;
+        }
+        if at > 0
+            && let Some(mut st) = self.current.take()
+        {
+            if at < st.len() {
+                // the remainder stays writable, so its spare capacity is kept
+                to.append(Bytes {
+                    storage: st.split_to(at),
+                });
+                self.current = Some(st);
+            } else if st.len() == 0 {
+                self.current = Some(st);
+            } else {
+                to.append(BytePage::from(st));
+            }
         }
     }
 
@@ -239,7 +384,7 @@ impl BytePages {
         while self.take().is_some() {}
     }
 
-    /// Converts `self` into an immutable `Bytes`.
+    /// Drains all pages into one immutable [`Bytes`] value.
     #[inline]
     #[must_use]
     pub fn freeze(&mut self) -> Bytes {
@@ -258,55 +403,92 @@ impl BytePages {
     }
 
     #[inline]
+    /// Moves the current writable page from `pages` if this value is empty.
     pub fn try_get_current_from(&mut self, pages: &mut BytePages) {
-        if self.pages().is_empty() && self.current.len() == 0 && pages.current.len() != 0 {
-            self.current =
-                mem::replace(&mut pages.current, StorageVec::sized(self.page_size()));
+        if self.pages().is_empty()
+            && self.current.is_none()
+            && let Some(st) = pages.current.take()
+        {
+            self.current = Some(st);
         }
     }
 
-    /// Access current page as `BytesMut` object
+    /// Passes a new mutable buffer to `f` and appends its contents.
+    ///
+    /// After `f` returns, the buffer is appended according to the rules of
+    /// [`append`](Self::append). Existing pages and the current writable page
+    /// are not exposed to `f`. If `f` panics, the temporary buffer is dropped
+    /// and this collection is unchanged.
+    ///
+    /// This is a low-level API intended for ntex internals and may change
+    /// without notice.
+    #[doc(hidden)]
+    #[deprecated(
+        since = "1.10.0",
+        note = "use the `BufMut` methods of `BytePages` instead"
+    )]
     pub fn with_bytes_mut<F, R>(&mut self, f: F) -> R
     where
         F: FnOnce(&mut BytesMut) -> R,
     {
-        let cap = self.current.capacity();
-        let mut buf = BytesMut {
-            storage: StorageVec(self.current.0),
-        };
-
+        let mut buf = BytesMut::new();
         let res = f(&mut buf);
-
-        // `buf.storage` cal re-allocate, makes self.current invalid
-        self.current.0 = buf.storage.0;
-        if buf.capacity() != cap {
-            buf.storage.unsize();
-        }
-        // buf.storage.0 uses same pointer as self.current.0
-        mem::forget(buf);
-
-        // add new page
-        if self.current.len() >= self.page_size().capacity() {
-            let storage = StorageVec::sized(self.page_size());
-            let page = BytePage::from(mem::replace(&mut self.current, storage));
-            self.pages_mut().push_back(page);
-        }
-
+        self.append(buf);
         res
+    }
+
+    // Returns the current page if it has spare capacity, or a new page.
+    //
+    // The current page can be full, for example after `advance_mut` filled
+    // it, a full page moves to the page list, an empty one is dropped.
+    fn take_writable(&mut self) -> StorageVec {
+        match self.current.take() {
+            Some(st) if !st.is_full() => st,
+            Some(st) => {
+                if st.len() != 0 {
+                    self.push_back(BytePage::from(st));
+                }
+                StorageVec::sized(self.page_size())
+            }
+            None => StorageVec::sized(self.page_size()),
+        }
+    }
+
+    fn with_current<F, R>(&mut self, f: F) -> R
+    where
+        F: FnOnce(&mut StorageVec) -> R,
+    {
+        let mut st = self.take_writable();
+        let result = f(&mut st);
+
+        // a full page moves to the page list
+        if st.is_full() {
+            self.push_back(BytePage::from(st));
+        } else {
+            self.current = Some(st);
+        }
+
+        result
     }
 }
 
 impl Drop for BytePages {
     fn drop(&mut self) {
-        CACHE.with(move |c| {
-            let mut cache = c.take().unwrap();
-            if cache.len() < CACHE_SIZE {
-                let mut st = self.st.take().unwrap();
-                st.pages.clear();
-                cache.push(st);
-            }
-            c.set(Some(cache));
-        });
+        if let Some(mut st) = self.st.take() {
+            st.pages.clear();
+            // a large write must not pin its page list in the cache
+            st.pages.shrink_to(8);
+            st.len = 0;
+            // the cache is unavailable while the thread-local is being destroyed
+            let _ = CACHE.try_with(move |c| {
+                if let Some(mut cache) = c.take() {
+                    if cache.len() < CACHE_SIZE {
+                        cache.push(st);
+                    }
+                    c.set(Some(cache));
+                }
+            });
+        }
     }
 }
 
@@ -316,8 +498,8 @@ impl fmt::Debug for BytePages {
         for p in self.pages() {
             f.field(p);
         }
-        if self.current.len() != 0 {
-            f.field(&crate::debug::BsDebug(self.current.as_ref()));
+        if let Some(st) = &self.current {
+            f.field(&crate::debug::BsDebug(st.as_ref()));
         }
         f.finish()
     }
@@ -329,60 +511,58 @@ impl Default for BytePages {
     }
 }
 
+/// Pages are allocated on demand, so `remaining_mut()` reports
+/// `usize::MAX - len` and `chunk_mut()` is never empty. The chunk covers the
+/// spare capacity of the current page only.
 impl BufMut for BytePages {
     #[inline]
     fn remaining_mut(&self) -> usize {
-        self.current.remaining()
+        usize::MAX - self.len()
     }
 
     #[inline]
     unsafe fn advance_mut(&mut self, cnt: usize) {
-        // This call will panic if `cnt` is too big
-        self.current.set_len(self.current.len() + cnt);
+        if cnt == 0 {
+            return;
+        }
+        let spare = self.spare();
+        assert!(
+            cnt <= spare,
+            "cannot advance past the current page: {cnt:?} <= {spare:?}"
+        );
+        let st = self.current.as_mut().unwrap();
+        st.set_len(st.len() + cnt);
     }
 
     #[inline]
     fn chunk_mut(&mut self) -> &mut UninitSlice {
-        unsafe {
-            // This will never panic as `len` can never become invalid
-            let ptr = &mut self.current.as_ptr();
-            UninitSlice::from_raw_parts_mut(
-                ptr.add(self.current.len()),
-                self.remaining_mut(),
-            )
+        let st = self.take_writable();
+        self.current.insert(st).spare_mut()
+    }
+
+    fn put<T: Buf>(&mut self, mut src: T)
+    where
+        Self: Sized,
+    {
+        while src.has_remaining() {
+            let chunk = src.chunk();
+            let len = chunk.len();
+            self.put_slice(chunk);
+            src.advance(len);
         }
     }
 
     fn put_slice(&mut self, mut src: &[u8]) {
         while !src.is_empty() {
-            let amount = cmp::min(src.len(), self.current.remaining());
-            unsafe {
-                ptr::copy_nonoverlapping(
-                    src.as_ptr(),
-                    self.chunk_mut().as_mut_ptr(),
-                    amount,
-                );
-                self.advance_mut(amount);
-            }
-            src = &src[amount..];
+            let amount = self.with_current(|st| st.put_slice_partial(src));
 
-            // add new page
-            if self.current.is_full() {
-                let storage = StorageVec::sized(self.page_size());
-                let page = BytePage::from(mem::replace(&mut self.current, storage));
-                self.pages_mut().push_back(page);
-            }
+            src = &src[amount..];
         }
     }
 
     #[inline]
     fn put_u8(&mut self, n: u8) {
-        self.current.put_u8(n);
-        if self.current.is_full() {
-            let storage = StorageVec::sized(self.page_size());
-            let page: BytePage = From::from(mem::replace(&mut self.current, storage));
-            self.pages_mut().push_back(page);
-        }
+        self.with_current(|st| st.put_u8(n));
     }
 
     #[inline]
@@ -412,13 +592,20 @@ impl io::Write for BytePages {
 }
 
 impl From<BytePages> for Bytes {
-    fn from(pages: BytePages) -> Bytes {
-        BytesMut::from(pages).freeze()
+    /// A single page is converted without copying.
+    fn from(mut pages: BytePages) -> Bytes {
+        pages.freeze()
     }
 }
 
 impl From<BytePages> for BytesMut {
+    /// A single page is converted without copying if nothing else refers to
+    /// its buffer.
     fn from(mut pages: BytePages) -> BytesMut {
+        if pages.num_pages() == 1 {
+            return BytesMut::from(pages.take().unwrap());
+        }
+
         let mut buf = BytesMut::with_capacity(pages.len());
         while let Some(p) = pages.take() {
             buf.extend_from_slice(&p);
@@ -427,6 +614,7 @@ impl From<BytePages> for BytesMut {
     }
 }
 
+/// A contiguous chunk stored by [`BytePages`].
 pub struct BytePage {
     inner: StorageType,
 }
@@ -441,25 +629,25 @@ impl BytePage {
     #[inline]
     /// Returns the number of bytes contained in this `BytePage`.
     pub fn len(&self) -> usize {
-        match &self.inner {
-            StorageType::Bytes(b) => b.len(),
-            StorageType::Storage(b) => b.len(),
-            StorageType::Vec(b) => b.len(),
-        }
+        self.as_ref().len()
     }
 
     #[inline]
-    /// Returns true if the `BytePage` has a length of 0.
+    /// Returns `true` if the page is empty.
     pub fn is_empty(&self) -> bool {
-        match &self.inner {
-            StorageType::Bytes(b) => b.is_empty(),
-            StorageType::Storage(b) => b.len() == 0,
-            StorageType::Vec(b) => b.is_empty(),
-        }
+        self.len() == 0
     }
 
-    /// Return a raw pointer to data.
-    pub fn as_ptr(&self) -> *const u8 {
+    #[inline]
+    /// Returns a raw pointer to the data.
+    ///
+    /// # Safety
+    ///
+    /// The returned pointer may only be dereferenced while the page is neither
+    /// moved, modified nor dropped, and only for [`len`](Self::len) bytes. An
+    /// inline page stores its data inside the `BytePage` itself, so moving the
+    /// page invalidates the pointer, see [`is_inline`](Self::is_inline).
+    pub unsafe fn as_ptr(&self) -> *const u8 {
         unsafe {
             match &self.inner {
                 StorageType::Bytes(b) => b.storage.as_ptr(),
@@ -469,10 +657,31 @@ impl BytePage {
         }
     }
 
+    #[inline]
+    #[doc(hidden)]
+    /// Returns the kind of storage backing this page.
+    pub fn info(&self) -> crate::info::PageKind {
+        match &self.inner {
+            StorageType::Bytes(_) => crate::info::PageKind::Bytes,
+            StorageType::Storage(_) => crate::info::PageKind::Storage,
+            StorageType::Vec(_) => crate::info::PageKind::Vec,
+        }
+    }
+
+    #[inline]
+    #[doc(hidden)]
+    /// Returns `true` if the data is stored inside the `BytePage` itself.
+    ///
+    /// Moving an inline page moves its data, pointers from `as_ptr()` do not
+    /// survive the move.
+    pub fn is_inline(&self) -> bool {
+        matches!(&self.inner, StorageType::Bytes(b) if b.is_inline())
+    }
+
     /// Splits the buffer into two at the given index.
     ///
     /// Afterwards, `self` contains elements `[at, len)`, and the returned `BytePage`
-    /// contains elements `[0, at)`.
+    /// contains elements `[0, at)`. If `at > len`, all data is moved.
     ///
     /// Depending on the underlying storage, this operation might be `O(1)` or could
     /// involve a memory copy.
@@ -511,7 +720,8 @@ impl BytePage {
     /// Advance the internal cursor.
     ///
     /// Afterwards `self` contains elements `[cnt, len)`.
-    /// This is an `O(1)` operation.
+    /// This is an `O(1)` operation, except for pages backed by a `Vec<u8>`,
+    /// whose remaining data is copied.
     ///
     /// # Panics
     ///
@@ -520,8 +730,13 @@ impl BytePage {
     pub fn advance_to(&mut self, cnt: usize) {
         match &mut self.inner {
             StorageType::Bytes(b) => b.advance_to(cnt),
-            StorageType::Storage(b) => unsafe { b.set_start(cnt as u32) },
+            StorageType::Storage(b) => unsafe { b.set_start(cnt) },
             StorageType::Vec(b) => {
+                assert!(
+                    cnt <= b.len(),
+                    "cannot advance past the end of the buffer, cnt:{cnt} len:{}",
+                    b.len()
+                );
                 self.inner = StorageType::Bytes(Bytes::copy_from_slice(&b[cnt..]));
             }
         }
@@ -541,7 +756,7 @@ impl BytePage {
     }
 
     fn into_storage(self) -> Result<StorageVec, Self> {
-        if let StorageType::Storage(mut st) = self.inner {
+        if let StorageType::Storage(st) = self.inner {
             // SAFETY: Converting back to `StorageVec` requires uniqueness.
             if !st.is_full() && st.is_unique() {
                 Ok(st)
@@ -560,11 +775,11 @@ impl Clone for BytePage {
     fn clone(&self) -> Self {
         let inner = match &self.inner {
             StorageType::Bytes(b) => StorageType::Bytes(b.clone()),
-            StorageType::Storage(st) => {
-                // SAFETY: We garantee that `st` is not being used
-                // for modification. `st` is marked as non-unique after clone
-                StorageType::Storage(unsafe { st.clone() })
-            }
+            // The clone is an immutable view, `st` must stay the only
+            // handle that can modify the shared header and spare capacity
+            StorageType::Storage(st) => StorageType::Bytes(Bytes {
+                storage: st.shallow_freeze(),
+            }),
             StorageType::Vec(b) => StorageType::Bytes(Bytes::copy_from_slice(b)),
         };
 
@@ -644,19 +859,19 @@ impl From<Vec<u8>> for BytePage {
 
 impl From<&'static str> for BytePage {
     fn from(buf: &'static str) -> Self {
-        BytePage::from(Bytes::from_static(buf.as_bytes()))
+        Bytes::from_static(buf.as_bytes()).into()
     }
 }
 
 impl From<&'static [u8]> for BytePage {
     fn from(buf: &'static [u8]) -> Self {
-        BytePage::from(Bytes::from_static(buf))
+        Bytes::from_static(buf).into()
     }
 }
 
 impl<const N: usize> From<&'static [u8; N]> for BytePage {
-    fn from(src: &'static [u8; N]) -> Self {
-        BytePage::from(Bytes::from_static(src))
+    fn from(buf: &'static [u8; N]) -> Self {
+        Bytes::from_static(buf).into()
     }
 }
 
@@ -674,7 +889,14 @@ impl From<BytePage> for BytesMut {
     fn from(page: BytePage) -> Self {
         match page.inner {
             StorageType::Bytes(b) => b.into(),
-            StorageType::Storage(storage) => BytesMut { storage },
+            // clones of the page may still read the data
+            StorageType::Storage(storage) => {
+                if storage.is_unique() {
+                    BytesMut { storage }
+                } else {
+                    BytesMut::copy_from_slice(storage.as_ref())
+                }
+            }
             StorageType::Vec(v) => BytesMut::copy_from_slice(&v),
         }
     }
@@ -686,28 +908,9 @@ impl PartialEq for BytePage {
     }
 }
 
-impl<'a> PartialEq<&'a [u8]> for BytePage {
-    fn eq(&self, other: &&'a [u8]) -> bool {
-        self.as_ref() == *other
-    }
-}
+impl_partial_eq!(BytePage);
 
-impl<'a, const N: usize> PartialEq<&'a [u8; N]> for BytePage {
-    fn eq(&self, other: &&'a [u8; N]) -> bool {
-        self.as_ref() == other.as_ref()
-    }
-}
-
-impl io::Read for BytePage {
-    fn read(&mut self, dst: &mut [u8]) -> io::Result<usize> {
-        let len = cmp::min(self.len(), dst.len());
-        if len > 0 {
-            dst[..len].copy_from_slice(&self[..len]);
-            self.advance_to(len);
-        }
-        Ok(len)
-    }
-}
+impl_read!(BytePage);
 
 impl ops::Deref for BytePage {
     type Target = [u8];
@@ -731,103 +934,537 @@ mod tests {
     use super::*;
 
     #[test]
-    fn pages() {
-        // pages
-        let mut pages = BytePages::new(BytePageSize::Size8);
-        assert!(pages.is_empty());
-        assert_eq!(pages.len(), 0);
-        assert_eq!(pages.num_pages(), 0);
-        pages.extend_from_slice(b"b");
-        assert_eq!(pages.len(), 1);
+    #[allow(clippy::op_ref, clippy::cmp_owned)]
+    fn page_eq_and_read() {
+        use std::io::Read;
+
+        let mut page = BytePage::from(Vec::from(&b"hello"[..]));
+        assert_eq!(page, b"hello"[..]);
+        assert_eq!(page, *b"hello");
+        assert_eq!(page, b"hello");
+        assert_eq!(page, &b"hello"[..]);
+        assert_eq!(page, "hello");
+        assert_eq!(page, *"hello");
+        assert_eq!(page, b"hello".to_vec());
+        assert_eq!(page, String::from("hello"));
+        assert_eq!(b"hello"[..], page);
+        assert_eq!(*b"hello", page);
+        assert_eq!(b"hello", page);
+        assert_eq!(&b"hello"[..], page);
+        assert_eq!("hello", page);
+        assert_eq!(*"hello", page);
+        assert_eq!(b"hello".to_vec(), page);
+        assert_eq!(String::from("hello"), page);
+        assert_ne!(page, "hell");
+
+        let mut buf = [0u8; 3];
+        assert_eq!(page.read(&mut buf).unwrap(), 3);
+        assert_eq!(&buf, b"hel");
+        assert_eq!(page, "lo");
+        assert_eq!(page.read(&mut buf).unwrap(), 2);
+        assert_eq!(page.read(&mut buf).unwrap(), 0);
+        assert!(page.is_empty());
+    }
+
+    #[test]
+    fn page_info() {
+        use crate::info::PageKind;
+
+        let p = BytePage::from(Bytes::copy_from_slice(&[1; 64]));
+        assert_eq!(p.info(), PageKind::Bytes);
+        let p = BytePage::from(BytesMut::copy_from_slice(&[1; 64][..]));
+        assert_eq!(p.info(), PageKind::Storage);
+        let p = BytePage::from(vec![1; 64]);
+        assert_eq!(p.info(), PageKind::Vec);
+        assert!(!p.is_inline());
+
+        assert!(BytePage::from(Bytes::copy_from_slice(&[1; 4])).is_inline());
+        assert!(!BytePage::from(Bytes::copy_from_slice(&[1; 64])).is_inline());
+        assert!(!BytePage::from(BytesMut::copy_from_slice(&[1; 4][..])).is_inline());
+    }
+
+    #[test]
+    fn append_copies_small_and_splits_for_large() {
+        let cap = BytePageSize::Size16.capacity();
+        let mut pages = BytePages::new(BytePageSize::Size16);
+        pages.extend_from_slice(b"head\r\n");
+
+        // small data is copied into the current page
+        pages.append(Bytes::copy_from_slice(&[1; APPEND_COPY_LIMIT]));
         assert_eq!(pages.num_pages(), 1);
-        pages.extend_from_slice("a".repeat(9 * 1024).as_bytes());
-        assert_eq!(pages.len(), 9217);
+        assert_eq!(pages.current_len(), 6 + APPEND_COPY_LIMIT);
+
+        // large data is not copied, the filled part is split off in front
+        let body = Bytes::copy_from_slice(&[2; APPEND_COPY_LIMIT + 1]);
+        let body_ptr = body.as_ptr();
+        pages.append(body.clone());
         assert_eq!(pages.num_pages(), 2);
-        assert!(!pages.is_empty());
+        assert_eq!(pages.current_len(), 0);
+        assert_eq!(pages.spare(), cap - 6 - APPEND_COPY_LIMIT);
 
-        let mut pgs = BytePages::new(BytePageSize::Size8);
-        pgs.put_i8(b'a' as i8);
-        let p = pgs.take().unwrap();
-        assert_eq!(p.len(), 1);
-        assert_eq!(p.as_ref(), b"a");
+        // later writes use the spare capacity of the current page
+        let page_ptr = pages.pages()[0].as_ref().as_ptr();
+        pages.extend_from_slice(b"\r\n");
+        assert_eq!(pages.num_pages(), 3);
+        let tail_ptr = pages.current.as_ref().unwrap().as_ref().as_ptr();
+        assert_eq!(tail_ptr, page_ptr.wrapping_add(6 + APPEND_COPY_LIMIT));
 
-        pgs.extend_from_slice("a".repeat(8 * 1024 - 1).as_bytes());
-        assert_eq!(pgs.num_pages(), 1);
-        pgs.put_u8(b'a');
-        assert_eq!(pgs.num_pages(), 1);
-        assert_eq!(pgs.current.len(), 0);
+        let mut expected = b"head\r\n".to_vec();
+        expected.extend_from_slice(&[1; APPEND_COPY_LIMIT]);
+        expected.extend_from_slice(&body);
+        expected.extend_from_slice(b"\r\n");
+        assert_eq!(pages.len(), expected.len());
 
-        pgs.put_u8(b'a');
-        assert_eq!(pgs.num_pages(), 2);
-
-        pgs.append(Bytes::copy_from_slice("a".repeat(8 * 1024).as_bytes()));
-        assert_eq!(pgs.num_pages(), 3);
-        assert_eq!(pgs.current.len(), 0);
-
-        // page
-        let p = pages.take().unwrap();
-        assert_eq!(p.len(), 8192);
-        let p = pages.take().unwrap();
-        assert_eq!(p.len(), 1025);
-        assert!(!p.is_empty());
-        assert_eq!(p.as_ref().as_ptr(), p.as_ptr());
-        assert_eq!(p.as_ref(), "a".repeat(1025).as_bytes());
+        let first = pages.take().unwrap();
+        let second = pages.take().unwrap();
+        assert_eq!(second.as_ref().as_ptr(), body_ptr);
+        let third = pages.take().unwrap();
         assert!(pages.take().is_none());
+        let data = [first.as_ref(), second.as_ref(), third.as_ref()].concat();
+        assert_eq!(data, expected);
 
-        let p = BytePage::from(Bytes::copy_from_slice(b"123"));
-        assert_eq!(p.len(), 3);
-        assert!(!p.is_empty());
-        assert_eq!(p.as_ref(), b"123");
-        assert_eq!(p.as_ref().as_ptr(), p.as_ptr());
+        // draining the pages keeps an empty current page for later writes
+        pages.extend_from_slice(b"x");
+        pages.append(body);
+        assert_eq!(pages.take().unwrap().as_ref(), b"x");
+        assert_eq!(pages.take().unwrap().len(), APPEND_COPY_LIMIT + 1);
+        assert!(pages.take().is_none());
+        assert_eq!(pages.num_pages(), 0);
+        assert_eq!(pages.spare(), cap - 1);
+    }
 
-        let p = BytePage::from(&b"123"[..]);
-        assert_eq!(p.len(), 3);
-        assert!(!p.is_empty());
-        assert_eq!(p.as_ref(), b"123");
-        assert_eq!(p.as_ref().as_ptr(), p.as_ptr());
+    #[test]
+    fn pages() {
+        let cap = BytePageSize::Size8.capacity();
+        unsafe {
+            // pages
+            let mut pages = BytePages::new(BytePageSize::Size8);
+            assert!(pages.is_empty());
+            assert_eq!(pages.len(), 0);
+            assert_eq!(pages.num_pages(), 0);
+            pages.extend_from_slice(b"b");
+            assert_eq!(pages.len(), 1);
+            assert_eq!(pages.num_pages(), 1);
+            pages.extend_from_slice("a".repeat(9 * 1024).as_bytes());
+            assert_eq!(pages.len(), 9217);
+            assert_eq!(pages.num_pages(), 2);
+            assert!(!pages.is_empty());
 
-        let p = BytePage::from(b"123");
-        assert_eq!(p.len(), 3);
-        assert!(!p.is_empty());
-        assert_eq!(p.as_ref(), b"123");
-        assert_eq!(p.as_ref().as_ptr(), p.as_ptr());
+            let mut pgs = BytePages::new(BytePageSize::Size8);
+            pgs.put_i8(b'a' as i8);
+            let p = pgs.take().unwrap();
+            assert_eq!(p.len(), 1);
+            assert_eq!(p.as_ref(), b"a");
 
-        let p = BytePage::from("123");
-        assert_eq!(p.len(), 3);
-        assert!(!p.is_empty());
-        assert_eq!(p.as_ref(), b"123");
-        assert_eq!(p.as_ref().as_ptr(), p.as_ptr());
-        assert_eq!(p.freeze(), b"123");
+            pgs.extend_from_slice("a".repeat(cap - 1).as_bytes());
+            assert_eq!(pgs.num_pages(), 1);
+            pgs.put_u8(b'a');
+            assert_eq!(pgs.num_pages(), 1);
+            assert!(pgs.current.is_none());
 
-        let p = BytePage::from(vec![b'1', b'2', b'3']);
-        assert_eq!(p.len(), 3);
-        assert!(!p.is_empty());
-        assert_eq!(p.as_ref(), b"123");
-        assert_eq!(p.as_ref().as_ptr(), p.as_ptr());
-        assert_eq!(p.freeze(), b"123");
+            pgs.put_u8(b'a');
+            assert_eq!(pgs.num_pages(), 2);
 
-        let mut p = BytePage::from(vec![b'1', b'2', b'3']);
-        p.advance_to(1);
-        assert_eq!(p.len(), 2);
-        assert!(!p.is_empty());
-        assert_eq!(p.as_ref(), b"23");
+            pgs.append(Bytes::copy_from_slice("a".repeat(cap).as_bytes()));
+            assert_eq!(pgs.num_pages(), 3);
+            assert_eq!(pgs.current_len(), 0);
+            assert_eq!(pgs.spare(), cap - 1);
 
-        // debug
+            // page
+            let p = pages.take().unwrap();
+            assert_eq!(p.len(), cap);
+            let p = pages.take().unwrap();
+            assert_eq!(p.len(), 9217 - cap);
+            assert!(!p.is_empty());
+            assert_eq!(p.as_ref().as_ptr(), p.as_ptr());
+            assert_eq!(p.as_ref(), "a".repeat(9217 - cap).as_bytes());
+            assert!(pages.take().is_none());
+
+            let p = BytePage::from(Bytes::copy_from_slice(b"123"));
+            assert_eq!(p.len(), 3);
+            assert!(!p.is_empty());
+            assert_eq!(p.as_ref(), b"123");
+            assert_eq!(p.as_ref().as_ptr(), p.as_ptr());
+
+            let p = BytePage::from(&b"123"[..]);
+            assert_eq!(p.len(), 3);
+            assert!(!p.is_empty());
+            assert_eq!(p.as_ref(), b"123");
+            assert_eq!(p.as_ref().as_ptr(), p.as_ptr());
+
+            let p = BytePage::from(b"123");
+            assert_eq!(p.len(), 3);
+            assert!(!p.is_empty());
+            assert_eq!(p.as_ref(), b"123");
+            assert_eq!(p.as_ref().as_ptr(), p.as_ptr());
+
+            let p = BytePage::from("123");
+            assert_eq!(p.len(), 3);
+            assert!(!p.is_empty());
+            assert_eq!(p.as_ref(), b"123");
+            assert_eq!(p.as_ref().as_ptr(), p.as_ptr());
+            assert_eq!(p.freeze(), b"123");
+
+            let p = BytePage::from(vec![b'1', b'2', b'3']);
+            assert_eq!(p.len(), 3);
+            assert!(!p.is_empty());
+            assert_eq!(p.as_ref(), b"123");
+            assert_eq!(p.as_ref().as_ptr(), p.as_ptr());
+            assert_eq!(p.freeze(), b"123");
+
+            let mut p = BytePage::from(vec![b'1', b'2', b'3']);
+            p.advance_to(1);
+            assert_eq!(p.len(), 2);
+            assert!(!p.is_empty());
+            assert_eq!(p.as_ref(), b"23");
+
+            // debug
+            let mut pages = BytePages::new(BytePageSize::Size8);
+            pages.extend_from_slice(b"b");
+            assert_eq!(format!("{pages:?}"), "BytePages(b\"b\")");
+            let p = pages.take().unwrap();
+            assert_eq!(p.as_ref(), b"b");
+
+            let mut pages = BytePages::new(BytePageSize::Size8);
+            pages.extend_from_slice(b"a");
+            pages.append(Bytes::copy_from_slice(b"123"));
+            pages.push_back(p);
+            assert_eq!(format!("{pages:?}"), "BytePages(b\"b\", b\"a123\")");
+
+            assert_eq!(pages.len(), 5);
+            pages.clear();
+            assert_eq!(pages.len(), 0);
+        }
+    }
+
+    /// Checks the tracked length against the pages.
+    fn assert_len(pages: &BytePages) {
+        let len = pages.pages().iter().map(BytePage::len).sum::<usize>() + pages.current_len();
+        assert_eq!(pages.len(), len);
+        assert_eq!(pages.is_empty(), len == 0);
+    }
+
+    #[test]
+    fn pages_len_tracking() {
+        let mut rng = rand::rng();
         let mut pages = BytePages::new(BytePageSize::Size8);
-        pages.extend_from_slice(b"b");
-        assert_eq!(format!("{pages:?}"), "BytePages(b\"b\")");
-        let p = pages.take().unwrap();
-        assert_eq!(p.as_ref(), b"b");
+        let mut other = BytePages::new(BytePageSize::Size8);
+        let mut expected = 0;
 
-        let mut pages = BytePages::new(BytePageSize::Size8);
-        pages.extend_from_slice(b"a");
-        pages.append(Bytes::copy_from_slice(b"123"));
-        pages.pages_mut().push_back(p);
-        assert_eq!(format!("{pages:?}"), "BytePages(b\"b\", b\"a123\")");
+        let (iters, max) = if cfg!(miri) { (100, 256) } else { (2000, 12 * 1024) };
+        for _ in 0..iters {
+            let n = rng.random_range(0..max);
+            match rng.random_range(0..9) {
+                0 => {
+                    pages.extend_from_slice(&vec![1; n]);
+                    expected += n;
+                }
+                1 => {
+                    pages.append(Bytes::copy_from_slice(&vec![2; n]));
+                    expected += n;
+                }
+                2 => {
+                    if pages.prepend(BytesMut::copy_from_slice(vec![3; n])) {
+                        expected += n;
+                    }
+                }
+                3 => {
+                    if let Some(p) = pages.take() {
+                        expected -= p.len();
+                    }
+                }
+                4 => {
+                    let at = cmp::min(n, expected);
+                    let split = pages.split_to(at);
+                    assert_len(&split);
+                    assert_eq!(split.len(), at);
+                    expected -= at;
+                }
+                5 => {
+                    let at = cmp::min(n, expected);
+                    pages.split_into(at, &mut other);
+                    expected -= at;
+                }
+                6 => {
+                    other.move_to(&mut pages);
+                    assert_len(&other);
+                    assert!(other.is_empty());
+                    expected = pages.len();
+                }
+                7 => {
+                    let mut copy = BytePages::new(BytePageSize::Size8);
+                    pages.copy_to(&mut copy);
+                    assert_len(&copy);
+                    assert_eq!(copy.len(), expected);
+                }
+                _ => {
+                    pages.put_u8(4);
+                    expected += 1;
+                }
+            }
+            assert_len(&pages);
+            assert_len(&other);
+            assert_eq!(pages.len(), expected);
+        }
 
-        assert_eq!(pages.len(), 5);
+        let len = pages.len();
+        assert_eq!(pages.freeze().len(), len);
+        assert_len(&pages);
+        assert!(pages.is_empty());
+        pages.extend_from_slice(b"123");
         pages.clear();
-        assert_eq!(pages.len(), 0);
+        assert_len(&pages);
+        assert!(pages.is_empty());
+    }
+
+    #[test]
+    fn pages_len_after_cache_reuse() {
+        let mut pages = BytePages::new(BytePageSize::Size8);
+        pages.append(Bytes::copy_from_slice(&[1; 64]));
+        pages.append(Bytes::copy_from_slice(&[1; 64]));
+        drop(pages);
+
+        let pages = BytePages::new(BytePageSize::Size8);
+        assert_len(&pages);
+        assert!(pages.is_empty());
+    }
+
+    #[test]
+    fn pages_copy_to_shares_current() {
+        let mut pages = BytePages::new(BytePageSize::Size8);
+        pages.put_slice(&[1; 64]);
+        let ptr = unsafe { pages.current.as_ref().unwrap().as_ptr() };
+
+        let mut copy = BytePages::new(BytePageSize::Size8);
+        pages.copy_to(&mut copy);
+        let page = copy.take().unwrap();
+        assert_eq!(unsafe { page.as_ptr() }, ptr.cast_const());
+        assert_eq!(page.as_ref(), &[1; 64][..]);
+
+        // the source keeps writing to the page it shares with the copy
+        pages.put_slice(&[2; 64]);
+        assert_eq!(unsafe { pages.current.as_ref().unwrap().as_ptr() }, ptr);
+        assert_eq!(page.as_ref(), &[1; 64][..]);
+        assert_eq!(pages.len(), 128);
+
+        drop(pages);
+        assert_eq!(page.as_ref(), &[1; 64][..]);
+    }
+
+    #[test]
+    fn pages_split_keeps_current_writable() {
+        let mut pages = BytePages::new(BytePageSize::Size8);
+        pages.put_slice(&[1; 64]);
+        let ptr = unsafe { pages.current.as_ref().unwrap().as_ptr() };
+        let remaining = pages.spare();
+
+        let mut head = pages.split_to(40);
+        assert_eq!(head.len(), 40);
+        assert_eq!(pages.len(), 24);
+        assert_eq!(pages.num_pages(), 1);
+        assert_eq!(pages.spare(), remaining);
+
+        // new data goes into the same page
+        pages.put_slice(&[2; 16]);
+        assert_eq!(pages.num_pages(), 1);
+        assert_eq!(
+            unsafe { pages.current.as_ref().unwrap().as_ptr() },
+            ptr.wrapping_add(40)
+        );
+        let mut expected = vec![1; 24];
+        expected.extend_from_slice(&[2; 16]);
+        assert_eq!(&pages.freeze()[..], &expected[..]);
+        assert_eq!(&head.freeze()[..], &[1; 40][..]);
+
+        // an inline head
+        let mut pages = BytePages::new(BytePageSize::Size8);
+        pages.put_slice(&[1; 64]);
+        let mut to = BytePages::new(BytePageSize::Size8);
+        pages.split_into(2, &mut to);
+        assert_eq!(&to.freeze()[..], &[1; 2][..]);
+        assert_eq!(pages.spare(), remaining);
+        assert_eq!(pages.len(), 62);
+
+        // the whole current page moves with its spare capacity
+        let mut pages = BytePages::new(BytePageSize::Size8);
+        pages.put_slice(&[1; 64]);
+        let ptr = unsafe { pages.current.as_ref().unwrap().as_ptr() };
+        let to = pages.split_to(64);
+        assert!(pages.is_empty());
+        assert_eq!(pages.num_pages(), 0);
+        assert_eq!(to.spare(), remaining);
+        assert_eq!(unsafe { to.current.as_ref().unwrap().as_ptr() }, ptr);
+
+        // an empty current page stays in place
+        let mut pages = BytePages::new(BytePageSize::Size8);
+        let _ = pages.chunk_mut();
+        let head = pages.split_to(10);
+        assert!(head.is_empty());
+        assert_eq!(pages.spare(), remaining + 64);
+    }
+
+    #[test]
+    fn pages_buf_mut_grows() {
+        let mut pages = BytePages::new(BytePageSize::Size8);
+        assert!(pages.has_remaining_mut());
+        assert_eq!(pages.remaining_mut(), usize::MAX);
+        unsafe { pages.advance_mut(0) };
+
+        // filling the current page through `chunk_mut` starts a new one
+        let n = pages.chunk_mut().len();
+        unsafe {
+            std::ptr::write_bytes(pages.chunk_mut().as_mut_ptr(), 1, n);
+            pages.advance_mut(n);
+        }
+        assert!(pages.chunk_mut().len() > 0);
+        // the new current page holds no data yet
+        assert_eq!(pages.num_pages(), 1);
+        unsafe {
+            *pages.chunk_mut().as_mut_ptr() = 2;
+            pages.advance_mut(1);
+        }
+        assert_eq!(pages.len(), n + 1);
+        assert_eq!(pages.remaining_mut(), usize::MAX - n - 1);
+
+        // `put` and `io::Write` are not limited to the current page
+        let mut pages = BytePages::new(BytePageSize::Size8);
+        pages.put(&[3u8; 200][..]);
+        pages.put(Bytes::from_static(b"abcd"));
+        io::Write::write_all(&mut pages, &[4; 100]).unwrap();
+        let mut expected = vec![3; 200];
+        expected.extend_from_slice(b"abcd");
+        expected.extend_from_slice(&[4; 100]);
+        assert_eq!(&pages.freeze()[..], &expected[..]);
+    }
+
+    #[test]
+    fn pages_byte_write_after_full_page() {
+        // `advance_mut` leaves a full current page
+        let mut pages = BytePages::new(BytePageSize::Size8);
+        let n = pages.chunk_mut().len();
+        unsafe {
+            std::ptr::write_bytes(pages.chunk_mut().as_mut_ptr(), 1, n);
+            pages.advance_mut(n);
+        }
+        pages.put_u8(2);
+        pages.put_i8(3);
+        assert_eq!(pages.num_pages(), 2);
+        assert_eq!(pages.pages()[0].len(), n);
+        let mut expected = vec![1; n];
+        expected.extend_from_slice(&[2, 3]);
+        assert_eq!(&pages.freeze()[..], &expected[..]);
+
+        // splitting off a full current page leaves an empty page without capacity
+        let mut pages = BytePages::new(BytePageSize::Size8);
+        let n = pages.chunk_mut().len();
+        unsafe {
+            std::ptr::write_bytes(pages.chunk_mut().as_mut_ptr(), 1, n);
+            pages.advance_mut(n);
+        }
+        pages.append(vec![2; APPEND_COPY_LIMIT + 1]);
+        pages.put_u8(3);
+        assert!(pages.pages().iter().all(|p| !p.is_empty()));
+        let mut expected = vec![1; n];
+        expected.extend_from_slice(&[2; APPEND_COPY_LIMIT + 1]);
+        expected.push(3);
+        assert_eq!(&pages.freeze()[..], &expected[..]);
+    }
+
+    #[test]
+    #[should_panic(expected = "cannot advance past the current page")]
+    fn pages_advance_past_current_page() {
+        let mut pages = BytePages::new(BytePageSize::Size8);
+        let n = pages.chunk_mut().len();
+        unsafe { pages.advance_mut(n + 1) };
+    }
+
+    #[test]
+    #[should_panic(expected = "Page size cannot be Unset")]
+    fn pages_new_unset() {
+        let _ = BytePages::new(BytePageSize::Unset);
+    }
+
+    #[test]
+    #[should_panic(expected = "Page size cannot be Unset")]
+    fn pages_set_page_size_unset() {
+        let mut pages = BytePages::new(BytePageSize::Size8);
+        pages.set_page_size(BytePageSize::Unset);
+    }
+
+    #[test]
+    fn cached_pages_list_is_shrunk() {
+        let mut pages = BytePages::new(BytePageSize::Size4);
+        for _ in 0..200 {
+            pages.append(Bytes::from_static(b"page"));
+        }
+        assert!(pages.pages().capacity() >= 200);
+        drop(pages);
+
+        let pages = BytePages::new(BytePageSize::Size4);
+        assert!(
+            pages.pages().capacity() < 200,
+            "{}",
+            pages.pages().capacity()
+        );
+    }
+
+    #[test]
+    fn pages_into_bytes_single_page() {
+        // the current page
+        let mut pages = BytePages::new(BytePageSize::Size8);
+        pages.put_slice(&[1; 64]);
+        let ptr = unsafe { pages.current.as_ref().unwrap().as_ptr() };
+        let mut buf = BytesMut::from(pages);
+        assert_eq!(buf.as_ptr(), ptr.cast_const());
+        assert_eq!(&buf[..], &[1; 64][..]);
+        // the rest of the page is spare capacity
+        assert_eq!(buf.capacity(), BytePageSize::Size8.capacity());
+        buf.extend_from_slice(&[2; 64]);
+        assert_eq!(buf.as_ptr(), ptr.cast_const());
+
+        let mut pages = BytePages::new(BytePageSize::Size8);
+        pages.put_slice(&[1; 64]);
+        let ptr = unsafe { pages.current.as_ref().unwrap().as_ptr() };
+        let b = Bytes::from(pages);
+        assert_eq!(b.as_ptr(), ptr.cast_const());
+        assert_eq!(&b[..], &[1; 64][..]);
+
+        // a `Bytes` page
+        let src = Bytes::copy_from_slice(&[3; 64]);
+        let ptr = src.as_ptr();
+        let mut pages = BytePages::new(BytePageSize::Size8);
+        pages.prepend(src);
+        assert_eq!(BytesMut::from(pages).as_ptr(), ptr);
+
+        // a shared page is copied
+        let src = Bytes::copy_from_slice(&[3; 64]);
+        let mut pages = BytePages::new(BytePageSize::Size8);
+        pages.prepend(&src);
+        let mut buf = BytesMut::from(pages);
+        assert_ne!(buf.as_ptr(), src.as_ptr());
+        buf[0] = 4;
+        assert_eq!(&src[..], &[3; 64][..]);
+    }
+
+    #[test]
+    fn pages_into_bytes_multiple_pages() {
+        let mut pages = BytePages::new(BytePageSize::Size8);
+        pages.prepend(Bytes::copy_from_slice(&[1; 64]));
+        pages.put_slice(&[2; 64]);
+        assert_eq!(pages.num_pages(), 2);
+        let buf = BytesMut::from(pages);
+        assert_eq!(&buf[..64], &[1; 64][..]);
+        assert_eq!(&buf[64..], &[2; 64][..]);
+
+        let mut pages = BytePages::new(BytePageSize::Size8);
+        pages.prepend(Bytes::copy_from_slice(&[1; 64]));
+        pages.put_slice(&[2; 64]);
+        let b = Bytes::from(pages);
+        assert_eq!(&b[..64], &[1; 64][..]);
+        assert_eq!(&b[64..], &[2; 64][..]);
+
+        assert!(BytesMut::from(BytePages::new(BytePageSize::Size8)).is_empty());
+        assert!(Bytes::from(BytePages::new(BytePageSize::Size8)).is_empty());
     }
 
     #[test]
@@ -898,6 +1535,7 @@ mod tests {
 
         // .with_bytes_mut()
         let mut pages = BytePages::default();
+        #[allow(deprecated)]
         pages.with_bytes_mut(|buf| buf.extend_from_slice(b"123"));
         assert_eq!(pages.len(), 3);
         let p = pages.freeze();
@@ -910,6 +1548,7 @@ mod tests {
             .collect::<String>();
 
         let mut pages = BytePages::default();
+        #[allow(deprecated)]
         pages.with_bytes_mut(|buf| buf.extend_from_slice(data.as_bytes()));
         assert_eq!(pages.len(), 65_536);
         let p = pages.freeze();
@@ -939,8 +1578,26 @@ mod tests {
         }
         let p2 = p.clone();
         assert_eq!(p, p2);
-        if let StorageType::Storage(mut st) = p.inner {
+        // short data is copied into an inline view
+        assert!(matches!(p2.inner, StorageType::Bytes(_)));
+        if let StorageType::Storage(st) = p.inner {
+            assert!(st.is_unique());
+        } else {
+            panic!()
+        }
+
+        let mut p = BytePage::from(BytesMut::copy_from_slice([b'1'; 64]));
+        let p2 = p.clone();
+        assert_eq!(p, p2);
+        assert!(matches!(p2.inner, StorageType::Bytes(_)));
+        if let StorageType::Storage(ref mut st) = p.inner {
             assert!(!st.is_unique());
+        } else {
+            panic!()
+        }
+        drop(p2);
+        if let StorageType::Storage(st) = p.inner {
+            assert!(st.is_unique());
         } else {
             panic!()
         }
@@ -986,5 +1643,251 @@ mod tests {
         assert_eq!(page.read(&mut buf).unwrap(), 3);
         assert_eq!(page.len(), 0);
         assert_eq!(buf, [49, 50, 51, 0, 0, 0, 0, 0, 0, 0]);
+    }
+
+    #[test]
+    fn pages_misc() {
+        let mut pages = BytePages::new(BytePageSize::Size4);
+        pages.set_page_size(BytePageSize::Size8);
+        assert_eq!(pages.page_size(), BytePageSize::Size8);
+        assert!(!pages.prepend(Bytes::new()));
+        assert!(pages.prepend(Bytes::from_static(b"a")));
+
+        io::Write::write_all(&mut pages, b"bc").unwrap();
+        io::Write::flush(&mut pages).unwrap();
+        assert_eq!(pages.freeze(), "abc");
+
+        let s = ByteString::from_static("str");
+        pages.append(&s);
+        assert_eq!(pages.freeze(), "str");
+    }
+
+    #[test]
+    fn pages_try_get_current_from() {
+        let mut src = BytePages::new(BytePageSize::Size4);
+        src.extend_from_slice(b"data");
+
+        // the target already holds data
+        let mut dst = BytePages::new(BytePageSize::Size4);
+        dst.append(Bytes::from_static(b"x"));
+        dst.try_get_current_from(&mut src);
+        assert_eq!(src.len(), 4);
+        assert_eq!(dst.len(), 1);
+
+        let mut dst = BytePages::new(BytePageSize::Size4);
+        dst.try_get_current_from(&mut src);
+        assert_eq!(src.len(), 0);
+        assert_eq!(dst.len(), 4);
+        dst.extend_from_slice(b"!");
+        assert_eq!(dst.freeze(), "data!");
+    }
+
+    #[test]
+    fn pages_drop_cache() {
+        CACHE.with(|c| c.set(Some(Box::default())));
+        let cached = || {
+            CACHE.with(|c| {
+                let cache = c.take().unwrap();
+                let len = cache.len();
+                c.set(Some(cache));
+                len
+            })
+        };
+
+        // the cache is full
+        let pages: Vec<_> = (0..=CACHE_SIZE)
+            .map(|_| BytePages::new(BytePageSize::Size4))
+            .collect();
+        drop(pages);
+        assert_eq!(cached(), CACHE_SIZE);
+
+        // the cache is in use
+        CACHE.with(|c| c.set(Some(Box::default())));
+        let pages = BytePages::new(BytePageSize::Size4);
+        let cache = CACHE.with(Cell::take);
+        drop(pages);
+        CACHE.with(|c| c.set(cache));
+        assert_eq!(cached(), 0);
+    }
+
+    #[test]
+    fn page_conversions() {
+        let page = BytePage::from(BytesMut::copy_from_slice([1; 64]));
+        assert_eq!(page.info(), crate::info::PageKind::Storage);
+        assert_eq!(Bytes::from(page), &[1; 64][..]);
+
+        let page = BytePage::from(vec![2; 64]);
+        assert_eq!(page.info(), crate::info::PageKind::Vec);
+        assert_eq!(Bytes::from(page), &[2; 64][..]);
+
+        let page = BytePage::from(vec![3; 64]);
+        assert_eq!(BytesMut::from(page), &[3; 64][..]);
+
+        let s = ByteString::from_static("string");
+        assert_eq!(BytePage::from(&s), "string");
+    }
+
+    #[test]
+    fn append_storage_page() {
+        // a page with spare capacity becomes the current page
+        let mut pages = BytePages::new(BytePageSize::Size4);
+        let mut buf = BytesMut::with_capacity(64);
+        buf.extend_from_slice(b"a");
+        pages.append(buf);
+        pages.extend_from_slice(b"b");
+        assert_eq!(pages.num_pages(), 1);
+        assert_eq!(pages.freeze(), "ab");
+
+        // full and shared pages are added to the page list
+        let mut buf = BytesMut::with_capacity(64);
+        let cap = buf.capacity();
+        buf.resize(cap, b'x');
+        pages.append(buf);
+        let page = BytePage::from(BytesMut::copy_from_slice([b'y'; 64]));
+        let shared = page.clone();
+        pages.append(page);
+        pages.extend_from_slice(b"z");
+        assert_eq!(pages.num_pages(), 3);
+        assert_eq!(pages.len(), cap + 65);
+        assert_eq!(shared, &[b'y'; 64][..]);
+    }
+
+    // inline page, shared page, then the current page
+    fn mixed_pages() -> BytePages {
+        let mut pages = BytePages::new(BytePageSize::Size4);
+        pages.extend_from_slice(b"current");
+        pages.prepend(Bytes::copy_from_slice(&[b'b'; 64]));
+        pages.prepend(Bytes::copy_from_slice(b"ab"));
+        assert!(pages.pages()[0].is_inline());
+        pages
+    }
+
+    #[test]
+    fn iter_pages() {
+        let pages = BytePages::default();
+        assert_eq!(pages.iter().count(), 0);
+
+        let pages = mixed_pages();
+        let chunks: Vec<&[u8]> = pages.iter().collect();
+        assert_eq!(chunks, [&b"ab"[..], &[b'b'; 64][..], &b"current"[..]]);
+        assert_eq!(chunks.len(), pages.num_pages());
+
+        // data, including inline pages, does not move with `self`
+        let ptrs: Vec<*const u8> = pages.iter().map(<[u8]>::as_ptr).collect();
+        let moved = Box::new(pages);
+        let moved_ptrs: Vec<*const u8> = moved.iter().map(<[u8]>::as_ptr).collect();
+        assert_eq!(ptrs, moved_ptrs);
+
+        // an empty current page is skipped
+        let mut pages = BytePages::new(BytePageSize::Size4);
+        pages.extend_from_slice(b"data");
+        pages.prepend(Bytes::copy_from_slice(b"ab"));
+        pages.advance_to(6);
+        assert_eq!(pages.iter().count(), 0);
+        assert_eq!(pages.num_pages(), 0);
+    }
+
+    #[test]
+    fn advance_to_pages() {
+        let mut pages = mixed_pages();
+        let len = pages.len();
+        pages.advance_to(0);
+        assert_eq!(pages.len(), len);
+
+        // whole page
+        pages.advance_to(2);
+        assert_eq!(pages.len(), len - 2);
+        assert_eq!(pages.num_pages(), 2);
+        assert_eq!(pages.iter().next().unwrap(), &[b'b'; 64][..]);
+
+        // part of a page
+        pages.advance_to(60);
+        assert_eq!(pages.len(), 11);
+        assert_eq!(pages.num_pages(), 2);
+        let chunks: Vec<&[u8]> = pages.iter().collect();
+        assert_eq!(chunks, [&b"bbbb"[..], &b"current"[..]]);
+
+        // rest of the page and part of the current page
+        pages.advance_to(6);
+        assert_eq!(pages.len(), 5);
+        assert_eq!(pages.num_pages(), 1);
+        assert_eq!(pages.iter().next().unwrap(), b"rrent");
+
+        // the current page keeps its spare capacity
+        let ptr = pages.iter().next().unwrap().as_ptr();
+        pages.advance_to(5);
+        assert!(pages.is_empty());
+        assert_eq!(pages.num_pages(), 0);
+        pages.extend_from_slice(b"next");
+        assert_eq!(pages.num_pages(), 1);
+        assert_eq!(pages.iter().next().unwrap().as_ptr(), ptr.wrapping_add(5));
+        assert_eq!(pages.freeze(), "next");
+    }
+
+    #[test]
+    fn move_to_keeps_pages() {
+        // into empty pages, the page list is swapped
+        let mut src = mixed_pages();
+        let ptrs: Vec<*const u8> = src
+            .iter()
+            .filter(|s| s.len() > 2)
+            .map(<[u8]>::as_ptr)
+            .collect();
+        let mut dst = BytePages::new(BytePageSize::Size16);
+        src.move_to(&mut dst);
+        assert!(src.is_empty());
+        assert_eq!(src.num_pages(), 0);
+        assert_eq!(dst.page_size(), BytePageSize::Size16);
+        assert_eq!(dst.num_pages(), 3);
+        assert_eq!(dst.len(), 73);
+        let moved: Vec<*const u8> = dst
+            .iter()
+            .filter(|s| s.len() > 2)
+            .map(<[u8]>::as_ptr)
+            .collect();
+        assert_eq!(ptrs, moved);
+
+        // small pages are not merged, the filled part of the current page
+        // of `dst` goes first and its spare capacity is kept
+        let mut dst = BytePages::new(BytePageSize::Size4);
+        dst.extend_from_slice(b"first");
+        dst.prepend(Bytes::copy_from_slice(b"0"));
+        let mut src = mixed_pages();
+        src.move_to(&mut dst);
+        let chunks: Vec<&[u8]> = dst.iter().collect();
+        assert_eq!(
+            chunks,
+            [
+                &b"0"[..],
+                &b"first"[..],
+                &b"ab"[..],
+                &[b'b'; 64][..],
+                &b"current"[..]
+            ]
+        );
+        assert_eq!(dst.len(), 79);
+        dst.extend_from_slice(b"last");
+        assert_eq!(dst.num_pages(), 6);
+
+        // empty source
+        let mut src = BytePages::default();
+        src.move_to(&mut dst);
+        assert_eq!(dst.num_pages(), 6);
+    }
+
+    #[test]
+    fn advance_to_vec_page() {
+        let mut pages = BytePages::default();
+        pages.prepend(b"hello world".to_vec());
+        pages.advance_to(6);
+        assert_eq!(pages.len(), 5);
+        assert_eq!(pages.freeze(), "world");
+    }
+
+    #[test]
+    #[should_panic(expected = "cannot advance past the end of the buffer")]
+    fn advance_to_past_end() {
+        let mut pages = mixed_pages();
+        pages.advance_to(pages.len() + 1);
     }
 }

@@ -1,4 +1,8 @@
-//! Http protocol support.
+//! HTTP protocol primitives for ntex.
+//!
+//! This crate provides [`HeaderMap`] and [`HeaderValue`] implementations,
+//! message-body abstractions in [`body`], common HTTP errors, and re-exports of
+//! standard method, status, URI, version, and header-name types.
 #![deny(clippy::pedantic)]
 #![allow(
     clippy::missing_fields_in_debug,
@@ -23,10 +27,9 @@ pub use self::map::Value;
 
 // re-exports
 pub use http::header::HeaderName;
-pub use http::uri::{self, Uri};
 pub use http::{Method, StatusCode, Version};
 
-/// Convert `http::HeaderMap` to a `HeaderMap`
+/// Converts an `http::HeaderMap` into an ntex [`HeaderMap`].
 impl From<http::HeaderMap> for HeaderMap {
     fn from(map: http::HeaderMap) -> HeaderMap {
         let mut new_map = HeaderMap::with_capacity(map.capacity());
@@ -43,5 +46,4 @@ pub mod compat {
     pub use http::header::InvalidHeaderValue;
     pub use http::method::InvalidMethod;
     pub use http::status::InvalidStatusCode;
-    pub use http::uri::InvalidUri;
 }

@@ -1,12 +1,14 @@
 use std::{cell::Ref, cell::RefCell, cell::RefMut, fmt, net, rc::Rc};
 
 use bitflags::bitflags;
+use urly::Url;
 
-use crate::http::{Method, StatusCode, Uri, Version, h1::Codec, header::HeaderMap};
+use crate::http::header::HeaderMap;
+use crate::http::{HeaderItem, Method, StatusCode, Version, h1::Codec};
 use crate::io::{IoBoxed, IoRef, types};
 use crate::util::Extensions;
 
-/// Represents various types of connection
+/// The connection behavior selected for an HTTP message.
 #[derive(Copy, Clone, PartialEq, Eq, Debug)]
 pub enum ConnectionType {
     /// Close connection after response
@@ -31,7 +33,8 @@ bitflags! {
 pub(crate) trait Head: Default + 'static + fmt::Debug {
     fn clear(&mut self);
 
-    fn with_pool<F, R>(f: F) -> R
+    /// Calls `f` with the thread's pool, returns `None` if the pool is already destroyed.
+    fn with_pool<F, R>(f: F) -> Option<R>
     where
         F: FnOnce(&MessagePool<Self>) -> R;
 }
@@ -70,13 +73,26 @@ impl CurrentIo {
     }
 }
 
+/// The parsed metadata for an HTTP request.
 #[derive(Debug)]
 pub struct RequestHead {
+    /// Identifier of the connection that received the request.
     pub id: usize,
-    pub uri: Uri,
+    /// Request URI.
+    pub uri: Url,
+    /// Request method.
     pub method: Method,
+    /// HTTP protocol version.
     pub version: Version,
+    /// Parsed request headers.
     pub headers: HeaderMap,
+    /// Headers in their original order and with their original names.
+    ///
+    /// This collection is populated only when
+    /// [`HttpServiceConfig::set_headers_vec`](crate::http::HttpServiceConfig::set_headers_vec)
+    /// is enabled.
+    pub headers_vec: Vec<HeaderItem>,
+    /// Request-local type map.
     pub extensions: RefCell<Extensions>,
     pub(crate) io: CurrentIo,
     pub(crate) flags: Flags,
@@ -87,10 +103,11 @@ impl Default for RequestHead {
         RequestHead {
             id: 0,
             io: CurrentIo::None,
-            uri: Uri::default(),
+            uri: Url::new(),
             method: Method::default(),
             version: Version::HTTP_11,
             headers: HeaderMap::with_capacity(16),
+            headers_vec: Vec::default(),
             flags: Flags::empty(),
             extensions: RefCell::new(Extensions::new()),
         }
@@ -100,45 +117,58 @@ impl Default for RequestHead {
 impl Head for RequestHead {
     fn clear(&mut self) {
         self.io = CurrentIo::None;
+        // the uri and headers may share the connection read buffer, a pooled
+        // head must not keep it alive
+        self.uri = Url::new();
         self.flags = Flags::empty();
         self.version = Version::HTTP_11;
         self.headers.clear();
+        self.headers_vec.clear();
         self.extensions.get_mut().clear();
     }
 
-    fn with_pool<F, R>(f: F) -> R
+    fn with_pool<F, R>(f: F) -> Option<R>
     where
         F: FnOnce(&MessagePool<Self>) -> R,
     {
-        REQUEST_POOL.with(|p| f(p))
+        REQUEST_POOL.try_with(|p| f(p)).ok()
     }
 }
 
 impl RequestHead {
-    /// Message extensions
+    /// Returns the request extensions.
     #[inline]
     pub fn extensions(&self) -> Ref<'_, Extensions> {
         self.extensions.borrow()
     }
 
-    /// Mutable reference to a the message's extensions
+    /// Returns mutable access to the request extensions.
     #[inline]
     pub fn extensions_mut(&self) -> RefMut<'_, Extensions> {
         self.extensions.borrow_mut()
     }
 
-    /// Read the message headers.
+    /// Returns the request headers.
     pub fn headers(&self) -> &HeaderMap {
         &self.headers
     }
 
-    /// Mutable reference to the message headers.
+    /// Returns mutable access to the request headers.
     pub fn headers_mut(&mut self) -> &mut HeaderMap {
         &mut self.headers
     }
 
+    /// Returns headers preserved in their original order and casing.
+    pub fn headers_vec(&self) -> &[HeaderItem] {
+        &self.headers_vec
+    }
+
     #[inline]
-    /// Set connection type of the message
+    /// Sets the request connection behavior.
+    ///
+    /// Connection types are flags, and calling this method again does not clear
+    /// a previously set type. When several are set, `Close` takes precedence
+    /// over `KeepAlive`, which takes precedence over `Upgrade`.
     pub fn set_connection_type(&mut self, ctype: ConnectionType) {
         match ctype {
             ConnectionType::Close => self.flags.insert(Flags::CLOSE),
@@ -148,7 +178,7 @@ impl RequestHead {
     }
 
     #[inline]
-    /// Connection type
+    /// Returns the request connection behavior.
     pub fn connection_type(&self) -> ConnectionType {
         if self.flags.contains(Flags::CLOSE) {
             ConnectionType::Close
@@ -164,24 +194,27 @@ impl RequestHead {
     }
 
     #[inline]
-    /// Connection upgrade status
+    /// Returns whether the request upgrades the connection.
     pub fn upgrade(&self) -> bool {
         self.flags.contains(Flags::UPGRADE)
     }
 
     #[inline]
-    /// Request contains `EXPECT` header
+    /// Returns whether the request contains `Expect: 100-continue`.
     pub fn expect(&self) -> bool {
         self.flags.contains(Flags::EXPECT)
     }
 
     #[inline]
-    /// Get response body chunking state
+    /// Returns whether chunked transfer encoding is allowed.
     pub fn chunked(&self) -> bool {
         !self.flags.contains(Flags::NO_CHUNKING)
     }
 
     #[inline]
+    /// Enables or disables chunked transfer encoding.
+    ///
+    /// A streaming request body without chunked coding requires a `Content-Length` header.
     pub fn no_chunking(&mut self, val: bool) {
         if val {
             self.flags.insert(Flags::NO_CHUNKING);
@@ -200,7 +233,7 @@ impl RequestHead {
         self.flags.insert(Flags::UPGRADE);
     }
 
-    /// Peer socket address
+    /// Returns the peer socket address.
     ///
     /// Peer address is actual socket address, if proxy is used in front of
     /// ntex http server, then peer address would be address of this proxy.
@@ -213,9 +246,11 @@ impl RequestHead {
         })
     }
 
-    /// Take io and codec for current request
+    /// Takes ownership of the I/O stream and HTTP/1 codec for an upgrade.
     ///
-    /// This objects are set only for upgrade requests
+    /// The handle is installed only after an upgrade is acknowledged through
+    /// the HTTP/1 control service. This is a one-shot operation: subsequent
+    /// calls return [`None`].
     pub fn take_io(&self) -> Option<(IoBoxed, Codec)> {
         self.io.take()
     }
@@ -226,11 +261,22 @@ impl RequestHead {
     }
 }
 
+/// The metadata for an HTTP response.
 #[derive(Debug)]
 pub struct ResponseHead {
+    /// HTTP protocol version.
     pub version: Version,
+    /// Response status code.
     pub status: StatusCode,
+    /// Response headers.
     pub headers: HeaderMap,
+    /// Headers in their original order and with their original names.
+    ///
+    /// This collection is populated when decoding a response with
+    /// [`HttpServiceConfig::set_headers_vec`](crate::http::HttpServiceConfig::set_headers_vec)
+    /// enabled.
+    pub headers_vec: Vec<HeaderItem>,
+    /// Custom reason phrase, or `None` to use the status code's standard phrase.
     pub reason: Option<&'static str>,
     pub(crate) io: CurrentIo,
     pub(crate) extensions: RefCell<Extensions>,
@@ -238,13 +284,14 @@ pub struct ResponseHead {
 }
 
 impl ResponseHead {
-    /// Create new instance of `ResponseHead` type
+    /// Creates response metadata with the supplied status and HTTP version.
     #[inline]
     pub fn new(status: StatusCode, version: Version) -> ResponseHead {
         ResponseHead {
             status,
             version,
             headers: HeaderMap::with_capacity(12),
+            headers_vec: Vec::default(),
             reason: None,
             flags: Flags::empty(),
             io: CurrentIo::None,
@@ -252,32 +299,41 @@ impl ResponseHead {
         }
     }
 
-    /// Message extensions
+    /// Returns the response extensions.
     #[inline]
     pub fn extensions(&self) -> Ref<'_, Extensions> {
         self.extensions.borrow()
     }
 
-    /// Mutable reference to a the message's extensions
+    /// Returns mutable access to the response extensions.
     #[inline]
     pub fn extensions_mut(&self) -> RefMut<'_, Extensions> {
         self.extensions.borrow_mut()
     }
 
     #[inline]
-    /// Read the message headers.
+    /// Returns the response headers.
     pub fn headers(&self) -> &HeaderMap {
         &self.headers
     }
 
     #[inline]
-    /// Mutable reference to the message headers.
+    /// Returns mutable access to the response headers.
     pub fn headers_mut(&mut self) -> &mut HeaderMap {
         &mut self.headers
     }
 
+    /// Returns headers preserved in their original order and casing.
+    pub fn headers_vec(&self) -> &[HeaderItem] {
+        &self.headers_vec
+    }
+
     #[inline]
-    /// Set connection type of the message
+    /// Sets the response connection behavior.
+    ///
+    /// Connection types are flags, and calling this method again does not clear
+    /// a previously set type. When several are set, `Close` takes precedence
+    /// over `KeepAlive`, which takes precedence over `Upgrade`.
     pub fn set_connection_type(&mut self, ctype: ConnectionType) {
         match ctype {
             ConnectionType::Close => self.flags.insert(Flags::CLOSE),
@@ -287,6 +343,7 @@ impl ResponseHead {
     }
 
     #[inline]
+    /// Returns the response's connection behavior.
     pub fn connection_type(&self) -> ConnectionType {
         if self.flags.contains(Flags::CLOSE) {
             ConnectionType::Close
@@ -302,26 +359,26 @@ impl ResponseHead {
     }
 
     #[inline]
-    /// Check if keep-alive is enabled
+    /// Returns whether the response keeps the connection open.
     pub fn keep_alive(&self) -> bool {
         self.connection_type() == ConnectionType::KeepAlive
     }
 
     #[inline]
-    /// Check upgrade status of this message
+    /// Returns whether the response upgrades the connection.
     pub fn upgrade(&self) -> bool {
         self.connection_type() == ConnectionType::Upgrade
     }
 
-    /// Get custom reason for the response
+    /// Returns the custom or canonical reason phrase.
+    ///
+    /// The reason phrase is empty for a status code without a canonical reason.
     #[inline]
     pub fn reason(&self) -> &str {
         if let Some(reason) = self.reason {
             reason
         } else {
-            self.status
-                .canonical_reason()
-                .unwrap_or("<unknown status code>")
+            self.status.canonical_reason().unwrap_or("")
         }
     }
 
@@ -339,13 +396,13 @@ impl ResponseHead {
     }
 
     #[inline]
-    /// Get response body chunking state
+    /// Returns whether HTTP/1 chunked transfer encoding is allowed.
     pub fn chunked(&self) -> bool {
         !self.flags.contains(Flags::NO_CHUNKING)
     }
 
     #[inline]
-    /// Set no chunking for payload
+    /// Enables or disables HTTP/1 chunked transfer encoding.
     pub fn no_chunking(&mut self, val: bool) {
         if val {
             self.flags.insert(Flags::NO_CHUNKING);
@@ -365,15 +422,17 @@ impl Head for ResponseHead {
     fn clear(&mut self) {
         self.reason = None;
         self.headers.clear();
+        self.headers_vec.clear();
         self.io = CurrentIo::None;
         self.flags = Flags::empty();
+        self.extensions.get_mut().clear();
     }
 
-    fn with_pool<F, R>(f: F) -> R
+    fn with_pool<F, R>(f: F) -> Option<R>
     where
         F: FnOnce(&MessagePool<Self>) -> R,
     {
-        RESPONSE_POOL.with(|p| f(p))
+        RESPONSE_POOL.try_with(|p| f(p)).ok()
     }
 }
 
@@ -385,15 +444,37 @@ pub(crate) struct Message<T: Head> {
 impl<T: Head> Message<T> {
     /// Get new message from the pool of objects
     pub(crate) fn new() -> Self {
-        T::with_pool(MessagePool::get_message)
+        let head = T::with_pool(MessagePool::get_head)
+            .flatten()
+            .unwrap_or_else(|| Rc::new(T::default()));
+        Message { head }
+    }
+
+    /// Clears the head, so a cached message does not hold request data.
+    pub(crate) fn clear(&mut self) {
+        if let Some(head) = Rc::get_mut(&mut self.head) {
+            head.clear();
+        }
     }
 }
 
 impl Message<ResponseHead> {
     /// Get new message from the pool of objects
     pub(crate) fn with_status(status: StatusCode) -> Self {
-        let mut msg = RESPONSE_POOL.with(MessagePool::get_message);
+        let mut msg = Self::new();
         msg.status = status;
+        msg
+    }
+
+    /// Copies the response head into a new message, extensions are not copied.
+    pub(crate) fn copy(&self) -> Self {
+        let mut msg = Self::with_status(self.status);
+        msg.version = self.version;
+        msg.headers = self.headers.clone();
+        msg.headers_vec.clone_from(&self.headers_vec);
+        msg.reason = self.reason;
+        msg.io = self.io.clone();
+        msg.flags = self.flags;
         msg
     }
 }
@@ -422,13 +503,14 @@ impl<T: Head> std::ops::DerefMut for Message<T> {
 
 impl<T: Head> Drop for Message<T> {
     fn drop(&mut self) {
-        if Rc::strong_count(&self.head) == 1 {
+        if let Some(head) = Rc::get_mut(&mut self.head) {
+            // clearing may drop other messages (e.g. stored in extensions),
+            // so the pool must not be borrowed at this point
+            head.clear();
             T::with_pool(|pool| {
-                let v = &mut pool.0.borrow_mut();
-                if v.len() < 128 {
-                    Rc::get_mut(&mut self.head)
-                        .expect("Multiple copies exist")
-                        .clear();
+                if let Ok(mut v) = pool.0.try_borrow_mut()
+                    && v.len() < 128
+                {
                     v.push(self.head.clone());
                 }
             });
@@ -447,17 +529,74 @@ impl<T: Head> MessagePool<T> {
         MessagePool(RefCell::new(Vec::with_capacity(256)))
     }
 
-    /// Get message from the pool
+    /// Get cleared head from the pool
     #[inline]
-    fn get_message(&self) -> Message<T> {
-        let head = if let Some(mut msg) = self.0.borrow_mut().pop() {
-            if let Some(msg) = Rc::get_mut(&mut msg) {
-                msg.clear();
+    fn get_head(&self) -> Option<Rc<T>> {
+        self.0.try_borrow_mut().ok()?.pop()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn nested_message_drop() {
+        let inner = Message::<RequestHead>::new();
+        let outer = Message::<RequestHead>::new();
+        outer.extensions_mut().insert(inner);
+        let mut res = Message::<ResponseHead>::with_status(StatusCode::OK);
+        res.extensions
+            .get_mut()
+            .insert(Message::<ResponseHead>::new());
+        outer.extensions_mut().insert(res);
+        drop(outer);
+
+        let _ = Message::<RequestHead>::new();
+        let _ = Message::<ResponseHead>::new();
+    }
+
+    #[test]
+    fn message_drop_after_pool_destroyed() {
+        struct Holder(Option<Message<RequestHead>>, Option<Message<ResponseHead>>);
+
+        impl Drop for Holder {
+            fn drop(&mut self) {
+                drop(self.0.take());
+                drop(self.1.take());
+                drop(Message::<RequestHead>::new());
             }
-            msg
-        } else {
-            Rc::new(T::default())
-        };
-        Message { head }
+        }
+
+        thread_local!(static HOLDER: RefCell<Option<Holder>> = const { RefCell::new(None) });
+
+        std::thread::spawn(|| {
+            // register holder before the pools, so it is destroyed after them
+            HOLDER.with(|_| ());
+            let req = Message::<RequestHead>::new();
+            let res = Message::<ResponseHead>::new();
+            HOLDER.with(|h| *h.borrow_mut() = Some(Holder(Some(req), Some(res))));
+        })
+        .join()
+        .unwrap();
+    }
+
+    #[test]
+    fn response_connection_type() {
+        let mut res = Message::<ResponseHead>::with_status(StatusCode::OK);
+        assert_eq!(res.connection_type(), ConnectionType::KeepAlive);
+        res.version = Version::HTTP_10;
+        assert_eq!(res.connection_type(), ConnectionType::Close);
+        res.set_connection_type(ConnectionType::KeepAlive);
+        assert_eq!(res.connection_type(), ConnectionType::KeepAlive);
+    }
+
+    #[test]
+    fn message_clone() {
+        let mut msg = Message::<RequestHead>::new();
+        msg.method = Method::POST;
+        let msg2 = msg.clone();
+        assert_eq!(msg2.method, Method::POST);
+        assert!(CurrentIo::None.take().is_none());
     }
 }

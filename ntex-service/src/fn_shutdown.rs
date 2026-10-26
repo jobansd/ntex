@@ -1,31 +1,27 @@
-use std::{cell::Cell, fmt, marker::PhantomData};
+use std::{cell::Cell, convert::Infallible, fmt, marker::PhantomData};
 
-use crate::{Service, ServiceCtx, ServiceFactory};
+use crate::{Ctx, Service, ServiceFactory};
 
-#[inline]
-/// Create `FnShutdown` for function that can act as a `on_shutdown` callback.
-pub fn fn_shutdown<Req, Err, F>(f: F) -> FnShutdown<Req, Err, F>
-where
-    F: AsyncFnOnce(),
-{
-    FnShutdown::new(f)
-}
-
-pub struct FnShutdown<Req, Err, F> {
+/// A pass-through service that invokes an asynchronous shutdown callback once.
+pub struct FnShutdown<F, Err> {
     f_shutdown: Cell<Option<F>>,
-    _t: PhantomData<(Req, Err)>,
+    err: PhantomData<Err>,
 }
 
-impl<Req, Err, F> FnShutdown<Req, Err, F> {
-    pub(crate) fn new(f: F) -> Self {
+impl<F, Err> FnShutdown<F, Err> {
+    /// Creates a service with the supplied shutdown callback.
+    pub fn new<St>(f: F) -> Self
+    where
+        F: AsyncFnOnce(&St),
+    {
         Self {
             f_shutdown: Cell::new(Some(f)),
-            _t: PhantomData,
+            err: PhantomData,
         }
     }
 }
 
-impl<Req, Err, F> Clone for FnShutdown<Req, Err, F>
+impl<F, Err> Clone for FnShutdown<F, Err>
 where
     F: Clone,
 {
@@ -35,12 +31,12 @@ where
         self.f_shutdown.set(f.clone());
         Self {
             f_shutdown: Cell::new(f),
-            _t: PhantomData,
+            err: PhantomData,
         }
     }
 }
 
-impl<Req, Err, F> fmt::Debug for FnShutdown<Req, Err, F> {
+impl<F, Err> fmt::Debug for FnShutdown<F, Err> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("FnShutdown")
             .field("fn", &std::any::type_name::<F>())
@@ -48,22 +44,43 @@ impl<Req, Err, F> fmt::Debug for FnShutdown<Req, Err, F> {
     }
 }
 
-impl<Req, Err, C, F> ServiceFactory<Req, C> for FnShutdown<Req, Err, F>
+impl<F, St, Req, Err> Service<St, Req> for FnShutdown<F, Err>
 where
-    F: AsyncFnOnce() + Clone,
+    F: AsyncFnOnce(&St),
 {
-    type Response = Req;
+    type Res = Req;
     type Error = Err;
-    type Service = FnShutdown<Req, Err, F>;
-    type InitError = ();
 
     #[inline]
-    async fn create(&self, _: C) -> Result<Self::Service, Self::InitError> {
+    async fn shutdown(&self, ctx: Ctx<'_, Self, St>) {
+        if let Some(f) = self.f_shutdown.take() {
+            (f)(ctx.st()).await;
+        }
+    }
+
+    #[inline]
+    async fn call(&self, req: Req, _: Ctx<'_, Self, St>) -> Result<Req, Err> {
+        Ok(req)
+    }
+}
+
+impl<F, St, Req, Err> ServiceFactory<St, Req> for FnShutdown<F, Err>
+where
+    F: AsyncFnOnce(&St) + Clone,
+{
+    type Res = Req;
+    type Error = Err;
+
+    type Service = FnShutdown<F, Err>;
+    type InitError = Infallible;
+
+    #[inline]
+    async fn create(&self, _: &St) -> Result<Self::Service, Self::InitError> {
         if let Some(f) = self.f_shutdown.take() {
             self.f_shutdown.set(Some(f.clone()));
             Ok(FnShutdown {
                 f_shutdown: Cell::new(Some(f)),
-                _t: PhantomData,
+                err: PhantomData,
             })
         } else {
             panic!("FnShutdown was used already");
@@ -71,49 +88,25 @@ where
     }
 }
 
-impl<Req, Err, F> Service<Req> for FnShutdown<Req, Err, F>
-where
-    F: AsyncFnOnce(),
-{
-    type Response = Req;
-    type Error = Err;
-
-    #[inline]
-    async fn shutdown(&self) {
-        if let Some(f) = self.f_shutdown.take() {
-            (f)().await;
-        }
-    }
-
-    #[inline]
-    async fn call(&self, req: Req, _: ServiceCtx<'_, Self>) -> Result<Req, Err> {
-        Ok(req)
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use std::{future::poll_fn, rc::Rc};
 
-    use crate::{chain_factory, fn_service};
+    use crate::{Pipeline, factory, service};
 
     use super::*;
 
     #[ntex::test]
     async fn test_fn_shutdown() {
+        // Service factory
         let is_called = Rc::new(Cell::new(false));
-        let srv = fn_service(|()| async { Ok::<_, ()>("pipe") });
         let is_called2 = is_called.clone();
-        let on_shutdown = fn_shutdown(async move || {
+        let fac = factory(|()| async { Ok::<_, ()>("pipe") }).shutdown(async move |()| {
             is_called2.set(true);
         });
+        let _ = format!("{fac:?}");
 
-        let pipe = chain_factory(srv)
-            .and_then(on_shutdown)
-            .clone()
-            .pipeline(())
-            .await
-            .unwrap();
+        let pipe = Pipeline::new((), fac.clone().create(&()).await.unwrap());
 
         let res = pipe.call(()).await;
         assert_eq!(pipe.ready().await, Ok(()));
@@ -122,30 +115,31 @@ mod tests {
         assert!(!pipe.is_shutdown());
         pipe.shutdown().await;
         assert!(is_called.get());
-        assert!(!pipe.is_shutdown());
+        assert!(pipe.is_shutdown());
 
-        let pipe = pipe.bind();
         poll_fn(|cx| pipe.poll_shutdown(cx)).await;
         assert!(pipe.is_shutdown());
 
-        let _ = format!("{pipe:?}");
-    }
-
-    #[ntex::test]
-    #[should_panic]
-    #[allow(clippy::should_panic_without_expect)]
-    async fn test_fn_shutdown_panic() {
+        // Service
         let is_called = Rc::new(Cell::new(false));
         let is_called2 = is_called.clone();
-        let on_shutdown = fn_shutdown::<(), (), _>(async move || {
+        let svc = service(|()| async { Ok::<_, ()>("pipe") }).shutdown(async move |()| {
             is_called2.set(true);
         });
+        let _ = format!("{fac:?}");
 
-        let pipe = chain_factory(on_shutdown).pipeline(()).await.unwrap();
+        let pipe = Pipeline::new((), svc);
+
+        let res = pipe.call(()).await;
+        assert_eq!(pipe.ready().await, Ok(()));
+        assert!(res.is_ok());
+        assert_eq!(res.unwrap(), "pipe");
+        assert!(!pipe.is_shutdown());
         pipe.shutdown().await;
         assert!(is_called.get());
-        assert!(!pipe.is_shutdown());
+        assert!(pipe.is_shutdown());
 
-        let _factory = pipe.get_ref().create(()).await;
+        poll_fn(|cx| pipe.poll_shutdown(cx)).await;
+        assert!(pipe.is_shutdown());
     }
 }

@@ -1,162 +1,151 @@
-use std::{fmt, marker::PhantomData, task::Context};
+use std::{fmt, marker::PhantomData};
 
-use super::{Service, ServiceCtx, ServiceFactory};
+use super::{Ctx, Service, ServiceFactory};
 
-/// Service for the `map_err` combinator, changing the type of a service's
-/// error.
+/// Service produced by the `map_err` combinator.
 ///
-/// This is created by the `ServiceExt::map_err` method.
-pub struct MapErr<A, F, E> {
-    service: A,
+/// This is created by the `Service::map_err()` and `ServiceChain::map_err()` methods.
+/// Mapping errors preserves the wrapped service's readiness identity.
+pub struct MapErr<F, S, E> {
     f: F,
-    _t: PhantomData<E>,
+    svc: S,
+    e: PhantomData<E>,
 }
 
-impl<A, F, E> MapErr<A, F, E> {
-    /// Create new `MapErr` combinator
-    pub(crate) fn new<R>(service: A, f: F) -> Self
+impl<F, S, E> MapErr<F, S, E> {
+    /// Creates a new `MapErr` service.
+    pub(crate) fn new<St, Req>(f: F, svc: S) -> Self
     where
-        A: Service<R>,
-        F: Fn(A::Error) -> E,
+        S: Service<St, Req>,
+        F: Fn(S::Error) -> E,
     {
         Self {
-            service,
             f,
-            _t: PhantomData,
+            svc,
+            e: PhantomData,
         }
     }
 }
 
-impl<A, F, E> Clone for MapErr<A, F, E>
+impl<F, S, E> Clone for MapErr<F, S, E>
 where
-    A: Clone,
     F: Clone,
+    S: Clone,
 {
     #[inline]
     fn clone(&self) -> Self {
         MapErr {
-            service: self.service.clone(),
             f: self.f.clone(),
-            _t: PhantomData,
+            svc: self.svc.clone(),
+            e: PhantomData,
         }
     }
 }
 
-impl<A, F, E> fmt::Debug for MapErr<A, F, E>
+impl<F, S, E> fmt::Debug for MapErr<F, S, E>
 where
-    A: fmt::Debug,
+    S: fmt::Debug,
 {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("MapErr")
-            .field("svc", &self.service)
+            .field("svc", &self.svc)
             .field("map", &std::any::type_name::<F>())
             .finish()
     }
 }
 
-impl<A, R, F, E> Service<R> for MapErr<A, F, E>
+impl<F, S, St, Req, E> Service<St, Req> for MapErr<F, S, E>
 where
-    A: Service<R>,
-    F: Fn(A::Error) -> E,
+    S: Service<St, Req>,
+    F: Fn(S::Error) -> E,
 {
-    type Response = A::Response;
+    type Res = S::Res;
     type Error = E;
 
+    crate::forward_bind!(St, svc);
+
     #[inline]
-    async fn ready(&self, ctx: ServiceCtx<'_, Self>) -> Result<(), Self::Error> {
-        ctx.ready(&self.service).await.map_err(&self.f)
+    async fn call(&self, req: Req, ctx: Ctx<'_, Self, St>) -> Result<S::Res, E> {
+        self.svc
+            .call(req, ctx.cast())
+            .await
+            .map_err(|e| (self.f)(e))
     }
 
     #[inline]
-    fn poll(&self, cx: &mut Context<'_>) -> Result<(), Self::Error> {
-        self.service.poll(cx).map_err(&self.f)
+    async fn ready(&self, ctx: Ctx<'_, Self, St>) -> Result<(), E> {
+        self.svc.ready(ctx.cast()).await.map_err(&self.f)
     }
 
     #[inline]
-    async fn call(
-        &self,
-        req: R,
-        ctx: ServiceCtx<'_, Self>,
-    ) -> Result<Self::Response, Self::Error> {
-        ctx.call(&self.service, req).await.map_err(|e| (self.f)(e))
+    async fn shutdown(&self, ctx: Ctx<'_, Self, St>) {
+        self.svc.shutdown(ctx.cast()).await;
     }
-
-    crate::forward_shutdown!(service);
 }
 
-/// Factory for the `map_err` combinator, changing the type of a new
-/// service's error.
+/// Service factory produced by the `map_err` combinator.
 ///
-/// This is created by the `NewServiceExt::map_err` method.
-pub struct MapErrFactory<A, R, C, F, E>
-where
-    A: ServiceFactory<R, C>,
-    F: Fn(A::Error) -> E + Clone,
-{
-    a: A,
+/// This is created by the `ServiceChainFactory::map_err()` method.
+pub struct MapErrFactory<F, Sf, E> {
     f: F,
-    e: PhantomData<fn(R, C) -> E>,
+    sf: Sf,
+    e: PhantomData<fn(Sf) -> E>,
 }
 
-impl<A, R, C, F, E> MapErrFactory<A, R, C, F, E>
-where
-    A: ServiceFactory<R, C>,
-    F: Fn(A::Error) -> E + Clone,
-{
-    /// Create new `MapErr` new service instance
-    pub(crate) fn new(a: A, f: F) -> Self {
+impl<F, Sf, E> MapErrFactory<F, Sf, E> {
+    /// Creates a new `MapErrFactory`.
+    pub(crate) fn new<St, Req>(f: F, sf: Sf) -> Self
+    where
+        Sf: ServiceFactory<St, Req>,
+        F: Fn(Sf::Error) -> E + Clone,
+    {
         Self {
-            a,
             f,
+            sf,
             e: PhantomData,
         }
     }
 }
 
-impl<A, R, C, F, E> Clone for MapErrFactory<A, R, C, F, E>
-where
-    A: ServiceFactory<R, C> + Clone,
-    F: Fn(A::Error) -> E + Clone,
-{
+impl<F: Clone, Sf: Clone, E> Clone for MapErrFactory<F, Sf, E> {
     fn clone(&self) -> Self {
         Self {
-            a: self.a.clone(),
             f: self.f.clone(),
+            sf: self.sf.clone(),
             e: PhantomData,
         }
     }
 }
 
-impl<A, R, C, F, E> fmt::Debug for MapErrFactory<A, R, C, F, E>
+impl<F, Sf, E> fmt::Debug for MapErrFactory<F, Sf, E>
 where
-    A: ServiceFactory<R, C> + fmt::Debug,
-    F: Fn(A::Error) -> E + Clone,
+    Sf: fmt::Debug,
 {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("MapErrFactory")
-            .field("factory", &self.a)
+            .field("sf", &self.sf)
             .field("map", &std::any::type_name::<F>())
             .finish()
     }
 }
 
-impl<A, R, C, F, E> ServiceFactory<R, C> for MapErrFactory<A, R, C, F, E>
+impl<F, Sf, St, Req, E> ServiceFactory<St, Req> for MapErrFactory<F, Sf, E>
 where
-    A: ServiceFactory<R, C>,
-    F: Fn(A::Error) -> E + Clone,
+    Sf: ServiceFactory<St, Req>,
+    F: Fn(Sf::Error) -> E + Clone,
 {
-    type Response = A::Response;
+    type Res = Sf::Res;
     type Error = E;
 
-    type Service = MapErr<A::Service, F, E>;
-    type InitError = A::InitError;
+    type Service = MapErr<F, Sf::Service, E>;
+    type InitError = Sf::InitError;
 
     #[inline]
-    async fn create(&self, cfg: C) -> Result<Self::Service, Self::InitError> {
-        self.a.create(cfg).await.map(|service| MapErr {
-            service,
+    async fn create(&self, st: &St) -> Result<Self::Service, Self::InitError> {
+        self.sf.create(st).await.map(|svc| MapErr {
+            svc,
             f: self.f.clone(),
-            _t: PhantomData,
+            e: PhantomData,
         })
     }
 }
@@ -166,24 +155,24 @@ mod tests {
     use std::{cell::Cell, rc::Rc};
 
     use super::*;
-    use crate::{Pipeline, fn_factory};
+    use crate::{Pipeline, fn_factory, service};
 
     #[derive(Debug, Clone)]
     struct Srv(bool, Rc<Cell<usize>>);
 
-    impl Service<()> for Srv {
-        type Response = ();
+    impl Service<(), ()> for Srv {
+        type Res = ();
         type Error = ();
 
-        async fn ready(&self, _: ServiceCtx<'_, Self>) -> Result<(), Self::Error> {
+        async fn ready(&self, _: Ctx<'_, Self>) -> Result<(), Self::Error> {
             if self.0 { Err(()) } else { Ok(()) }
         }
 
-        async fn call(&self, _m: (), _: ServiceCtx<'_, Self>) -> Result<(), ()> {
+        async fn call(&self, _m: (), _: Ctx<'_, Self>) -> Result<(), ()> {
             Err(())
         }
 
-        async fn shutdown(&self) {
+        async fn shutdown(&self, _: Ctx<'_, Self, ()>) {
             self.1.set(self.1.get() + 1);
         }
     }
@@ -191,7 +180,10 @@ mod tests {
     #[ntex::test]
     async fn test_ready() {
         let cnt_sht = Rc::new(Cell::new(0));
-        let srv = Pipeline::new(Srv(true, cnt_sht.clone()).map_err(|()| "error"));
+        let srv = Pipeline::new(
+            (),
+            service(Srv(true, cnt_sht.clone())).map_err(|()| "error"),
+        );
         let res = srv.ready().await;
         assert_eq!(res, Err("error"));
 
@@ -202,6 +194,7 @@ mod tests {
     #[ntex::test]
     async fn test_service() {
         let srv = Pipeline::new(
+            (),
             Srv(false, Rc::new(Cell::new(0)))
                 .map_err(|()| "error")
                 .clone(),
@@ -216,7 +209,8 @@ mod tests {
     #[ntex::test]
     async fn test_pipeline() {
         let srv = Pipeline::new(
-            crate::chain(Srv(false, Rc::new(Cell::new(0))))
+            (),
+            crate::service(Srv(false, Rc::new(Cell::new(0))))
                 .map_err(|()| "error")
                 .clone(),
         );
@@ -230,10 +224,9 @@ mod tests {
     #[ntex::test]
     async fn test_factory() {
         let new_srv =
-            fn_factory(|| async { Ok::<_, ()>(Srv(false, Rc::new(Cell::new(0)))) })
-                .map_err(|()| "error")
-                .clone();
-        let srv = Pipeline::new(new_srv.create(&()).await.unwrap());
+            crate::fn_factory(|(): &()| async { Ok::<_, ()>(Srv(false, Rc::new(Cell::new(0)))) })
+                .map_err(|()| "error");
+        let srv = Pipeline::new((), new_srv.create(&()).await.unwrap());
         let res = srv.call(()).await;
         assert!(res.is_err());
         assert_eq!(res.err().unwrap(), "error");
@@ -242,12 +235,11 @@ mod tests {
 
     #[ntex::test]
     async fn test_pipeline_factory() {
-        let new_srv = crate::chain_factory(fn_factory(|| async {
-            Ok::<Srv, ()>(Srv(false, Rc::new(Cell::new(0))))
-        }))
-        .map_err(|()| "error")
-        .clone();
-        let srv = Pipeline::new(new_srv.create(&()).await.unwrap());
+        let new_srv =
+            fn_factory(|(): &()| async move { Ok::<Srv, ()>(Srv(false, Rc::new(Cell::new(0)))) })
+                .map_err(|()| "error")
+                .clone();
+        let srv = Pipeline::new((), new_srv.create(&()).await.unwrap());
         let res = srv.call(()).await;
         assert!(res.is_err());
         assert_eq!(res.err().unwrap(), "error");

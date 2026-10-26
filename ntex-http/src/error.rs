@@ -3,7 +3,7 @@ use std::{error, fmt};
 pub use crate::value::{InvalidHeaderValue, ToStrError};
 
 #[derive(Copy, Clone, PartialEq, Eq, Hash)]
-/// A generic "error" for HTTP connections
+/// A generic error for HTTP value conversions.
 ///
 /// This error type is less specific than the error returned from other
 /// functions in this crate, but all other errors can be converted to this
@@ -71,12 +71,12 @@ impl fmt::Display for Error {
 }
 
 impl Error {
-    /// Return true if the underlying error has the same type as T.
+    /// Returns `true` if the underlying error has type `T`.
     pub fn is<T: error::Error + 'static>(&self) -> bool {
         self.get_ref().is::<T>()
     }
 
-    /// Return a reference to the lower level, inner error.
+    /// Returns the underlying conversion error.
     pub fn get_ref(&self) -> &(dyn error::Error + 'static) {
         match self.inner {
             ErrorKind::StatusCode(ref e) => e,
@@ -159,6 +159,8 @@ impl From<http::Error> for Error {
             ErrorKind::Method(InvalidMethod { _priv: () })
         } else if err.is::<http::uri::InvalidUri>() {
             ErrorKind::Uri(InvalidUri { _priv: () })
+        } else if err.is::<http::uri::InvalidUriParts>() {
+            ErrorKind::UriParts(InvalidUri { _priv: () })
         } else if err.is::<http::header::InvalidHeaderName>() {
             ErrorKind::HeaderName(InvalidHeaderName { _priv: () })
         } else if err.is::<http::header::InvalidHeaderValue>() {
@@ -249,5 +251,21 @@ mod tests {
 
         let s = format!("{err:?}");
         assert!(s.starts_with("ntex_http::Error"));
+    }
+
+    #[test]
+    fn other_http_error() {
+        // http errors without a dedicated kind convert to a generic error
+        let e = http::HeaderMap::<http::HeaderValue>::new()
+            .try_reserve(usize::MAX)
+            .unwrap_err();
+        let err: Error = http::Error::from(e).into();
+        assert_eq!(err.to_string(), "http error");
+        assert!(err.source().is_none());
+        assert!(!err.is::<InvalidStatusCode>());
+        assert_eq!(
+            format!("{err:?}"),
+            "ntex_http::Error(ErrorMessage(\"http error\"))"
+        );
     }
 }

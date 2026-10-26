@@ -8,13 +8,13 @@ use serde::{Serialize, de::DeserializeOwned};
 use crate::http::encoding::Decoder;
 use crate::http::header::{CONTENT_LENGTH, CONTENT_TYPE};
 use crate::http::{HttpMessage, Payload, Response, StatusCode};
-use crate::util::{BoxFuture, BytesMut, stream_recv};
-use crate::web::error::{ErrorRenderer, UrlencodedError, WebResponseError};
-use crate::web::{FromRequest, HttpRequest, Responder};
+use crate::util::BoxFuture;
+use crate::web::error::{UrlencodedError, WebResponseError};
+use crate::web::{FromRequest, HttpRequest, Responder, State};
 
 /// Form data helper (`application/x-www-form-urlencoded`)
 ///
-/// Can be use to extract url-encoded data from the request body,
+/// Can be used to extract url-encoded data from the request body,
 /// or send url-encoded data as the response.
 ///
 /// ## Extract
@@ -22,7 +22,7 @@ use crate::web::{FromRequest, HttpRequest, Responder};
 /// To extract typed information from request's body, the type `T` must
 /// implement the `Deserialize` trait from *serde*.
 ///
-/// [**`FormConfig`**](struct.FormConfig.html) allows to configure extraction
+/// [`FormConfig`] allows to configure extraction
 /// process.
 ///
 /// ### Example
@@ -35,9 +35,11 @@ use crate::web::{FromRequest, HttpRequest, Responder};
 /// }
 ///
 /// /// Extract form data using serde.
-/// /// This handler get called only if content type is *x-www-form-urlencoded*
-/// /// and content of the request could be deserialized to a `FormData` struct
-/// fn index(form: web::types::Form<FormData>) -> String {
+/// ///
+/// /// If the content type is not *x-www-form-urlencoded* or the body cannot be
+/// /// deserialized to a `FormData` struct, the extractor fails with
+/// /// `UrlencodedError` and the handler is not called.
+/// async fn index(form: web::types::Form<FormData>) -> String {
 ///     format!("Welcome {}!", form.username)
 /// }
 /// # fn main() {}
@@ -62,7 +64,7 @@ use crate::web::{FromRequest, HttpRequest, Responder};
 /// // Will return a 200 response with header
 /// // `Content-Type: application/x-www-form-urlencoded`
 /// // and body "name=ntex&age=123"
-/// fn index() -> web::types::Form<SomeForm> {
+/// async fn index() -> web::types::Form<SomeForm> {
 ///     web::types::Form(SomeForm {
 ///         name: "ntex".into(),
 ///         age: 123
@@ -94,14 +96,15 @@ impl<T> ops::DerefMut for Form<T> {
     }
 }
 
-impl<T, Err> FromRequest<Err> for Form<T>
+impl<St, T> FromRequest<St> for Form<T>
 where
+    St: State,
     T: DeserializeOwned + 'static,
-    Err: ErrorRenderer,
 {
     type Error = UrlencodedError;
 
     async fn from_request(
+        _: &St,
         req: &HttpRequest,
         payload: &mut Payload,
     ) -> Result<Self, Self::Error> {
@@ -126,17 +129,18 @@ impl<T: fmt::Display> fmt::Display for Form<T> {
     }
 }
 
-impl<T: Serialize, Err: ErrorRenderer> Responder<Err> for Form<T>
+impl<St, T: Serialize> Responder<St> for Form<T>
 where
-    Err::Container: From<serde_urlencoded::ser::Error>,
+    St: State,
+    serde_urlencoded::ser::Error: WebResponseError<St, St::Error>,
 {
-    async fn respond_to(self, req: &HttpRequest) -> Response {
+    async fn respond_to(self, st: &St, _: &HttpRequest) -> Response {
         let body = match serde_urlencoded::to_string(&self.0) {
             Ok(body) => body,
-            Err(e) => return e.error_response(req),
+            Err(e) => return e.error_response(st),
         };
 
-        Response::build(StatusCode::OK)
+        Response::builder(StatusCode::OK)
             .header(CONTENT_TYPE, "application/x-www-form-urlencoded")
             .body(body)
     }
@@ -145,7 +149,8 @@ where
 /// Form extractor configuration
 ///
 /// ```rust
-/// use ntex::web::{self, App, Error, FromRequest};
+/// use std::convert::Infallible;
+/// use ntex::web::{self, App, WebError, FromRequest, WebAppConfig};
 ///
 /// #[derive(serde::Deserialize)]
 /// struct FormData {
@@ -154,19 +159,18 @@ where
 ///
 /// /// Extract form data using serde.
 /// /// Custom configuration is used for this handler, max payload size is 4k
-/// async fn index(form: web::types::Form<FormData>) -> Result<String, Error> {
+/// async fn index(form: web::types::Form<FormData>) -> Result<String, Infallible> {
 ///     Ok(format!("Welcome {}!", form.username))
 /// }
 ///
 /// fn main() {
-///     let app = App::new().service(
-///         web::resource("/index.html")
-///             // change `Form` extractor configuration
-///             .state(
-///                 web::types::FormConfig::default().limit(4097)
-///             )
-///             .route(web::get().to(index))
-///     );
+///     let cfg = WebAppConfig::new()
+///         // change `Form` extractor configuration
+///         .set_state(web::types::FormConfig::default().limit(4097));
+///
+///     let app = App::default()
+///         .with_config(cfg)
+///         .service(web::resource("/index.html").route(web::get().to(index)));
 /// }
 /// ```
 #[derive(Clone, Debug)]
@@ -200,7 +204,8 @@ impl Default for FormConfig {
 /// Returns error:
 ///
 /// * content type is not `application/x-www-form-urlencoded`
-/// * content-length is greater than 32k
+/// * content-length is greater than the limit (32k by default; the `Form`
+///   extractor sets it from [`FormConfig`], 16k by default)
 ///
 struct UrlEncoded<U> {
     #[cfg(feature = "compress")]
@@ -218,7 +223,10 @@ impl<U> UrlEncoded<U> {
     /// Create a new future to URL encode a request
     fn new(req: &HttpRequest, payload: &mut Payload) -> UrlEncoded<U> {
         // check content type
-        if req.content_type().to_lowercase() != "application/x-www-form-urlencoded" {
+        if !req
+            .content_type()
+            .eq_ignore_ascii_case("application/x-www-form-urlencoded")
+        {
             return Self::err(UrlencodedError::ContentType);
         }
         let Ok(encoding) = req.encoding() else {
@@ -264,7 +272,7 @@ impl<U> UrlEncoded<U> {
         }
     }
 
-    /// Change max size of payload. By default max size is 256Kb
+    /// Change max size of payload. By default max size is 32Kb
     fn limit(mut self, limit: usize) -> Self {
         self.limit = limit;
         self
@@ -287,8 +295,8 @@ where
         }
 
         // payload size
-        let limit = self.limit;
-        if let Some(len) = self.length.take()
+        let (limit, length) = (self.limit, self.length);
+        if let Some(len) = length
             && len > limit
         {
             return Poll::Ready(Err(UrlencodedError::Overflow { size: len, limit }));
@@ -299,18 +307,10 @@ where
         let mut stream = self.stream.take().unwrap();
 
         self.fut = Some(Box::pin(async move {
-            let mut body = BytesMut::with_capacity(8192);
-
-            while let Some(item) = stream_recv(&mut stream).await {
-                let chunk = item?;
-                if (body.len() + chunk.len()) > limit {
-                    return Err(UrlencodedError::Overflow {
-                        size: body.len() + chunk.len(),
-                        limit,
-                    });
-                }
-                body.extend_from_slice(&chunk);
-            }
+            let body = super::read_body(&mut stream, limit, length, |size| {
+                UrlencodedError::Overflow { size, limit }
+            })
+            .await?;
 
             if encoding == UTF_8 {
                 serde_urlencoded::from_bytes::<U>(&body).map_err(|_| UrlencodedError::Parse)
@@ -374,13 +374,15 @@ mod tests {
 
     #[crate::rt_test]
     async fn test_form() {
-        let (req, mut pl) =
+        let (req, mut pl, ()) =
             TestRequest::with_header(CONTENT_TYPE, "application/x-www-form-urlencoded")
                 .header(CONTENT_LENGTH, "11")
-                .set_payload(Bytes::from_static(b"hello=world&counter=123"))
+                .payload(Bytes::from_static(b"hello=world&counter=123"))
                 .to_http_parts();
 
-        let Form(s) = from_request::<Form<Info>>(&req, &mut pl).await.unwrap();
+        let Form(s) = from_request::<_, Form<Info>>(&(), &req, &mut pl)
+            .await
+            .unwrap();
         assert_eq!(
             s,
             Info {
@@ -389,25 +391,25 @@ mod tests {
             }
         );
 
-        let (req, mut pl) =
+        let (req, mut pl, ()) =
             TestRequest::with_header(CONTENT_TYPE, "application/x-www-form-urlencoded")
                 .header(CONTENT_LENGTH, "xx")
-                .set_payload(Bytes::from_static(b"hello=world&counter=123"))
+                .payload(Bytes::from_static(b"hello=world&counter=123"))
                 .to_http_parts();
-        let res = from_request::<Form<Info>>(&req, &mut pl).await;
+        let res = from_request::<_, Form<Info>>(&(), &req, &mut pl).await;
         assert!(eq(&res.err().unwrap(), &UrlencodedError::UnknownLength));
     }
 
     #[crate::rt_test]
     async fn test_urlencoded_error() {
-        let (req, mut pl) =
+        let (req, mut pl, ()) =
             TestRequest::with_header(CONTENT_TYPE, "application/x-www-form-urlencoded")
                 .header(CONTENT_LENGTH, "xxxx")
                 .to_http_parts();
         let info = UrlEncoded::<Info>::new(&req, &mut pl).await;
         assert!(eq(&info.err().unwrap(), &UrlencodedError::UnknownLength));
 
-        let (req, mut pl) =
+        let (req, mut pl, ()) =
             TestRequest::with_header(CONTENT_TYPE, "application/x-www-form-urlencoded")
                 .header(CONTENT_LENGTH, "1000000")
                 .to_http_parts();
@@ -417,7 +419,7 @@ mod tests {
             &UrlencodedError::Overflow { size: 0, limit: 0 }
         ));
 
-        let (req, mut pl) = TestRequest::with_header(CONTENT_TYPE, "text/plain")
+        let (req, mut pl, ()) = TestRequest::with_header(CONTENT_TYPE, "text/plain")
             .header(CONTENT_LENGTH, "10")
             .to_http_parts();
         let info = UrlEncoded::<Info>::new(&req, &mut pl).await;
@@ -426,10 +428,10 @@ mod tests {
 
     #[crate::rt_test]
     async fn test_urlencoded() {
-        let (req, mut pl) =
+        let (req, mut pl, ()) =
             TestRequest::with_header(CONTENT_TYPE, "application/x-www-form-urlencoded")
                 .header(CONTENT_LENGTH, "11")
-                .set_payload(Bytes::from_static(b"hello=world&counter=123"))
+                .payload(Bytes::from_static(b"hello=world&counter=123"))
                 .to_http_parts();
 
         let info = UrlEncoded::<Info>::new(&req, &mut pl).await.unwrap();
@@ -441,12 +443,19 @@ mod tests {
             }
         );
 
-        let (req, mut pl) = TestRequest::with_header(
+        let (req, mut pl, ()) =
+            TestRequest::with_header(CONTENT_TYPE, "Application/X-WWW-Form-URLEncoded")
+                .header(CONTENT_LENGTH, "11")
+                .payload(Bytes::from_static(b"hello=world&counter=123"))
+                .to_http_parts();
+        assert!(UrlEncoded::<Info>::new(&req, &mut pl).await.is_ok());
+
+        let (req, mut pl, ()) = TestRequest::with_header(
             CONTENT_TYPE,
             "application/x-www-form-urlencoded; charset=utf-8",
         )
         .header(CONTENT_LENGTH, "11")
-        .set_payload(Bytes::from_static(b"hello=world&counter=123"))
+        .payload(Bytes::from_static(b"hello=world&counter=123"))
         .to_http_parts();
 
         let info = UrlEncoded::<Info>::new(&req, &mut pl).await.unwrap();
@@ -458,12 +467,12 @@ mod tests {
             }
         );
 
-        let (req, mut pl) = TestRequest::with_header(
+        let (req, mut pl, ()) = TestRequest::with_header(
             CONTENT_TYPE,
             "application/x-www-form-urlencoded; charset=cp1251",
         )
         .header(CONTENT_LENGTH, "11")
-        .set_payload(Bytes::from_static(b"hello=world&counter=123"))
+        .payload(Bytes::from_static(b"hello=world&counter=123"))
         .to_http_parts();
 
         let info = UrlEncoded::<Info>::new(&req, &mut pl).await.unwrap();
@@ -492,5 +501,41 @@ mod tests {
         );
 
         assert_eq!(resp.get_body_ref(), b"hello=world&counter=123");
+    }
+
+    #[crate::rt_test]
+    async fn test_urlencoded_errors2() {
+        let (req, mut pl, ()) = TestRequest::with_header(
+            CONTENT_TYPE,
+            "application/x-www-form-urlencoded; charset=unknown",
+        )
+        .to_http_parts();
+        let info = UrlEncoded::<Info>::new(&req, &mut pl).await;
+        assert!(eq(&info.err().unwrap(), &UrlencodedError::ContentType));
+
+        let (req, mut pl, ()) =
+            TestRequest::with_header(CONTENT_TYPE, "application/x-www-form-urlencoded")
+                .header(CONTENT_LENGTH, HeaderValue::from_bytes(b"1\xff").unwrap())
+                .to_http_parts();
+        let info = UrlEncoded::<Info>::new(&req, &mut pl).await;
+        assert!(eq(&info.err().unwrap(), &UrlencodedError::UnknownLength));
+
+        // no content-length, payload is larger than limit
+        let (req, mut pl, ()) =
+            TestRequest::with_header(CONTENT_TYPE, "application/x-www-form-urlencoded")
+                .payload(Bytes::from_static(b"hello=world&counter=123"))
+                .to_http_parts();
+        let info = UrlEncoded::<Info>::new(&req, &mut pl).limit(5).await;
+        assert!(eq(
+            &info.err().unwrap(),
+            &UrlencodedError::Overflow { size: 0, limit: 0 }
+        ));
+    }
+
+    #[crate::rt_test]
+    async fn test_responder_error() {
+        let req = TestRequest::default().to_http_request();
+        let resp = respond_to(Form(1), &req).await;
+        assert_eq!(resp.status(), StatusCode::INTERNAL_SERVER_ERROR);
     }
 }

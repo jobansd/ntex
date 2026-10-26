@@ -1,11 +1,13 @@
-use std::{cell::UnsafeCell, net::SocketAddr, rc::Rc};
+use std::{any::Any, any::TypeId, cell::UnsafeCell, net::SocketAddr, rc::Rc};
+
+use urly::Url;
 
 use crate::service::cfg::{CfgContext, Configuration};
-use crate::{router::ResourceDef, util::ByteString, util::Extensions};
+use crate::{router::ResourceDef, util::ByteString, util::HashMap};
 
 use super::httprequest::{HttpRequest, HttpRequestInner};
 use super::service::{AppServiceFactory, ServiceFactoryWrapper, WebServiceFactory};
-use super::{DefaultError, ErrorRenderer, resource::Resource, route::Route};
+use super::{Resource, Route, State};
 
 /// Application configuration
 #[derive(Debug)]
@@ -15,6 +17,7 @@ pub struct WebAppConfig {
     host: String,
     addr: SocketAddr,
     config: CfgContext,
+    state: HashMap<TypeId, Box<dyn Any + Sync + Send>>,
     pub(super) pool_size: usize,
 }
 
@@ -57,6 +60,7 @@ impl WebAppConfig {
             addr,
             name: name.into(),
             pool_size: 128,
+            state: HashMap::default(),
             config: CfgContext::default(),
         }
     }
@@ -69,10 +73,10 @@ impl WebAppConfig {
     /// Server host name
     ///
     /// Host name is used by application router as a hostname for url generation.
-    /// Check [`ConnectionInfo`](./struct.ConnectionInfo.html#method.host)
+    /// Check [`ConnectionInfo::host()`](crate::web::dev::ConnectionInfo::host)
     /// documentation for more information.
     ///
-    /// By default host name is set to a "localhost" value.
+    /// By default host name is set to a "localhost:8080" value.
     pub fn host(&self) -> &str {
         &self.host
     }
@@ -87,10 +91,17 @@ impl WebAppConfig {
         self.addr
     }
 
+    /// Get an application state object stored with `.set_state()` method.
+    pub fn state<T: 'static>(&self) -> Option<&T> {
+        self.state
+            .get(&TypeId::of::<T>())
+            .and_then(|boxed| boxed.downcast_ref())
+    }
+
     #[must_use]
     /// Set server host name.
     ///
-    /// By default host name is set to a "localhost" value.
+    /// By default host name is set to a "localhost:8080" value.
     pub fn set_host(mut self, host: String) -> Self {
         self.host = host;
         self
@@ -104,7 +115,7 @@ impl WebAppConfig {
     }
 
     #[must_use]
-    /// Returns the socket address of the local half of this TCP connection.
+    /// Set the socket address of the local half of the TCP connection.
     pub fn set_local_addr(mut self, addr: SocketAddr) -> Self {
         self.addr = addr;
         self
@@ -119,16 +130,21 @@ impl WebAppConfig {
         self
     }
 
-    /// Get message from the pool.
-    pub(crate) fn get_request(&self) -> Option<HttpRequest> {
-        CACHE.with(|cache| {
-            cache.with(self.config.id(), |cache| cache.pop().map(HttpRequest))
-        })
+    #[must_use]
+    /// Set application level arbitrary state item.
+    ///
+    /// Application state stored with `.set_state()` method is available
+    /// via `HttpRequest::app_state()` method at runtime.
+    pub fn set_state<T: Send + Sync + 'static>(mut self, val: T) -> Self {
+        self.state
+            .insert(TypeId::of::<T>(), Box::new(val))
+            .and_then(|item| item.downcast::<T>().map(|boxed| *boxed).ok());
+        self
     }
 
     /// Get message from the pool.
-    pub(crate) fn clear_requests(&self) {
-        CACHE.with(|cache| cache.with(self.config.id(), Vec::clear));
+    pub(crate) fn get_request(&self) -> Option<HttpRequest> {
+        CACHE.with(|cache| cache.with(self.config.id(), |cache| cache.pop().map(HttpRequest)))
     }
 }
 
@@ -139,8 +155,10 @@ pub(crate) fn put_request(id: usize, pool_size: usize, req: &mut Rc<HttpRequestI
             if cache.len() < pool_size
                 && let Some(inner) = Rc::get_mut(req)
             {
-                inner.head.remove_io();
-                inner.head.extensions.borrow_mut().clear();
+                // the head and the path may share the connection read buffer,
+                // a pooled request must not keep it alive
+                inner.head.clear();
+                inner.path.set(Url::new());
                 cache.push(req.clone());
             }
         });
@@ -154,33 +172,28 @@ pub(crate) fn put_request(id: usize, pool_size: usize, req: &mut Rc<HttpRequestI
 /// modularization of big application configuration.
 #[derive(derive_more::Debug)]
 #[debug("ServiceConfig")]
-pub struct ServiceConfig<Err = DefaultError> {
-    pub(super) services: Vec<Box<dyn AppServiceFactory<Err>>>,
-    pub(super) state: Extensions,
+pub struct ServiceConfig<St, In = ()> {
+    pub(super) services: Vec<Box<dyn AppServiceFactory<St, In>>>,
     pub(super) external: Vec<ResourceDef>,
 }
 
-impl<Err: ErrorRenderer> ServiceConfig<Err> {
-    pub fn new() -> Self {
+impl<St: State, In: 'static> ServiceConfig<St, In> {
+    /// Create a service configuration with the given external resources.
+    pub fn new(external: Vec<ResourceDef>) -> Self {
         Self {
+            external,
             services: Vec::new(),
-            state: Extensions::new(),
-            external: Vec::new(),
         }
     }
 
-    /// Set application state.
+    /// Register a route for an application path.
     ///
-    /// This is same as `App::state()` method.
-    pub fn state<S: 'static>(&mut self, st: S) -> &mut Self {
-        self.state.insert(st);
-        self
-    }
-
-    /// Configure route for a specific path.
+    /// This has the same behavior as [`App::route()`]: it creates a separate
+    /// resource containing the route and promotes the route's method and custom
+    /// guards to resource guards.
     ///
-    /// This is same as `App::route()` method.
-    pub fn route(&mut self, path: &str, mut route: Route<Err>) -> &mut Self {
+    /// [`App::route()`]: super::App::route
+    pub fn route(&mut self, path: &str, mut route: Route<St, In>) -> &mut Self {
         self.service(
             Resource::new(path)
                 .add_guards(route.take_guards())
@@ -188,12 +201,29 @@ impl<Err: ErrorRenderer> ServiceConfig<Err> {
         )
     }
 
-    /// Register http service.
+    /// Registers a web service with the current application or scope.
     ///
-    /// This is same as `App::service()` method.
+    /// This has the same routing behavior as [`App::service()`]. The service
+    /// can be a resource, scope, attribute-macro handler, or custom
+    /// [`WebServiceFactory`]. When this configuration is used by a scope, the
+    /// service is registered below that scope's path prefix.
+    ///
+    /// ```rust
+    /// use ntex::web::{self, App, ServiceConfig};
+    ///
+    /// fn configure(cfg: &mut ServiceConfig<()>) {
+    ///     cfg.service(
+    ///         web::resource("/health").to(async || "OK"),
+    ///     );
+    /// }
+    ///
+    /// App::default().configure(configure);
+    /// ```
+    ///
+    /// [`App::service()`]: super::App::service
     pub fn service<F>(&mut self, factory: F) -> &mut Self
     where
-        F: WebServiceFactory<Err> + 'static,
+        F: WebServiceFactory<St, In> + 'static,
     {
         self.services
             .push(Box::new(ServiceFactoryWrapper::new(factory)));
@@ -206,22 +236,12 @@ impl<Err: ErrorRenderer> ServiceConfig<Err> {
     /// and are never considered for matching at request time. Calls to
     /// `HttpRequest::url_for()` will work as expected.
     ///
-    /// This is same as `App::external_service()` method.
-    pub fn external_resource<N, U>(&mut self, name: N, url: U) -> &mut Self
-    where
-        N: AsRef<str>,
-        U: AsRef<str>,
-    {
+    /// This is same as `App::external_resource()` method.
+    pub fn external_resource(&mut self, name: impl AsRef<str>, url: impl AsRef<str>) -> &mut Self {
         let mut rdef = ResourceDef::new(url.as_ref());
-        *rdef.name_mut() = name.as_ref().to_string();
+        rdef.set_name(name.as_ref());
         self.external.push(rdef);
         self
-    }
-}
-
-impl<Err: ErrorRenderer> Default for ServiceConfig<Err> {
-    fn default() -> Self {
-        Self::new()
     }
 }
 
@@ -255,12 +275,13 @@ impl LocalCache {
 }
 
 #[cfg(test)]
+#[allow(clippy::assert_is_empty)]
 mod tests {
     use super::*;
     use crate::http::{Method, StatusCode};
     use crate::util::Bytes;
     use crate::web::test::{TestRequest, call_service, init_service, read_body};
-    use crate::web::{self, App, DefaultError, HttpRequest, HttpResponse};
+    use crate::web::{self, App, HttpRequest, HttpResponse};
 
     #[crate::rt_test]
     async fn test_webappconfig() {
@@ -271,40 +292,21 @@ mod tests {
         assert_eq!(cfg.host(), "www.example.org");
         assert_eq!(cfg.local_addr(), "127.0.0.1:8080".parse().unwrap());
         assert_eq!(cfg.pool_size, 256);
+        assert_eq!(cfg.name(), "ntex:web");
+        assert!(!cfg.secure());
+        assert!(cfg.set_secure().secure());
     }
 
-    #[crate::rt_test]
-    async fn test_configure_state() {
-        let cfg = |cfg: &mut ServiceConfig<_>| {
-            cfg.state(10usize);
-        };
-
-        let srv = init_service(
-            App::new().configure(cfg).service(
-                web::resource("/")
-                    .to(|_: web::types::State<usize>| async { HttpResponse::Ok() }),
-            ),
-        )
-        .await;
-        let req = TestRequest::default().to_request();
-        let resp = srv.call(req).await.unwrap();
-        assert_eq!(resp.status(), StatusCode::OK);
-    }
-
-    #[cfg(feature = "url")]
     #[crate::rt_test]
     async fn test_configure_external_resource() {
         let srv = init_service(
             App::new()
                 .configure(|cfg| {
-                    cfg.external_resource(
-                        "youtube",
-                        "https://youtube.com/watch/{video_id}",
-                    );
+                    cfg.external_resource("youtube", "https://youtube.com/watch/{video_id}");
                 })
                 .route(
                     "/test",
-                    web::get().to(|req: HttpRequest| async move {
+                    web::get().to(async move |req: HttpRequest| {
                         HttpResponse::Ok()
                             .body(format!("{}", req.url_for("youtube", ["12345"]).unwrap()))
                     }),
@@ -322,13 +324,9 @@ mod tests {
     async fn test_configure_service() {
         let srv = init_service(App::new().configure(|cfg| {
             cfg.service(
-                web::resource("/test")
-                    .route(web::get().to(|| async { HttpResponse::Created() })),
+                web::resource("/test").route(web::get().to(async || HttpResponse::Created())),
             )
-            .route(
-                "/index.html",
-                web::get().to(|| async { HttpResponse::Ok() }),
-            );
+            .route("/index.html", web::get().to(async || HttpResponse::Ok()));
         }))
         .await;
 
@@ -347,7 +345,7 @@ mod tests {
 
     #[test]
     fn test_new_service_config() {
-        let cfg: ServiceConfig<DefaultError> = ServiceConfig::default();
+        let cfg: ServiceConfig<(), ()> = ServiceConfig::new(Vec::new());
         assert!(cfg.services.is_empty());
         assert!(cfg.external.is_empty());
     }

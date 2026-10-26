@@ -2,7 +2,7 @@
 use std::{borrow::Borrow, borrow::BorrowMut};
 
 use ntex_bytes::info::Kind;
-use ntex_bytes::{Buf, BufMut, BytePage, BytePages, Bytes, BytesMut};
+use ntex_bytes::{Buf, BufMut, BytePage, BytePageSize, Bytes, BytesMut, METADATA_SIZE};
 
 const LONG: &[u8] = b"mary had a little lamb, little lamb, little lamb";
 const SHORT: &[u8] = b"hello world";
@@ -20,10 +20,16 @@ fn is_send<T: Send>() {}
 fn test_size() {
     assert_eq!(24, std::mem::size_of::<Bytes>());
     assert_eq!(24, std::mem::size_of::<Option<Bytes>>());
-    assert_eq!(24, ntex_bytes::METADATA_SIZE);
+    #[cfg(not(feature = "tracker"))]
+    assert_eq!(16, ntex_bytes::METADATA_SIZE);
+    #[cfg(feature = "tracker")]
+    assert_eq!(32, ntex_bytes::METADATA_SIZE);
     assert_eq!(8, std::mem::size_of::<BytesMut>());
-    assert_eq!(16, std::mem::size_of::<BytePages>());
+    assert_eq!(16, std::mem::size_of::<ntex_bytes::BytePages>());
     assert_eq!(32, std::mem::size_of::<BytePage>());
+    assert_eq!(16, std::mem::size_of::<std::sync::Arc<str>>());
+    assert_eq!(8, std::mem::size_of::<std::sync::Arc<String>>());
+    assert_eq!(16, std::mem::size_of::<&'static str>());
 
     let mut t = BytesMut::new();
     t.extend_from_slice(&b"\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0"[..]);
@@ -214,6 +220,8 @@ fn split_off_oob() {
     hello.split_off(inline_cap() + 1);
 }
 
+const MIN_CAPACITY: usize = 128 - METADATA_SIZE;
+
 const B: &[u8] = b"abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ";
 
 #[test]
@@ -386,10 +394,10 @@ fn fns_defined_for_bytes() {
     assert!(bytes > "g".to_string());
     assert!(bytes > "g".as_bytes().to_vec());
     assert!(bytes > Bytes::from("g"));
-    assert!("g" > bytes);
-    assert!("g".to_string() > bytes);
-    assert!("g".as_bytes().to_vec() > bytes);
-    assert!([b'g'] > bytes);
+    assert!("g" < bytes);
+    assert!("g".to_string() < bytes);
+    assert!("g".as_bytes().to_vec() < bytes);
+    assert!([b'g'] < bytes);
     assert!(Bytes::from(&"g"[..]) < bytes);
 
     assert_eq!(bytes, "hello world");
@@ -421,15 +429,15 @@ fn fns_defined_for_bytes() {
     let bytes = Bytes::copy_from_slice(&B[..]);
     assert_eq!(bytes.info().kind, Kind::Vec);
     assert_eq!(bytes.info().refs, 1);
-    assert_eq!(bytes.info().capacity, 76);
+    assert_eq!(bytes.info().capacity, B.len() + METADATA_SIZE);
     let b2 = bytes.clone();
     assert_eq!(b2.info().kind, Kind::Vec);
     assert_eq!(b2.info().refs, 2);
-    assert_eq!(b2.info().capacity, 76);
+    assert_eq!(b2.info().capacity, B.len() + METADATA_SIZE);
     drop(b2);
     assert_eq!(bytes.info().kind, Kind::Vec);
     assert_eq!(bytes.info().refs, 1);
-    assert_eq!(bytes.info().capacity, 76);
+    assert_eq!(bytes.info().capacity, B.len() + METADATA_SIZE);
 
     let mut bytes = Bytes::from(&b"hello world"[..]);
 
@@ -732,4 +740,385 @@ fn bytes_vec() {
     let data: [u8; 3] = [1, 2, 3];
     let bytes = BytesMut::from(data);
     assert_eq!(bytes, b"\x01\x02\x03");
+}
+
+#[cfg(target_pointer_width = "64")]
+#[test]
+#[should_panic(expected = "exceeds maximum")]
+fn with_capacity_over_u32() {
+    let _ = BytesMut::with_capacity(u32::MAX as usize);
+}
+
+#[cfg(target_pointer_width = "64")]
+#[test]
+#[should_panic(expected = "exceeds maximum")]
+fn reserve_over_u32() {
+    let mut buf = BytesMut::copy_from_slice(b"hello");
+    buf.reserve(u32::MAX as usize);
+}
+
+#[test]
+#[should_panic(expected = "buffer capacity overflow")]
+fn reserve_overflows_usize() {
+    let mut buf = BytesMut::copy_from_slice(b"hello");
+    buf.reserve(usize::MAX);
+}
+
+/// Fills the buffer until less than the low threshold of its page size remains.
+fn fill_low(buf: &mut BytesMut) {
+    let low = buf.page_size().low();
+    let remaining = buf.capacity() - buf.len();
+    if remaining >= low {
+        buf.extend_from_slice(&vec![1; remaining - low + 1]);
+    }
+}
+
+#[test]
+fn reserve_more_pages() {
+    // the remaining capacity is above the low threshold
+    let mut buf = BytesMut::with_page_size(BytePageSize::Size4);
+    buf.extend_from_slice(LONG);
+    buf.reserve_more();
+    assert_eq!(buf.page_size(), BytePageSize::Size4);
+    assert_eq!(&buf[..], LONG);
+
+    // every page size moves to the next one
+    let mut size = BytePageSize::Size4;
+    while size != BytePageSize::Size256 {
+        fill_low(&mut buf);
+        let len = buf.len();
+        size = size.next();
+        buf.reserve_more();
+        assert_eq!(buf.page_size(), size);
+        assert_eq!(buf.capacity(), size.capacity());
+        assert_eq!(buf.len(), len);
+        assert_eq!(&buf[..LONG.len()], LONG);
+    }
+
+    // above the largest page size, a regular buffer grows by 64 KiB
+    fill_low(&mut buf);
+    buf.reserve_more();
+    assert_eq!(buf.page_size(), BytePageSize::Unset);
+    assert_eq!(buf.capacity(), BytePageSize::Size256.capacity() + 64 * 1024);
+    assert_eq!(&buf[..LONG.len()], LONG);
+
+    // a shared page moves too, split off data stays valid
+    let mut buf = BytesMut::with_page_size(BytePageSize::Size8);
+    buf.extend_from_slice(LONG);
+    buf.extend_from_slice(SHORT);
+    let head = buf.split_to(LONG.len());
+    fill_low(&mut buf);
+    buf.reserve_more();
+    assert_eq!(buf.page_size(), BytePageSize::Size16);
+    assert_eq!(buf.capacity(), BytePageSize::Size16.capacity());
+    assert_eq!(&buf[..SHORT.len()], SHORT);
+    assert_eq!(&head[..], LONG);
+}
+
+#[test]
+fn reserve_more_reuses_page() {
+    // a unique page with consumed data is compacted in place
+    let mut buf = BytesMut::with_page_size(BytePageSize::Size8);
+    fill_low(&mut buf);
+    buf.advance(buf.len() - 100);
+    let ptr = buf.as_ptr();
+    buf.reserve_more();
+    assert_eq!(buf.page_size(), BytePageSize::Size8);
+    assert_eq!(buf.capacity(), BytePageSize::Size8.capacity());
+    assert_eq!(&buf[..], &[1; 100][..]);
+    assert_ne!(buf.as_ptr(), ptr);
+
+    // a shared page with little data moves to a page of the same size
+    let mut buf = BytesMut::with_page_size(BytePageSize::Size8);
+    fill_low(&mut buf);
+    let head = buf.split_to(buf.len() - 100);
+    buf.reserve_more();
+    assert_eq!(buf.page_size(), BytePageSize::Size8);
+    assert_eq!(buf.capacity(), BytePageSize::Size8.capacity());
+    assert_eq!(&buf[..], &[1; 100][..]);
+    assert!(head.iter().all(|b| *b == 1));
+
+    // more than half a page of data grows the page
+    let mut buf = BytesMut::with_page_size(BytePageSize::Size8);
+    fill_low(&mut buf);
+    let len = BytePageSize::Size8.capacity() - BytePageSize::Size8.half_capacity() + 1;
+    buf.advance(buf.len() - len);
+    buf.reserve_more();
+    assert_eq!(buf.page_size(), BytePageSize::Size16);
+    assert_eq!(buf.len(), len);
+}
+
+#[test]
+fn reserve_more_unset() {
+    let mut buf = BytesMut::copy_from_slice(b"");
+    assert_eq!(buf.capacity(), 0);
+    buf.reserve_more();
+    assert_eq!(buf.capacity(), MIN_CAPACITY);
+
+    let mut buf = BytesMut::copy_from_slice(LONG);
+    buf.reserve_more();
+    assert_eq!(buf.capacity(), LONG.len() + MIN_CAPACITY);
+    assert_eq!(&buf[..], LONG);
+
+    let mut buf = BytesMut::with_capacity(1000);
+    buf.extend_from_slice(LONG);
+    buf.reserve_more();
+    assert_eq!(buf.capacity(), 2000);
+    assert_eq!(buf.page_size(), BytePageSize::Unset);
+    assert_eq!(&buf[..], LONG);
+
+    // the step is limited to 64 KiB
+    let mut buf = BytesMut::with_capacity(100_000);
+    buf.extend_from_slice(LONG);
+    buf.reserve_more();
+    assert_eq!(buf.capacity(), 100_000);
+    fill_low(&mut buf);
+    buf.reserve_more();
+    assert_eq!(buf.capacity(), 100_000 + 64 * 1024);
+    assert_eq!(&buf[..LONG.len()], LONG);
+
+    // a unique buffer with consumed data is compacted in place
+    let mut buf = BytesMut::with_capacity(100_000);
+    buf.extend_from_slice(&vec![1; 100_000]);
+    buf.advance(99_000);
+    buf.reserve_more();
+    assert_eq!(buf.capacity(), 100_000);
+    assert_eq!(&buf[..], &[1; 1000][..]);
+
+    // a unique buffer is reclaimed when its allocation is large enough
+    let mut buf = BytesMut::with_capacity(1000);
+    buf.extend_from_slice(&[1; 1000]);
+    buf.advance(900);
+    let ptr = buf.as_ptr();
+    buf.reserve_more();
+    assert_eq!(buf.capacity(), 1000);
+    assert_eq!(&buf[..], &[1; 100][..]);
+    assert_ne!(buf.as_ptr(), ptr);
+
+    // a shared buffer is copied, split off data stays valid
+    let mut buf = BytesMut::with_capacity(1000);
+    buf.extend_from_slice(LONG);
+    buf.extend_from_slice(SHORT);
+    let head = buf.split_to(LONG.len());
+    let cap = buf.capacity();
+    buf.reserve_more();
+    assert_eq!(buf.capacity(), cap + MIN_CAPACITY.max(cap));
+    assert_eq!(&buf[..], SHORT);
+    assert_eq!(&head[..], LONG);
+}
+
+#[cfg(target_pointer_width = "64")]
+#[test]
+#[should_panic]
+fn set_len_over_u32() {
+    let mut buf = BytesMut::with_capacity(64);
+    unsafe { buf.set_len((1 << 32) + 5) };
+}
+
+fn assert_advance_panics(name: &str, f: impl FnOnce()) {
+    let res = std::panic::catch_unwind(std::panic::AssertUnwindSafe(f));
+    assert!(res.is_err(), "{name}: advance_to past len must panic");
+}
+
+#[test]
+fn advance_to_past_len_panics() {
+    let long = vec![b'x'; 100];
+
+    let mut buf = BytesMut::with_capacity(64);
+    buf.extend_from_slice(b"hello");
+    buf.advance_to(5);
+    assert!(buf.is_empty());
+    assert_advance_panics("BytesMut", || {
+        let mut buf = BytesMut::with_capacity(64);
+        buf.extend_from_slice(b"hello");
+        buf.advance_to(6);
+    });
+
+    let mut b = Bytes::from(long.clone());
+    b.advance_to(100);
+    assert!(b.is_empty());
+    assert_advance_panics("Bytes vec", || {
+        let mut b = Bytes::from(long.clone());
+        b.truncate(50);
+        b.advance_to(51);
+    });
+    assert_advance_panics("Bytes inline", || {
+        let mut b = Bytes::copy_from_slice(b"abc");
+        assert!(b.is_inline());
+        b.advance_to(4);
+    });
+    assert_advance_panics("Bytes static", || {
+        Bytes::from_static(b"abc").advance_to(4);
+    });
+    assert_advance_panics("Bytes split_to", || {
+        let _ = Bytes::from(long.clone()).split_to(101);
+    });
+    assert_advance_panics("BytePage", || {
+        let mut buf = BytesMut::with_capacity(64);
+        buf.extend_from_slice(b"hello");
+        BytePage::from(buf).advance_to(6);
+    });
+}
+
+#[test]
+fn split_to_view_truncate_and_trimdown() {
+    let data: Vec<u8> = (0..1000u32).map(|i| i as u8).collect();
+    let mut buf = BytesMut::with_capacity(1000);
+    buf.extend_from_slice(&data);
+
+    // the `BytesMut` view capacity is smaller than the `Bytes` view length
+    let mut b = buf.split_to(900);
+    assert_eq!(buf.capacity(), 100);
+    assert_eq!(b.info().capacity, 1000 + ntex_bytes::METADATA_SIZE);
+
+    b.truncate(800);
+    assert_eq!(b, &data[..800]);
+
+    let mut b2 = b.clone();
+    b2.trimdown();
+    assert_eq!(b2, &data[..800]);
+    b.trimdown();
+    assert_eq!(b, &data[..800]);
+    assert_eq!(buf, &data[900..]);
+}
+
+#[test]
+fn bytes_handle_concurrent_with_bytes_mut() {
+    let mut buf = BytesMut::with_capacity(1024);
+    buf.extend_from_slice(&[1u8; 512]);
+    let b = buf.split_to(256);
+
+    let t = std::thread::spawn(move || {
+        let mut b = b;
+        let info = b.info();
+        let b2 = b.clone();
+        b.truncate(200);
+        b.trimdown();
+        drop(b2);
+        (info, b)
+    });
+    buf.extend_from_slice(&[2u8; 16]);
+    buf.advance_to(8);
+    let _ = buf.split_to(32);
+    buf.reserve(64);
+    unsafe { buf.set_len(buf.len() - 1) };
+
+    let (info, b) = t.join().unwrap();
+    assert_eq!(info.capacity, 1024 + ntex_bytes::METADATA_SIZE);
+    assert_eq!(b, &[1u8; 200][..]);
+    assert_eq!(buf.len(), 256 + 16 - 8 - 32 - 1);
+}
+
+#[test]
+#[cfg(target_pointer_width = "64")]
+fn advance_to_does_not_truncate_count() {
+    const CNT: usize = (1 << 32) + 1;
+
+    assert_advance_panics("BytesMut", || {
+        let mut buf = BytesMut::with_capacity(64);
+        buf.extend_from_slice(b"hello");
+        buf.advance_to(CNT);
+    });
+    assert_advance_panics("BytesMut split_to", || {
+        let mut buf = BytesMut::with_capacity(64);
+        buf.extend_from_slice(b"hello");
+        let _ = buf.split_to(CNT);
+    });
+    assert_advance_panics("BytePage", || {
+        let mut buf = BytesMut::with_capacity(64);
+        buf.extend_from_slice(b"hello");
+        BytePage::from(buf).advance_to(CNT);
+    });
+    assert_advance_panics("BytePage vec", || {
+        BytePage::from(b"hello".to_vec()).advance_to(CNT);
+    });
+}
+
+fn storage_page(data: &[u8]) -> BytePage {
+    let mut buf = BytesMut::with_capacity(128);
+    buf.extend_from_slice(data);
+    let page = BytePage::from(buf);
+    assert_eq!(page.info(), ntex_bytes::info::PageKind::Storage);
+    page
+}
+
+#[test]
+fn page_clone_is_independent() {
+    let data = [b'a'; 64];
+
+    let mut p = storage_page(&data);
+    let c = p.clone();
+    p.advance_to(6);
+    assert_eq!(c, &data[..]);
+    assert_eq!(p, &data[6..]);
+
+    let p = storage_page(&data);
+    let c = p.clone();
+    let c2 = c.clone();
+    let mut m = BytesMut::from(p);
+    m[0] = b'X';
+    m.extend_from_slice(b"!!");
+    let mut m2 = BytesMut::from(c2);
+    m2.extend_from_slice(b"??");
+    assert_eq!(c, &data[..]);
+    assert_eq!(&m[..], [&b"X"[..], &data[1..], b"!!"].concat());
+    assert_eq!(&m2[..], [&data[..], b"??"].concat());
+
+    // a unique page is converted without a copy
+    let p = storage_page(&data);
+    let ptr = p.as_ref().as_ptr();
+    drop(p.clone());
+    assert_eq!(BytesMut::from(p).as_ptr(), ptr);
+}
+
+#[test]
+fn page_clone_across_threads() {
+    let data = [b'a'; 64];
+    let mut p = storage_page(&data);
+    let c = p.clone();
+
+    let t = std::thread::spawn(move || {
+        let mut c = c;
+        c.advance_to(1);
+        c
+    });
+    p.advance_to(2);
+    let c = t.join().unwrap();
+    assert_eq!(c, &data[1..]);
+    assert_eq!(p, &data[2..]);
+}
+
+#[test]
+fn buf_mut_put_grows() {
+    let data = vec![7u8; 5000];
+    let mut buf = BytesMut::new();
+    BufMut::put(&mut buf, &data[..]);
+    assert_eq!(&buf[..], &data[..]);
+
+    // source larger than the spare capacity
+    let src = Bytes::from(data.clone());
+    let mut buf = BytesMut::with_capacity(16);
+    BufMut::put(&mut buf, &b"ab"[..]);
+    BufMut::put(&mut buf, src);
+    assert_eq!(&buf[..2], b"ab");
+    assert_eq!(&buf[2..], &data[..]);
+}
+
+#[test]
+fn buf_mut_forwarding_grow() {
+    let data = vec![5u8; 5000];
+
+    // &mut BytesMut and Box<BytesMut> forward to the growable impl
+    fn fill<B: BufMut>(mut b: B, data: &[u8]) {
+        b.put_slice(data);
+        b.put(data);
+        b.put_u8(1);
+        b.put_i8(2);
+    }
+    let mut buf = BytesMut::new();
+    fill(&mut buf, &data);
+    assert_eq!(buf.len(), 2 * data.len() + 2);
+    let mut buf = Box::new(BytesMut::new());
+    fill(&mut buf, &data);
+    assert_eq!(buf.len(), 2 * data.len() + 2);
 }

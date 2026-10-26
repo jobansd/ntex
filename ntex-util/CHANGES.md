@@ -1,5 +1,191 @@
 # Changes
 
+## [4.5.0] - Unreleased
+
+* Keep owned local wake handles in timer registrations and driver teardown,
+  preserving 32-byte timer entries on 64-bit targets and existing in-place
+  expiry delivery and callback handling
+
+* Store runtime-local wake handles in `task::LocalWaker`. Add `take_local()` to
+  extract the owned local handle; `take()` still returns a standard `Waker` without
+  cloning
+
+* Preserve the registered waker if cloning a replacement panics, while keeping
+  slot state consistent during reentrant clone, drop, and wake callbacks
+
+## [4.4.0] - 2026-10-21
+
+* Add `bstream::channel_with_notifier()` for notification-invalidated sender
+  readiness. Watermark and terminal-state transitions, including receiver drop,
+  invalidate subscribed services before waking waiters. Putting data back also
+  updates sender backpressure. Plain channels do not allocate a notifier.
+
+* `KeepAliveService` invalidates cached readiness when its idle timer expires.
+  Its callback timer is canceled on shutdown or drop and rearms extended deadlines
+  without waking readiness. Calls extend the deadline, and an explicit readiness
+  bypass can restart an expired service.
+
+* `BufferService` preserves queue/token cleanup when readiness callbacks panic
+  and invalidates capacity before waking requests canceled during shutdown.
+
+* `InFlightService` and `OneRequestService` notify readiness changes when capacity
+  fills or is released, including on cancellation and errors. Notifications reach
+  every pipeline sharing the service. `Counter::bind()` subscribes other
+  services to the counter's capacity changes.
+
+* Both limiters keep an independent readiness cache for the wrapped service.
+  Capacity notifications preserve that cache; wrapped services must notify their
+  own readiness changes. `InFlightService` no longer uses `call_nowait()`.
+
+* Add local `time::CallbackTimer` with reusable one-shot callbacks, reset,
+  cancellation and shutdown-safe delivery
+
+* Restore timer wheel storage on unwinding. Wakers run in place without a
+  notification buffer and must not reenter the timer wheel. Callback delivery
+  runs outside wheel access and refreshes time before processing further timers
+
+## [4.4.0] - 2026-10-20
+
+* `BufferService` is ready while the buffer has room, independent of the inner
+  service. Buffered requests are released in order and wait for inner readiness
+  themselves, so cached readiness no longer stalls calls. Inner readiness errors
+  are returned to the waiting request. The buffer size is a soft limit
+
+* Re-export `ntex_rt::spawn_detached()`
+
+* `time::now()` returns `ntex_rt::now()`, the start of the current runtime turn on
+  neon and compio, `Instant::now()` on tokio. The lowres `Instant` cache is removed
+
+## [4.3.0] - 2026-10-06
+
+* `BufferService` uses pipeline readiness of the inner service instead of `call_nowait()`
+
+* `TimeoutService` does not check readiness of the inner service on call, it is covered
+  by the outer readiness check
+
+* `RetryService` does not check readiness of the inner service on the first call
+
+* `InFlightService` checks readiness of the inner service once per call, the call
+  skips the check if no call entered the service since its last readiness check
+
+## [4.2.1] - 2026-10-03
+
+* The time cached by the timer driver did not expire, `now()` returned a stale
+  time until the next timer wakeup, so io timers started meanwhile, e.g. a
+  restarted keep-alive timer, expired up to a second early
+
+## [4.2.0] - 2026-10-01
+
+* Timers of a system started after another system stopped on the same thread
+  never fired, the timer drivers of the stopped runtime were not dropped and
+  the next runtime did not start its own
+
+* `clone_io_error()` uses the error's display output as the message, instead of
+  its debug output, so a cloned error displays the same as the original
+
+* Dropping the last `bstream::Sender` wakes a pending read, before the receiver
+  could wait forever
+
+* `BufferService` shutdown releases buffered requests one at a time, as
+  readiness does, and shuts down the wrapped service after the last one
+  completes
+
+* Fix `Counter::unavailable()`, it was never woken once the counter reached
+  its capacity
+
+* `mpsc::Receiver` is reported as terminated only after buffered messages are
+  received
+
+* Fix `bstream::Sender::poll_ready()`, it now reports `Status::Dropped` after an
+  error and `Status::Eof` after EOF instead of `Status::Ready`
+
+* `LocalWaker::register()` no longer clones the waker when the same waker is
+  already registered
+
+* Fix `OneRequestService`: a dropped call no longer blocks the service forever,
+  every waiting caller is woken, and calls cannot overlap after several callers
+  observe readiness
+
+* Fix memory corruption in `mpsc::Receiver` drop when a buffered message sends
+  on the same channel from its `Drop`
+
+* Streamline the timer wheel, `now()` and `system_time()` no longer touch the wheel
+  when the cached time is valid, and the per-thread wheel is ~4KiB smaller
+
+* `TimerHandle::reset()` no longer adds an extra 16ms tick to short delays
+
+* Fix early timer expiry, a timer was measured from the cached time, which
+  goes stale while the thread is blocked; timers now use `Instant::now()`
+
+* The cached `time::now()` and `time::system_time()` values are refreshed every
+  150ms instead of 5ms
+
+* Remove `time::query_system_time()`, it was identical to `time::system_time()`
+
+* Fix timer drift, a late wakeup of the timer driver delayed all later timers by
+  the same amount; overdue timers now fire in a single pass
+
+* Fix `TimerHandle::reset(0)` not waking the task waiting on the timer
+
+* Dropping the lowres timer driver no longer stops the timer wheel, and dropping
+  either driver no longer allows the other one to be spawned twice
+
+* Fix abort when a `TimerHandle` is dropped by a thread-local destructor after
+  the timer wheel is destroyed
+
+* Add `mpsc::Sender::poll_closed()` and `mpsc::Sender::closed()` to wait until the receiver
+  is dropped or the channel is closed
+
+* `bstream` wakes a sender blocked by backpressure once the buffer is drained
+  to the low watermark, instead of after every consumed chunk
+
+* Add `bstream::Receiver::set_watermarks()` to configure the high and low
+  watermarks, deprecate `bstream::Receiver::max_buffer_size()`
+
+## [4.1.0] - 2026-09-21
+
+* The first `Interval` tick completes immediately, matching tokio's `interval`
+
+* Round zero delays in `Sleep::reset()` and the `Interval` period up to 1 ms
+
+* Propagate `Buffer::cancel_on_shutdown()` to the created service
+
+* Improve API documentation for channels, timers, futures, and services
+
+* Align service timeout ordering with `time::timeout()`
+
+* Remove unnecessary `Default` bound from `condition::Waiter` future
+
+* Wake pending `mpsc` receive operations when the receiver is closed
+
+* Recompute `bstream` sender readiness when its buffer threshold changes
+
+* Saturate overflowing `Millis` and `Seconds` conversions
+
+* Remove `Clone` from `OneRequestService` to preserve its single-call guarantee
+
+## [4.0.0] - 2026-09-14
+
+* Refactor Condition result
+
+* Removed EitherService in favor of Either<S1, S2>
+
+* Removed Ready
+
+* Removed Variant service
+
+## [4.0.0-beta.1] - 2026-08-25
+
+* Re-export HashMap and HashSet
+
+## [4.0.0-beta.0] - 2026-08-24
+
+* Migrate to ntex-service 5
+
+* Add Variant service
+
+* Use hashbrown HashMap, HashSet
+
 ## [3.6.1] - 2026-05-11
 
 * Add helper method bstream::Sender::is_closed()

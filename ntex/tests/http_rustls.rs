@@ -1,6 +1,6 @@
-#![cfg(feature = "rustls")]
-use std::io;
-use std::sync::{Arc, Mutex, atomic::AtomicUsize, atomic::Ordering};
+#![cfg(all(feature = "rustls", feature = "openssl"))]
+use std::sync::{Arc, Mutex, atomic::AtomicBool, atomic::AtomicUsize, atomic::Ordering};
+use std::{future::ready, io};
 
 use futures_util::stream::{Stream, StreamExt, once};
 
@@ -8,10 +8,10 @@ use ntex::codec::BytesCodec;
 use ntex::http::error::PayloadError;
 use ntex::http::header::{self, HeaderName, HeaderValue};
 use ntex::http::test::{self, server as test_server};
-use ntex::http::{HttpService, Method, Request, Response, StatusCode, Version, body, h1};
-use ntex::service::{ServiceFactory, cfg::SharedCfg, fn_service};
+use ntex::http::{self, HttpService, Method, Request, Response, StatusCode, Version, body, h1};
+use ntex::service::cfg::SharedCfg;
 use ntex::time::{Millis, Seconds, sleep, timeout};
-use ntex::util::{Bytes, BytesMut, Ready};
+use ntex::util::{Bytes, BytesMut, Either, select};
 use ntex::ws::{self, handshake_response};
 use ntex::{channel::oneshot, client, rt, web::error::InternalError};
 use ntex_tls::TlsConfig;
@@ -25,7 +25,7 @@ where
 {
     let body = stream
         .map(|res| if let Ok(chunk) = res { chunk } else { panic!() })
-        .fold(BytesMut::new(), move |mut body, chunk| async move {
+        .fold(BytesMut::new(), async move |mut body, chunk| {
             body.extend_from_slice(&chunk);
             body
         })
@@ -36,12 +36,13 @@ where
 
 #[ntex::test]
 async fn test_h2() -> io::Result<()> {
-    let srv = test_server(async move || {
-        HttpService::h2(|_| Ready::Ok::<_, io::Error>(Response::Ok().finish()))
-            .rustls(tls_acceptor())
-            .map_err(|_| ())
-    })
-    .await;
+    let srv = test_server(async move |_| {
+        http::rustls(
+            tls_acceptor(),
+            http::ALPN_PROTO_H2,
+            HttpService::h2(async |_| Ok::<_, io::Error>(Response::Ok().build())),
+        )
+    });
 
     let response = srv.srequest(Method::GET, "/").send().await.unwrap();
     assert!(response.status().is_success());
@@ -50,12 +51,13 @@ async fn test_h2() -> io::Result<()> {
 
 #[ntex::test]
 async fn test_h1() -> io::Result<()> {
-    let srv = test_server(async move || {
-        HttpService::h1(|_| Ready::Ok::<_, io::Error>(Response::Ok().finish()))
-            .rustls(tls_acceptor())
-            .map_err(|_| ())
-    })
-    .await;
+    let srv = test_server(async move |_| {
+        http::rustls(
+            tls_acceptor(),
+            http::ALPN_PROTO_H1,
+            HttpService::h1(async |_| Ok::<_, io::Error>(Response::Ok().build())),
+        )
+    });
 
     let response = srv.srequest(Method::GET, "/").send().await.unwrap();
     assert!(response.status().is_success());
@@ -64,16 +66,17 @@ async fn test_h1() -> io::Result<()> {
 
 #[ntex::test]
 async fn test_h2_1() -> io::Result<()> {
-    let srv = test_server(async move || {
-        HttpService::new(|req: Request| {
-            assert!(req.peer_addr().is_some());
-            assert_eq!(req.version(), Version::HTTP_2);
-            Ready::Ok::<_, io::Error>(Response::Ok().finish())
-        })
-        .rustls(tls_acceptor())
-        .map_err(|_| ())
-    })
-    .await;
+    let srv = test_server(async move |_| {
+        http::rustls(
+            tls_acceptor(),
+            http::ALPN_PROTOS,
+            HttpService::new(async |req: Request| {
+                assert!(req.peer_addr().is_some());
+                assert_eq!(req.version(), Version::HTTP_2);
+                Ok::<_, io::Error>(Response::Ok().build())
+            }),
+        )
+    });
 
     let response = srv.srequest(Method::GET, "/").send().await.unwrap();
     assert!(response.status().is_success());
@@ -83,17 +86,18 @@ async fn test_h2_1() -> io::Result<()> {
 #[ntex::test]
 async fn test_h2_body() -> io::Result<()> {
     let data = "HELLOWORLD".to_owned().repeat(64 * 1024);
-    let srv = test_server(async move || {
-        HttpService::h2(|mut req: Request| async move {
-            let body = load_body(req.take_payload())
-                .await
-                .map_err(io::Error::other)?;
-            Ok::<_, io::Error>(Response::Ok().body(body))
-        })
-        .rustls(tls_acceptor())
-        .map_err(|_| ())
-    })
-    .await;
+    let srv = test_server(async move |_| {
+        http::rustls(
+            tls_acceptor(),
+            http::ALPN_PROTO_H2,
+            HttpService::h2(async move |mut req: Request| {
+                let body = load_body(req.take_payload())
+                    .await
+                    .map_err(io::Error::other)?;
+                Ok::<_, io::Error>(Response::Ok().body(body))
+            }),
+        )
+    });
 
     let response = srv
         .srequest(Method::GET, "/")
@@ -109,24 +113,25 @@ async fn test_h2_body() -> io::Result<()> {
 
 #[ntex::test]
 async fn test_h2_content_length() {
-    let srv = test_server(async move || {
-        HttpService::h2(|req: Request| async move {
-            let indx: usize = req.uri().path()[1..].parse().unwrap();
-            let statuses = [
-                StatusCode::NO_CONTENT,
-                // h2 lib does not accept hangs on this statuses
-                //StatusCode::CONTINUE,
-                //StatusCode::SWITCHING_PROTOCOLS,
-                //StatusCode::PROCESSING,
-                StatusCode::OK,
-                StatusCode::NOT_FOUND,
-            ];
-            Ok::<_, io::Error>(Response::new(statuses[indx]))
-        })
-        .rustls(tls_acceptor())
-        .map_err(|_| ())
-    })
-    .await;
+    let srv = test_server(async move |_| {
+        http::rustls(
+            tls_acceptor(),
+            http::ALPN_PROTO_H2,
+            HttpService::h2(async move |req: Request| {
+                let indx: usize = req.uri().path().as_str()[1..].parse().unwrap();
+                let statuses = [
+                    StatusCode::NO_CONTENT,
+                    // h2 lib does not accept hangs on this statuses
+                    //StatusCode::CONTINUE,
+                    //StatusCode::SWITCHING_PROTOCOLS,
+                    //StatusCode::PROCESSING,
+                    StatusCode::OK,
+                    StatusCode::NOT_FOUND,
+                ];
+                Ok::<_, io::Error>(Response::new(statuses[indx]))
+            }),
+        )
+    });
 
     let header = HeaderName::from_static("content-length");
     let value = HeaderValue::from_static("0");
@@ -155,12 +160,15 @@ async fn test_h2_headers() {
     let data = STR.repeat(10);
     let data2 = data.clone();
 
-    let srv = test_server(async move || {
+    let srv = test_server(async move |_| {
         let data = data.clone();
-        HttpService::h2(async move |_| {
-            let mut builder = Response::Ok();
-            for idx in 0..90 {
-                builder.header(
+        http::rustls(
+            tls_acceptor(),
+            http::ALPN_PROTO_H2,
+            HttpService::h2(async move |_| {
+                let mut builder = Response::Ok();
+                for idx in 0..90 {
+                    builder.header(
                     format!("X-TEST-{idx}").as_str(),
                     "TEST TEST TEST TEST TEST TEST TEST TEST TEST TEST TEST TEST TEST TEST TEST \
                         TEST TEST TEST TEST TEST TEST TEST TEST TEST TEST TEST TEST TEST TEST TEST \
@@ -176,12 +184,11 @@ async fn test_h2_headers() {
                         TEST TEST TEST TEST TEST TEST TEST TEST TEST TEST TEST TEST TEST TEST TEST \
                         TEST TEST TEST TEST TEST TEST TEST TEST TEST TEST TEST TEST TEST TEST ",
                 );
-            }
-            Ok::<_, io::Error>(builder.body(data.clone()))
-        })
-        .rustls(tls_acceptor())
-                    .map_err(|_| ())
-    }).await;
+                }
+                Ok::<_, io::Error>(builder.body(data.clone()))
+            }),
+        )
+    });
 
     let response = srv.srequest(Method::GET, "/").send().await.unwrap();
     assert!(response.status().is_success());
@@ -215,12 +222,13 @@ const STR: &str = "Hello World Hello World Hello World Hello World Hello World \
 
 #[ntex::test]
 async fn test_h2_body2() {
-    let srv = test_server(async move || {
-        HttpService::h2(|_| async { Ok::<_, io::Error>(Response::Ok().body(STR)) })
-            .rustls(tls_acceptor())
-            .map_err(|_| ())
-    })
-    .await;
+    let srv = test_server(async move |_| {
+        http::rustls(
+            tls_acceptor(),
+            http::ALPN_PROTO_H2,
+            HttpService::h2(async |_| Ok::<_, io::Error>(Response::Ok().body(STR))),
+        )
+    });
 
     let response = srv.srequest(Method::GET, "/").send().await.unwrap();
     assert!(response.status().is_success());
@@ -232,12 +240,13 @@ async fn test_h2_body2() {
 
 #[ntex::test]
 async fn test_h2_head_empty() {
-    let srv = test_server(async move || {
-        HttpService::new(|_| async { Ok::<_, io::Error>(Response::Ok().body(STR)) })
-            .rustls(tls_acceptor())
-            .map_err(|_| ())
-    })
-    .await;
+    let srv = test_server(async move |_| {
+        http::rustls(
+            tls_acceptor(),
+            http::ALPN_PROTO_H2,
+            HttpService::h2(async |_| Ok::<_, io::Error>(Response::Ok().body(STR))),
+        )
+    });
 
     let response = srv.srequest(Method::HEAD, "/").send().await.unwrap();
     assert!(response.status().is_success());
@@ -255,14 +264,15 @@ async fn test_h2_head_empty() {
 
 #[ntex::test]
 async fn test_h2_head_binary() {
-    let srv = test_server(async move || {
-        HttpService::h2(|_| async {
-            Ok::<_, io::Error>(Response::Ok().content_length(STR.len() as u64).body(STR))
-        })
-        .rustls(tls_acceptor())
-        .map_err(|_| ())
-    })
-    .await;
+    let srv = test_server(async move |_| {
+        http::rustls(
+            tls_acceptor(),
+            http::ALPN_PROTO_H2,
+            HttpService::h2(async |_| {
+                Ok::<_, io::Error>(Response::Ok().content_length(STR.len() as u64).body(STR))
+            }),
+        )
+    });
 
     let response = srv.srequest(Method::HEAD, "/").send().await.unwrap();
     assert!(response.status().is_success());
@@ -280,12 +290,13 @@ async fn test_h2_head_binary() {
 /// Server must send content-length, but no payload
 #[ntex::test]
 async fn test_h2_head_binary2() {
-    let srv = test_server(async move || {
-        HttpService::h2(|_| async { Ok::<_, io::Error>(Response::Ok().body(STR)) })
-            .rustls(tls_acceptor())
-            .map_err(|_| ())
-    })
-    .await;
+    let srv = test_server(async move |_| {
+        http::rustls(
+            tls_acceptor(),
+            http::ALPN_PROTO_H2,
+            HttpService::h2(async |_| Ok::<_, io::Error>(Response::Ok().body(STR))),
+        )
+    });
 
     let response = srv.srequest(Method::HEAD, "/").send().await.unwrap();
     assert!(response.status().is_success());
@@ -298,17 +309,18 @@ async fn test_h2_head_binary2() {
 
 #[ntex::test]
 async fn test_h2_body_length() {
-    let srv = test_server(async move || {
-        HttpService::h2(|_| async {
-            let body = once(Ready::Ok(Bytes::from_static(STR.as_ref())));
-            Ok::<_, io::Error>(
-                Response::Ok().body(body::SizedStream::new(STR.len() as u64, body)),
-            )
-        })
-        .rustls(tls_acceptor())
-        .map_err(|_| ())
-    })
-    .await;
+    let srv = test_server(async move |_| {
+        http::rustls(
+            tls_acceptor(),
+            http::ALPN_PROTO_H2,
+            HttpService::h2(async |_| {
+                let body = once(ready(Ok(Bytes::from_static(STR.as_ref()))));
+                Ok::<_, io::Error>(
+                    Response::Ok().body(body::SizedStream::new(STR.len() as u64, body)),
+                )
+            }),
+        )
+    });
 
     let response = srv.srequest(Method::GET, "/").send().await.unwrap();
     assert!(response.status().is_success());
@@ -320,19 +332,20 @@ async fn test_h2_body_length() {
 
 #[ntex::test]
 async fn test_h2_body_chunked_explicit() {
-    let srv = test_server(async move || {
-        HttpService::h2(|_| {
-            let body = once(Ready::Ok::<_, io::Error>(Bytes::from_static(STR.as_ref())));
-            Ready::Ok::<_, io::Error>(
-                Response::Ok()
-                    .header(header::TRANSFER_ENCODING, "chunked")
-                    .streaming(body),
-            )
-        })
-        .rustls(tls_acceptor())
-        .map_err(|_| ())
-    })
-    .await;
+    let srv = test_server(async move |_| {
+        http::rustls(
+            tls_acceptor(),
+            http::ALPN_PROTO_H2,
+            HttpService::h2(async |_| {
+                let body = once(ready(Ok::<_, io::Error>(Bytes::from_static(STR.as_ref()))));
+                Ok::<_, io::Error>(
+                    Response::Ok()
+                        .header(header::TRANSFER_ENCODING, "chunked")
+                        .streaming(body),
+                )
+            }),
+        )
+    });
 
     let response = srv.srequest(Method::GET, "/").send().await.unwrap();
     assert!(response.status().is_success());
@@ -347,19 +360,20 @@ async fn test_h2_body_chunked_explicit() {
 
 #[ntex::test]
 async fn test_h2_response_http_error_handling() {
-    let srv = test_server(async move || {
-        HttpService::h2(fn_service(|_| {
-            let broken_header = Bytes::from_static(b"\0\0\0");
-            Ready::Ok::<_, io::Error>(
-                Response::Ok()
-                    .header(header::CONTENT_TYPE, &broken_header[..])
-                    .body(STR),
-            )
-        }))
-        .rustls(tls_acceptor())
-        .map_err(|_| ())
-    })
-    .await;
+    let srv = test_server(async move |_| {
+        http::rustls(
+            tls_acceptor(),
+            http::ALPN_PROTO_H2,
+            HttpService::h2(async |_| {
+                let broken_header = Bytes::from_static(b"\0\0\0");
+                Ok::<_, io::Error>(
+                    Response::Ok()
+                        .header(header::CONTENT_TYPE, &broken_header[..])
+                        .body(STR),
+                )
+            }),
+        )
+    });
 
     let response = srv.srequest(Method::GET, "/").send().await.unwrap();
     assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
@@ -371,17 +385,15 @@ async fn test_h2_response_http_error_handling() {
 
 #[ntex::test]
 async fn test_h2_service_error() {
-    let srv = test_server(async move || {
-        HttpService::h2(|_| {
-            Ready::Err::<Response, _>(InternalError::default(
-                "error",
-                StatusCode::BAD_REQUEST,
-            ))
-        })
-        .rustls(tls_acceptor())
-        .map_err(|_| ())
-    })
-    .await;
+    let srv = test_server(async move |_| {
+        http::rustls(
+            tls_acceptor(),
+            http::ALPN_PROTO_H2,
+            HttpService::h2(async |_| {
+                Err::<Response, _>(InternalError::default("error", StatusCode::BAD_REQUEST))
+            }),
+        )
+    });
 
     let response = srv.srequest(Method::GET, "/").send().await.unwrap();
     assert_eq!(response.status(), StatusCode::BAD_REQUEST);
@@ -404,29 +416,43 @@ impl Drop for SetOnDrop {
 async fn test_h2_client_drop() -> io::Result<()> {
     let count = Arc::new(AtomicUsize::new(0));
     let count2 = count.clone();
+    let started = Arc::new(AtomicBool::new(false));
+    let started2 = started.clone();
     let (tx, rx) = ::oneshot::async_channel();
     let tx = Arc::new(Mutex::new(Some(tx)));
 
-    let srv = test_server(async move || {
+    let srv = test_server(async move |_| {
         let tx = tx.clone();
         let count = count2.clone();
-        HttpService::h2(move |req: Request| {
-            let st = SetOnDrop(count.clone(), tx.clone());
-            async move {
+        let started = started2.clone();
+        http::rustls(
+            tls_acceptor(),
+            http::ALPN_PROTO_H2,
+            HttpService::h2(async move |req: Request| {
+                let st = SetOnDrop(count.clone(), tx.clone());
+                started.store(true, Ordering::Relaxed);
+
                 assert!(req.peer_addr().is_some());
                 assert_eq!(req.version(), Version::HTTP_2);
                 sleep(Seconds(30)).await;
                 drop(st);
-                Ok::<_, io::Error>(Response::Ok().finish())
-            }
-        })
-        .rustls(tls_acceptor())
-        .map_err(|_| ())
-    })
-    .await;
+                Ok::<_, io::Error>(Response::Ok().build())
+            }),
+        )
+    });
 
-    let result = timeout(Millis(2500), srv.srequest(Method::GET, "/").send()).await;
-    assert!(result.is_err());
+    // drop the request once the handler is running
+    let wait_started = async {
+        while !started.load(Ordering::Relaxed) {
+            sleep(Millis(10)).await;
+        }
+    };
+    let result = timeout(
+        Millis(2500),
+        select(srv.srequest(Method::GET, "/").send(), wait_started),
+    )
+    .await;
+    assert!(matches!(result, Ok(Either::Right(()))));
     let _ = timeout(Millis(1500), rx).await;
     assert_eq!(count.load(Ordering::Relaxed), 1);
     Ok(())
@@ -437,14 +463,15 @@ async fn test_ssl_handshake_timeout() {
     use std::io::Read;
 
     let srv = test::server_with_config(
-        async move || {
-            HttpService::h2(|_| Ready::Ok::<_, io::Error>(Response::Ok().finish()))
-                .rustls(tls_acceptor())
-                .map_err(|_| ())
+        async move |_| {
+            http::rustls(
+                tls_acceptor(),
+                http::ALPN_PROTO_H2,
+                HttpService::h2(async |_| Ok::<_, io::Error>(Response::Ok().build())),
+            )
         },
         SharedCfg::new("SVC").add(TlsConfig::new().set_handshake_timeout(Seconds(1))),
-    )
-    .await;
+    );
 
     let mut stream = std::net::TcpStream::connect(srv.addr()).unwrap();
     let mut data = String::new();
@@ -454,14 +481,17 @@ async fn test_ssl_handshake_timeout() {
 
 #[ntex::test]
 async fn test_ws_transport() {
-    let srv = test_server(async || {
-        HttpService::new(|_| Ready::Ok::<_, io::Error>(Response::NotFound()))
-            .h1_control(|req: h1::Control<_, _>| async move {
-                let ack = if let h1::Control::Upgrade(upg) = req {
-                    upg.handle(|req, io, codec| async move {
-                        let res = handshake_response(req.head()).finish();
+    let srv = test_server(async |_| {
+        http::rustls(
+            tls_acceptor(),
+            http::ALPN_PROTOS,
+            HttpService::new(async |_| Ok::<_, io::Error>(Response::NotFound())).h1_control(
+                async move |req: h1::Control<_, _>| {
+                    let ack = if let h1::Control::Upgrade(upg) = req {
+                        let (ack, io, req, codec) = upg.handle();
 
                         // send handshake respone
+                        let res = handshake_response(req.head()).build();
                         io.encode(
                             h1::Message::Item((res.drop_body(), body::BodySize::None)),
                             &codec,
@@ -476,19 +506,18 @@ async fn test_ws_transport() {
                             io.send(item, &BytesCodec).await.unwrap()
                         }
 
-                        Ok::<_, io::Error>(())
-                    })
-                } else {
-                    req.ack()
-                };
-                Ok::<_, io::Error>(ack)
-            })
-            .rustls(tls_acceptor())
-    })
-    .await;
+                        ack
+                    } else {
+                        req.ack()
+                    };
+                    Ok::<_, io::Error>(ack)
+                },
+            ),
+        )
+    });
 
     let io = srv.wss().await.unwrap().into_inner().0;
-    let codec = ws::Codec::default().client_mode();
+    let codec = ws::Codec::default().set_client_mode();
 
     io.send(ws::Message::Binary(Bytes::from_static(b"text")), &codec)
         .await
@@ -497,57 +526,53 @@ async fn test_ws_transport() {
     let item = io.recv(&codec).await.unwrap().unwrap();
     assert_eq!(item, ws::Frame::Binary(Bytes::from_static(b"text")));
 
-    io.send(ws::Message::Close(None), &codec).await.unwrap();
+    // the transport echoes the close code
+    io.send(ws::Message::Close(Some(ws::CloseCode::Away.into())), &codec)
+        .await
+        .unwrap();
     let item = io.recv(&codec).await.unwrap().unwrap();
-    assert_eq!(
-        item,
-        ws::Frame::Close(Some(ws::CloseReason {
-            code: ws::CloseCode::Normal,
-            description: None
-        }))
-    );
+    assert_eq!(item, ws::Frame::Close(Some(ws::CloseCode::Away.into())));
 }
 
 #[ntex::test]
-async fn test_h2_graceful_shutdown() -> io::Result<()> {
+async fn test_h2_not_graceful_shutdown() -> io::Result<()> {
     let count = Arc::new(AtomicUsize::new(0));
     let count2 = count.clone();
     let (tx, rx) = ::oneshot::channel();
     let tx = Arc::new(Mutex::new(Some(tx)));
 
-    let srv = test_server(async move || {
+    let srv = test_server(async move |_| {
         let tx = tx.clone();
         let count = count2.clone();
-        HttpService::h2(move |_| {
-            let count = count.clone();
-            count.fetch_add(1, Ordering::Relaxed);
-            if count.load(Ordering::Relaxed) == 2 {
-                let _ = tx.lock().unwrap().take().unwrap().send(());
-            }
-            async move {
+        http::rustls(
+            tls_acceptor(),
+            http::ALPN_PROTO_H2,
+            HttpService::h2(async move |_| {
+                let count = count.clone();
+                count.fetch_add(1, Ordering::Relaxed);
+                if count.load(Ordering::Relaxed) == 2 {
+                    let _ = tx.lock().unwrap().take().unwrap().send(());
+                }
                 sleep(Millis(1000)).await;
                 count.fetch_sub(1, Ordering::Relaxed);
-                Ok::<_, io::Error>(Response::Ok().finish())
-            }
-        })
-        .rustls(tls_acceptor())
-        .map_err(|_| ())
-    })
-    .await;
+                Ok::<_, io::Error>(Response::Ok().build())
+            }),
+        )
+    });
 
     let req = srv.srequest(Method::GET, "/");
     rt::spawn(async move {
         assert!(matches!(
-            req.send().await,
-            Err(client::error::ClientError::H2 { .. })
+            req.send().await.err().unwrap().into_error(),
+            client::error::ClientError::H2 { .. }
         ));
         sleep(Millis(100000)).await;
     });
     let req = srv.srequest(Method::GET, "/");
     rt::spawn(async move {
         assert!(matches!(
-            req.send().await,
-            Err(client::error::ClientError::H2 { .. })
+            req.send().await.err().unwrap().into_error(),
+            client::error::ClientError::H2 { .. }
         ));
         sleep(Millis(100000)).await;
     });
@@ -556,11 +581,11 @@ async fn test_h2_graceful_shutdown() -> io::Result<()> {
 
     let (tx, rx) = oneshot::channel();
     rt::spawn(async move {
-        srv.stop().await;
+        srv.stop(false).await;
         let _ = tx.send(());
     });
 
     let _ = rx.await;
-    assert_eq!(count.load(Ordering::Relaxed), 0);
+    assert_eq!(count.load(Ordering::Relaxed), 2);
     Ok(())
 }

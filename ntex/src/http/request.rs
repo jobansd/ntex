@@ -1,12 +1,14 @@
 use std::{cell::Ref, cell::RefMut, fmt, mem, net};
 
+use urly::Url;
+
 use crate::http::header::{self, HeaderMap};
 use crate::http::httpmessage::HttpMessage;
 use crate::http::message::{Message, RequestHead};
-use crate::http::{Method, Uri, Version, payload::Payload};
+use crate::http::{Method, Version, payload::Payload};
 use crate::{io::IoRef, io::types, util::Extensions};
 
-/// Request
+/// An HTTP request.
 pub struct Request {
     pub(crate) payload: Payload,
     pub(crate) head: Message<RequestHead>,
@@ -41,7 +43,7 @@ impl From<Message<RequestHead>> for Request {
 }
 
 impl Request {
-    /// Create new Request instance
+    /// Creates an empty request.
     pub fn new() -> Request {
         Request {
             head: Message::new(),
@@ -51,7 +53,7 @@ impl Request {
 }
 
 impl Request {
-    /// Create new Request instance
+    /// Creates a request with the supplied payload.
     pub fn with_payload(payload: Payload) -> Request {
         Request {
             payload,
@@ -60,7 +62,7 @@ impl Request {
     }
 
     #[inline]
-    /// Http message part of the request
+    /// Returns the request head.
     pub fn head(&self) -> &RequestHead {
         &self.head
     }
@@ -72,60 +74,60 @@ impl Request {
         &mut self.head
     }
 
-    /// Request's uri.
+    /// Returns the request URI.
     #[inline]
-    pub fn uri(&self) -> &Uri {
+    pub fn uri(&self) -> &Url {
         &self.head().uri
     }
 
-    /// Mutable reference to the request's uri.
+    /// Returns mutable access to the request URI.
     #[inline]
-    pub fn uri_mut(&mut self) -> &mut Uri {
+    pub fn uri_mut(&mut self) -> &mut Url {
         &mut self.head_mut().uri
     }
 
-    /// Read the Request method.
+    /// Returns the request method.
     #[inline]
     pub fn method(&self) -> &Method {
         &self.head().method
     }
 
-    /// Read the Request Version.
+    /// Returns the HTTP version.
     #[inline]
     pub fn version(&self) -> Version {
         self.head().version
     }
 
-    /// The target path of this Request.
+    /// Returns the path component of the request URI.
     #[inline]
     pub fn path(&self) -> &str {
-        self.head().uri.path()
+        self.head().uri.path().as_str()
     }
 
     #[inline]
-    /// Request's headers.
+    /// Returns the request headers.
     pub fn headers(&self) -> &HeaderMap {
         &self.head().headers
     }
 
-    /// Mutable reference to the message's headers.
+    /// Returns mutable access to the request headers.
     pub fn headers_mut(&mut self) -> &mut HeaderMap {
         &mut self.head_mut().headers
     }
 
-    /// Check if request requires connection upgrade
+    /// Returns whether this is an upgrade or `CONNECT` request.
     #[inline]
     pub fn upgrade(&self) -> bool {
         self.head().upgrade() || self.head().method == Method::CONNECT
     }
 
-    /// Io reference for current connection
+    /// Returns the I/O object for the current connection, when available.
     #[inline]
     pub fn io(&self) -> Option<&IoRef> {
         self.head().io.as_ref()
     }
 
-    /// Peer socket address
+    /// Returns the peer socket address.
     ///
     /// Peer address is actual socket address, if proxy is used in front of
     /// ntex http server, then peer address would be address of this proxy.
@@ -138,28 +140,28 @@ impl Request {
         })
     }
 
-    /// Get request's payload
+    /// Returns mutable access to the request payload.
     pub fn payload(&mut self) -> &mut Payload {
         &mut self.payload
     }
 
-    /// Get request's payload
+    /// Takes the request payload, leaving an empty payload behind.
     pub fn take_payload(&mut self) -> Payload {
         mem::take(&mut self.payload)
     }
 
-    /// Replace request's payload, returns old one
+    /// Replaces the request payload and returns the previous value.
     pub fn replace_payload(&mut self, payload: Payload) -> Payload {
         mem::replace(&mut self.payload, payload)
     }
 
-    /// Request extensions
+    /// Returns the request extensions.
     #[inline]
     pub fn extensions(&self) -> Ref<'_, Extensions> {
         self.head.extensions()
     }
 
-    /// Mutable reference to a the request's extensions
+    /// Returns mutable access to the request extensions.
     #[inline]
     pub fn extensions_mut(&self) -> RefMut<'_, Extensions> {
         self.head.extensions_mut()
@@ -186,7 +188,7 @@ impl fmt::Debug for Request {
             self.method(),
             self.path()
         )?;
-        if let Some(q) = self.uri().query().as_ref() {
+        if let Some(q) = self.uri().query() {
             writeln!(f, "  query: ?{q:?}")?;
         }
         writeln!(f, "  headers:")?;
@@ -237,14 +239,21 @@ mod tests {
         req.head_mut().no_chunking(false);
         assert!(req.head().chunked());
 
-        *req.uri_mut() = Uri::try_from("/index.html?q=1").unwrap();
+        *req.uri_mut() = Url::try_from("/index.html?q=1").unwrap();
         assert_eq!(req.uri().path(), "/index.html");
-        assert_eq!(req.uri().query(), Some("q=1"));
+        assert_eq!(req.uri().query().unwrap(), "q=1");
 
         let s = format!("{req:?}");
         assert!(s.contains("Request HTTP/1.1 GET:/index.html"));
 
         let s = format!("{:?}", req.head());
         assert!(s.contains("RequestHead { id: 0, uri:"));
+    }
+
+    #[test]
+    fn test_default() {
+        let req = Request::default();
+        assert_eq!(req.method(), Method::GET);
+        assert!(req.io().is_none());
     }
 }

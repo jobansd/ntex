@@ -1,282 +1,157 @@
-use std::{fmt, marker::PhantomData, sync::Arc};
+use std::{io, marker::PhantomData, sync::Arc};
 
 use ntex_io::Io;
-use ntex_service::{Service, ServiceCtx, ServiceFactory, boxed, cfg::SharedCfg};
+use ntex_service::{BindCtx, IntoService, Pipeline, Service, cfg::SharedCfg};
 use ntex_util::future::BoxFuture;
 
-use super::{Config, Token, socket::Stream};
+use super::{ServerAppConfig, Token, service::ConnGuard};
 
-pub(super) type BoxServerService = boxed::BoxServiceFactory<SharedCfg, Io, (), (), ()>;
-pub(super) type FactoryServiceType = Box<dyn FactoryService>;
+pub(super) type FactoryServiceType<St> = Box<dyn FactoryService<St>>;
+type CreateResult = Vec<(Box<dyn NetService>, Arc<str>, Vec<(Token, SharedCfg)>)>;
 
-#[derive(Debug)]
-pub(crate) struct NetService {
-    pub(crate) name: Arc<str>,
-    pub(crate) tokens: Vec<(Token, SharedCfg)>,
-    pub(crate) config: SharedCfg,
-    pub(crate) factory: BoxServerService,
+pub(crate) trait NetService {
+    fn bind(&self, ctx: &BindCtx<'_>);
+
+    fn call(&self, _: Io, _: ConnGuard);
+
+    fn ready(&self) -> BoxFuture<'_, Result<(), ()>>;
+
+    fn shutdown(&self) -> BoxFuture<'_, ()>;
 }
 
-pub(crate) trait FactoryService: Send {
-    #[allow(clippy::unnecessary_literal_bound)]
-    fn name(&self, _: Token) -> &str {
-        ""
-    }
+pub(crate) trait FactoryService<Cfg: ServerAppConfig>: Send {
+    fn clo(&self) -> FactoryServiceType<Cfg>;
 
-    fn clone_factory(&self) -> FactoryServiceType;
-
-    fn set_config(&mut self, _: Token, _: SharedCfg) {}
-
-    fn create(&self) -> BoxFuture<'static, Result<Vec<NetService>, ()>>;
+    fn create(&self, st: Cfg::State) -> BoxFuture<'static, io::Result<CreateResult>>;
 }
 
-struct Factory {
+// Each instance owns its factory, `F` is cloned, never shared between threads
+struct Factory<Cfg, F, S> {
     name: Arc<str>,
     tokens: Vec<(Token, SharedCfg)>,
-    wrapper: Box<dyn FactoryWrapper + Send>,
+    f: F,
+    _t: PhantomData<fn() -> (Cfg, S)>,
 }
 
-pub(crate) fn create_boxed_factory<S>(name: String, factory: S) -> BoxServerService
-where
-    S: ServiceFactory<Io, SharedCfg> + 'static,
-{
-    boxed::factory(ServerServiceFactory {
-        name: Arc::from(name),
-        factory,
-    })
-}
-
-pub(crate) fn create_factory_service<F, R>(
+pub(crate) fn create_factory_service<Cfg, F, S, I>(
     name: String,
     tokens: Vec<(Token, SharedCfg)>,
-    factory: F,
-) -> FactoryServiceType
+    f: F,
+) -> FactoryServiceType<Cfg>
 where
-    F: AsyncFn(Config) -> R + Send + Clone + 'static,
-    R: ServiceFactory<Io, SharedCfg> + 'static,
+    Cfg: ServerAppConfig,
+    F: AsyncFn(&Cfg::State) -> I + Send + Clone + 'static,
+    I: IntoService<S, Cfg::State, Io> + 'static,
+    S: Service<Cfg::State, Io> + 'static,
 {
-    let name: Arc<str> = Arc::from(name);
-
-    Box::from(Factory {
+    Box::new(Factory {
         tokens,
-        name: name.clone(),
-        wrapper: Box::new(FactoryWrapperImpl(async move |cfg| {
-            boxed::factory(ServerServiceFactory {
-                name: name.clone(),
-                factory: (factory)(cfg).await,
-            })
-        })),
+        name: Arc::from(name),
+        f,
+        _t: PhantomData::<fn() -> (Cfg, S)>,
     })
 }
 
-struct FactoryWrapperImpl<F>(F);
-
-trait FactoryWrapper: Send {
-    fn clone(&self) -> Box<dyn FactoryWrapper>;
-    fn run(&self, cfg: Config) -> BoxFuture<'static, BoxServerService>;
-}
-
-impl<F> FactoryWrapper for FactoryWrapperImpl<F>
+impl<Cfg, F, S, I> FactoryService<Cfg> for Factory<Cfg, F, S>
 where
-    F: AsyncFn(Config) -> BoxServerService + Send + Clone + 'static,
+    Cfg: ServerAppConfig,
+    F: AsyncFn(&Cfg::State) -> I + Send + Clone + 'static,
+    I: IntoService<S, Cfg::State, Io> + 'static,
+    S: Service<Cfg::State, Io> + 'static,
 {
-    fn clone(&self) -> Box<dyn FactoryWrapper> {
-        Box::new(Self(self.0.clone()))
-    }
-
-    fn run(&self, cfg: Config) -> BoxFuture<'static, BoxServerService> {
-        let f = self.0.clone();
-        Box::pin(async move { f(cfg).await })
-    }
-}
-
-impl FactoryService for Factory {
-    fn name(&self, _: Token) -> &str {
-        &self.name
-    }
-
-    fn clone_factory(&self) -> FactoryServiceType {
+    fn clo(&self) -> FactoryServiceType<Cfg> {
         Box::new(Factory {
             name: self.name.clone(),
             tokens: self.tokens.clone(),
-            wrapper: self.wrapper.clone(),
+            f: self.f.clone(),
+            _t: PhantomData::<fn() -> (Cfg, S)>,
         })
     }
 
-    fn set_config(&mut self, token: Token, cfg: SharedCfg) {
-        for item in &mut self.tokens {
-            if item.0 == token {
-                item.1 = cfg.clone();
-            }
-        }
-    }
-
-    fn create(&self) -> BoxFuture<'static, Result<Vec<NetService>, ()>> {
-        let cfg = Config::default();
+    fn create(&self, st: Cfg::State) -> BoxFuture<'static, io::Result<CreateResult>> {
         let name = self.name.clone();
-        let mut tokens = self.tokens.clone();
-        for item in &tokens {
-            cfg.config(item.1.clone());
+        let tokens = self.tokens.clone();
+        let f = self.f.clone();
+
+        Box::pin(async move {
+            let svc = f(&st).await.into_service();
+            let pipeline = Pipeline::new(st, svc.map(|_| ()).map_err(|_| ()));
+            let svc: Box<dyn NetService> = Box::new(ServerService { pipeline });
+            Ok(vec![(svc, name, tokens)])
+        })
+    }
+}
+
+pub(crate) struct ServerService {
+    pub(crate) pipeline: Pipeline<Io, (), ()>,
+}
+
+impl NetService for ServerService {
+    fn bind(&self, ctx: &BindCtx<'_>) {
+        self.pipeline.bind_to(ctx);
+    }
+
+    fn call(&self, io: Io, guard: ConnGuard) {
+        let fut = self.pipeline.call_static(io);
+        ntex_rt::spawn_detached(async move {
+            let _ = fut.await;
+            drop(guard);
+        });
+    }
+
+    fn ready(&self) -> BoxFuture<'_, Result<(), ()>> {
+        Box::pin(async { self.pipeline.ready().await })
+    }
+
+    fn shutdown(&self) -> BoxFuture<'_, ()> {
+        Box::pin(async { self.pipeline.shutdown().await })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::cell::Cell;
+
+    use super::*;
+
+    // Send but not Sync, clone mutates the source
+    struct CloneCounter(Cell<usize>);
+
+    impl Clone for CloneCounter {
+        fn clone(&self) -> Self {
+            self.0.set(self.0.get() + 1);
+            Self(Cell::new(0))
         }
-        let factory_fut = self.wrapper.run(cfg.clone());
+    }
 
-        Box::pin(async move {
-            let factory = factory_fut.await;
-            let config = cfg.get_config();
-            for item in &mut tokens {
-                item.1 = config.clone();
+    impl CloneCounter {
+        fn touch(&self) -> usize {
+            self.0.get()
+        }
+    }
+
+    // Under miri, a factory shared between instances is a data race
+    #[test]
+    fn factory_not_shared_between_threads() {
+        let counter = CloneCounter(Cell::new(0));
+        let first = create_factory_service::<crate::NoConfig, _, _, _>(
+            "test".to_owned(),
+            Vec::new(),
+            async move |(): &()| {
+                let _ = counter.touch();
+                ntex_service::fn_service(async |_: Io| Ok::<_, ()>(()))
+            },
+        );
+        let second = first.clo();
+        let barrier = std::sync::Barrier::new(2);
+        std::thread::scope(|scope| {
+            for fac in [first, second] {
+                let barrier = &barrier;
+                scope.spawn(move || {
+                    barrier.wait();
+                    drop(fac.create(()));
+                });
             }
-
-            Ok(vec![NetService {
-                name,
-                tokens,
-                factory,
-                config: config.clone(),
-            }])
-        })
-    }
-}
-
-struct ServerServiceFactory<S> {
-    name: Arc<str>,
-    factory: S,
-}
-
-impl<S> ServiceFactory<Io, SharedCfg> for ServerServiceFactory<S>
-where
-    S: ServiceFactory<Io, SharedCfg>,
-{
-    type Response = ();
-    type Error = ();
-    type Service = ServerService<S::Service>;
-    type InitError = ();
-
-    async fn create(&self, cfg: SharedCfg) -> Result<Self::Service, Self::InitError> {
-        self.factory
-            .create(cfg)
-            .await
-            .map(|inner| ServerService { inner })
-            .map_err(|_| log::error!("Cannot construct {:?} service", self.name))
-    }
-}
-
-struct ServerService<S> {
-    inner: S,
-}
-
-impl<S> Service<Io> for ServerService<S>
-where
-    S: Service<Io>,
-{
-    type Response = ();
-    type Error = ();
-
-    async fn ready(&self, ctx: ServiceCtx<'_, Self>) -> Result<(), ()> {
-        ctx.ready(&self.inner).await.map_err(|_| ())
-    }
-
-    async fn call(&self, req: Io, ctx: ServiceCtx<'_, Self>) -> Result<(), ()> {
-        ctx.call(&self.inner, req).await.map(|_| ()).map_err(|_| ())
-    }
-
-    ntex_service::forward_shutdown!(inner);
-}
-
-// SAFETY: Send cannot be provided authomatically because of E and R params
-// but R always get executed in one thread and never leave it
-unsafe impl Send for Factory {}
-
-pub(crate) trait OnWorkerStart {
-    fn clone_fn(&self) -> Box<dyn OnWorkerStart + Send>;
-
-    fn run(&self) -> BoxFuture<'static, Result<(), ()>>;
-}
-
-pub(super) struct OnWorkerStartWrapper<F, E> {
-    pub(super) f: F,
-    pub(super) _t: PhantomData<E>,
-}
-
-unsafe impl<F, E> Send for OnWorkerStartWrapper<F, E> where F: Send {}
-
-impl<F, E> OnWorkerStartWrapper<F, E>
-where
-    F: AsyncFn() -> Result<(), E> + Send + Clone + 'static,
-    E: fmt::Display + 'static,
-{
-    pub(super) fn create(f: F) -> Box<dyn OnWorkerStart + Send> {
-        Box::new(Self { f, _t: PhantomData })
-    }
-}
-
-impl<F, E> OnWorkerStart for OnWorkerStartWrapper<F, E>
-where
-    F: AsyncFn() -> Result<(), E> + Send + Clone + 'static,
-    E: fmt::Display + 'static,
-{
-    fn clone_fn(&self) -> Box<dyn OnWorkerStart + Send> {
-        Box::new(Self {
-            f: self.f.clone(),
-            _t: PhantomData,
-        })
-    }
-
-    fn run(&self) -> BoxFuture<'static, Result<(), ()>> {
-        let f = self.f.clone();
-        Box::pin(async move {
-            (f)().await.map_err(|e| {
-                log::error!("On worker start callback failed: {e}");
-            })
-        })
-    }
-}
-
-pub(crate) trait OnAccept {
-    fn clone_fn(&self) -> Box<dyn OnAccept + Send>;
-
-    fn run(&self, name: Arc<str>, stream: Stream)
-    -> BoxFuture<'static, Result<Stream, ()>>;
-}
-
-pub(super) struct OnAcceptWrapper<F, E> {
-    pub(super) f: F,
-    pub(super) _t: PhantomData<E>,
-}
-
-unsafe impl<F, E> Send for OnAcceptWrapper<F, E> where F: Send {}
-
-impl<F, E> OnAcceptWrapper<F, E>
-where
-    F: AsyncFn(Arc<str>, Stream) -> Result<Stream, E> + Send + Clone + 'static,
-    E: fmt::Display + 'static,
-{
-    pub(super) fn create(f: F) -> Box<dyn OnAccept + Send> {
-        Box::new(Self { f, _t: PhantomData })
-    }
-}
-
-impl<F, E> OnAccept for OnAcceptWrapper<F, E>
-where
-    F: AsyncFn(Arc<str>, Stream) -> Result<Stream, E> + Send + Clone + 'static,
-    E: fmt::Display + 'static,
-{
-    fn clone_fn(&self) -> Box<dyn OnAccept + Send> {
-        Box::new(Self {
-            f: self.f.clone(),
-            _t: PhantomData,
-        })
-    }
-
-    fn run(
-        &self,
-        name: Arc<str>,
-        stream: Stream,
-    ) -> BoxFuture<'static, Result<Stream, ()>> {
-        let f = self.f.clone();
-        Box::pin(async move {
-            (f)(name, stream).await.map_err(|e| {
-                log::error!("On accept callback failed: {e}");
-            })
-        })
+        });
     }
 }

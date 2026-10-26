@@ -1,9 +1,5 @@
-//! Shared configuration for services
-#![allow(
-    clippy::should_implement_trait,
-    clippy::new_ret_no_self,
-    clippy::missing_panics_doc
-)]
+//! Typed, shared configuration for services.
+#![allow(clippy::should_implement_trait, clippy::new_ret_no_self)]
 use std::any::{Any, TypeId};
 use std::cell::{RefCell, UnsafeCell};
 use std::sync::{Arc, atomic::AtomicUsize, atomic::Ordering};
@@ -27,11 +23,15 @@ static IDX: AtomicUsize = AtomicUsize::new(0);
 const KIND_ARC: usize = 1;
 const KIND_UNMASK: usize = !KIND_ARC;
 
+/// A value that can be stored in [`SharedCfg`].
 pub trait Configuration: Default + Send + Sync + fmt::Debug + 'static {
+    /// Human-readable configuration name used in diagnostics.
     const NAME: &'static str;
 
+    /// Returns the shared context associated with this value.
     fn ctx(&self) -> &CfgContext;
 
+    /// Associates this value with a shared configuration context.
     fn set_ctx(&mut self, ctx: CfgContext);
 }
 
@@ -46,12 +46,7 @@ struct Storage {
 }
 
 impl Storage {
-    fn new(
-        tag: &'static str,
-        service: &'static str,
-        building: bool,
-        ctx: CfgContext,
-    ) -> Self {
+    fn new(tag: &'static str, service: &'static str, building: bool, ctx: CfgContext) -> Self {
         let id = IDX.fetch_add(1, Ordering::SeqCst);
         Storage {
             id,
@@ -65,6 +60,7 @@ impl Storage {
 }
 
 #[derive(Debug)]
+/// Metadata and lookup access for a shared configuration.
 pub struct CfgContext(*const Storage);
 
 unsafe impl Send for CfgContext {}
@@ -75,23 +71,23 @@ impl CfgContext {
         self.0 = new_p;
     }
 
-    /// Unique id of the context.
+    /// Returns the unique identifier of the shared configuration.
     pub fn id(&self) -> usize {
         self.get_ref().id
     }
 
     #[inline]
-    /// Context tag.
+    /// Returns the configuration tag.
     pub fn tag(&self) -> &'static str {
         self.get_ref().tag
     }
 
-    /// Service name.
+    /// Returns the configured service name.
     pub fn service(&self) -> &'static str {
         self.get_ref().service
     }
 
-    /// Get a reference to a configuration.
+    /// Returns a typed configuration value from the same shared configuration.
     pub fn get<T>(&self) -> Cfg<T>
     where
         T: Configuration,
@@ -102,7 +98,7 @@ impl CfgContext {
         cfg
     }
 
-    /// Get a shared configuration.
+    /// Returns a handle to the complete shared configuration.
     pub fn shared(&self) -> SharedCfg {
         let inner: Arc<Storage> = unsafe { Arc::from_raw(self.0) };
         let shared = SharedCfg(inner.clone());
@@ -123,6 +119,7 @@ impl Default for CfgContext {
 }
 
 #[derive(Debug)]
+/// A typed handle to a value in a [`SharedCfg`].
 pub struct Cfg<T: Configuration>(UnsafeCell<*const T>, PhantomData<rc::Rc<T>>);
 
 impl<T: Configuration> Cfg<T> {
@@ -131,25 +128,33 @@ impl<T: Configuration> Cfg<T> {
     }
 
     #[inline]
-    /// Unique id of the configuration.
+    /// Returns the unique identifier of the shared configuration.
     pub fn id(&self) -> usize {
         self.get_ref().ctx().id()
     }
 
     #[inline]
-    /// Context tag.
+    /// Returns the configuration tag.
     pub fn tag(&self) -> &'static str {
         self.get_ref().ctx().tag()
     }
 
-    /// Service name.
+    /// Returns the configured service name.
     pub fn service(&self) -> &'static str {
         self.get_ref().ctx().service()
     }
 
-    /// Get a shared configuration.
+    /// Returns a handle to the complete shared configuration.
     pub fn shared(&self) -> SharedCfg {
         self.get_ref().ctx().shared()
+    }
+
+    /// Returns another typed value from the same shared configuration.
+    pub fn get_shared<U>(&self) -> Cfg<U>
+    where
+        U: Configuration,
+    {
+        self.get_ref().ctx().get::<U>()
     }
 
     fn get_ref(&self) -> &T {
@@ -173,13 +178,6 @@ impl<T: Configuration> Cfg<T> {
             ptr::swap(self.0.get(), cfg.0.get());
         }
     }
-
-    #[doc(hidden)]
-    #[deprecated(since = "4.5.0")]
-    #[must_use]
-    pub fn into_static(&self) -> Cfg<T> {
-        self.ctx().get()
-    }
 }
 
 impl<T: Configuration> Drop for Cfg<T> {
@@ -199,6 +197,13 @@ impl<T: Configuration> Clone for Cfg<T> {
     #[inline]
     fn clone(&self) -> Self {
         self.ctx().get()
+    }
+}
+
+impl<T: Configuration> From<T> for Cfg<T> {
+    #[inline]
+    fn from(cfg: T) -> Self {
+        SharedCfg::new("--").add(cfg).build().get()
     }
 }
 
@@ -226,10 +231,11 @@ impl<T: Configuration> Default for Cfg<T> {
 }
 
 #[derive(Clone, Debug)]
-/// Shared configuration
+/// An immutable collection of typed configuration values.
 pub struct SharedCfg(Arc<Storage>);
 
 #[derive(Debug)]
+/// Builder for [`SharedCfg`].
 pub struct SharedCfgBuilder {
     ctx: CfgContext,
     storage: Arc<Storage>,
@@ -250,33 +256,33 @@ impl Hash for SharedCfg {
 }
 
 impl SharedCfg {
-    /// Construct new configuration
+    /// Starts building a shared configuration with the given tag.
     pub fn new(tag: &'static str) -> SharedCfgBuilder {
         SharedCfgBuilder::new(tag)
     }
 
     #[inline]
-    /// Get unique shared cfg id
+    /// Returns the unique identifier of this configuration.
     pub fn id(&self) -> usize {
         self.0.id
     }
 
     #[inline]
-    /// Get tag.
+    /// Returns the configuration tag.
     pub fn tag(&self) -> &'static str {
         self.0.tag
     }
 
-    /// Service name.
+    /// Returns the configured service name.
     pub fn service(&self) -> &'static str {
         self.0.service
     }
 
-    /// Get a reference to a previously inserted on configuration.
+    /// Returns the configuration value of type `T`.
     ///
     /// # Panics
     ///
-    /// if shared config is in building stage
+    /// Panics if the shared configuration is still being built.
     pub fn get<T>(&self) -> Cfg<T>
     where
         T: Configuration,
@@ -292,10 +298,44 @@ impl Default for SharedCfg {
     }
 }
 
+impl<'a> From<&'a SharedCfg> for SharedCfg {
+    fn from(cfg: &'a SharedCfg) -> SharedCfg {
+        cfg.clone()
+    }
+}
+
 impl<T: Configuration> From<SharedCfg> for Cfg<T> {
     #[inline]
     fn from(cfg: SharedCfg) -> Self {
         cfg.get()
+    }
+}
+
+impl<'a, T: Configuration> From<&'a SharedCfg> for Cfg<T> {
+    #[inline]
+    fn from(cfg: &'a SharedCfg) -> Self {
+        cfg.get()
+    }
+}
+
+impl<T: Configuration> From<SharedCfgBuilder> for Cfg<T> {
+    #[inline]
+    fn from(cfg: SharedCfgBuilder) -> Self {
+        cfg.build().get()
+    }
+}
+
+impl<T: Configuration> From<T> for SharedCfg {
+    #[inline]
+    fn from(cfg: T) -> Self {
+        SharedCfg::new("--").add(cfg).build()
+    }
+}
+
+impl<T: Configuration> From<Cfg<T>> for SharedCfg {
+    #[inline]
+    fn from(cfg: Cfg<T>) -> Self {
+        cfg.shared()
     }
 }
 
@@ -309,17 +349,16 @@ impl SharedCfgBuilder {
     }
 
     #[must_use]
-    /// Set service name.
+    /// Sets the service name.
     pub fn service(mut self, name: &'static str) -> Self {
         Arc::get_mut(&mut self.storage).unwrap().service = name;
         self
     }
 
     #[must_use]
-    /// Insert a type into this configuration.
+    /// Inserts a typed value into this configuration.
     ///
-    /// If a config of this type already existed, it will
-    /// be replaced.
+    /// Replaces the existing value when the same type was already inserted.
     pub fn add<T: Configuration>(mut self, mut val: T) -> Self {
         val.set_ctx(CfgContext(self.ctx.0));
         Arc::get_mut(&mut self.storage)
@@ -330,7 +369,7 @@ impl SharedCfgBuilder {
     }
 
     #[must_use]
-    /// Build `SharedCfg` instance.
+    /// Finishes building and returns the shared configuration.
     pub fn build(self) -> SharedCfg {
         self.into()
     }
@@ -355,7 +394,7 @@ where
     );
 
     // increase arc refs for storage instead of actual item
-    // CfgContext and Cfg::shared() relayes on Arc<Storage>
+    // CfgContext and Cfg::shared() rely on Arc<Storage>.
     mem::forget(st.clone());
 
     let tp = TypeId::of::<T>();
@@ -465,6 +504,7 @@ mod tests {
         assert_eq!(t.ctx().id(), t.id());
 
         let cfg = SharedCfg::new("TEST2").build();
+        let cfg = SharedCfg::from(&cfg);
         let t = cfg.get::<TestCfg>();
         assert_eq!(t.tag(), "TEST2");
         assert_eq!(t.id(), cfg.id());
@@ -481,8 +521,7 @@ mod tests {
         assert_eq!(t3.tag(), "TEST3");
         assert_eq!(t3.id(), cfg2.id());
 
-        let t = SharedCfg::from(SharedCfg::new("TEST4").add(TestCfg::default()))
-            .get::<TestCfg>();
+        let t = SharedCfg::from(SharedCfg::new("TEST4").add(TestCfg::default())).get::<TestCfg>();
         let cfg = t.shared();
         assert_eq!(t.id(), cfg.id());
         let t2 = t.clone();
@@ -490,7 +529,53 @@ mod tests {
         assert_eq!(t2.tag(), "TEST4");
 
         let t3 = t.ctx().get::<TestCfg>();
+        let t3 = Cfg::from(t3.get_ref());
+        let t3 = t3.get_shared::<TestCfg>();
         assert_eq!(t3.id(), cfg.id());
         assert_eq!(t3.tag(), "TEST4");
+
+        let t1 = SharedCfg::from(t3);
+        assert_eq!(t.id(), t1.id());
+    }
+
+    #[test]
+    fn cfg_conversions() {
+        use std::hash::BuildHasher;
+
+        #[derive(Default, Debug)]
+        struct TestCfg {
+            config: CfgContext,
+            val: usize,
+        }
+        impl Configuration for TestCfg {
+            const NAME: &str = "TEST";
+            fn ctx(&self) -> &CfgContext {
+                &self.config
+            }
+            fn set_ctx(&mut self, ctx: CfgContext) {
+                self.config = ctx;
+            }
+        }
+        let new = |val| TestCfg {
+            val,
+            ..Default::default()
+        };
+
+        let t = Cfg::from(new(1));
+        assert_eq!(t.val, 1);
+        assert_eq!(t.tag(), "--");
+
+        let shared = SharedCfg::from(new(2));
+        assert_eq!(shared.get::<TestCfg>().val, 2);
+        assert_eq!(Cfg::<TestCfg>::from(&shared).val, 2);
+        assert_eq!(Cfg::<TestCfg>::from(shared.clone()).val, 2);
+
+        let t: Cfg<TestCfg> = SharedCfg::new("T").add(new(3)).into();
+        assert_eq!(t.val, 3);
+        assert_eq!(t.tag(), "T");
+
+        let hasher = foldhash::fast::FixedState::default();
+        assert_eq!(hasher.hash_one(&shared), hasher.hash_one(shared.clone()));
+        assert_eq!(hasher.hash_one(&shared), hasher.hash_one(shared.id()));
     }
 }

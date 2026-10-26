@@ -1,16 +1,16 @@
-//! Test helpers for ntex http client to use during testing.
+//! Test helpers for the ntex HTTP client.
 #[cfg(feature = "cookie")]
 use coo_kie::{Cookie, CookieJar};
 
 use crate::http::error::HttpError;
 use crate::http::header::{HeaderName, HeaderValue};
 use crate::http::{Payload, ResponseHead, StatusCode, Version};
-use crate::{channel::bstream, util::Bytes};
+use crate::{Cfg, channel::bstream, util::Bytes};
 
-use super::{ClientConfig, ClientResponse};
+use super::ClientResponse;
 
 #[derive(Debug)]
-/// Test `ClientResponse` builder
+/// Builder for creating a [`ClientResponse`] in tests.
 pub struct TestResponse {
     head: ResponseHead,
     payload: Option<Payload>,
@@ -18,8 +18,9 @@ pub struct TestResponse {
     cookies: CookieJar,
 }
 
-impl Default for TestResponse {
-    fn default() -> TestResponse {
+impl TestResponse {
+    /// Creates a test response builder.
+    pub fn builder() -> TestResponse {
         TestResponse {
             head: ResponseHead::new(StatusCode::OK, Version::default()),
             payload: None,
@@ -27,29 +28,27 @@ impl Default for TestResponse {
             cookies: CookieJar::new(),
         }
     }
-}
 
-impl TestResponse {
     #[must_use]
-    /// Create `TestResponse` and set header.
+    /// Creates a test response with one header.
     pub fn with_header<K, V>(key: K, value: V) -> Self
     where
         HeaderName: TryFrom<K>,
         HeaderValue: TryFrom<V>,
         <HeaderName as TryFrom<K>>::Error: Into<HttpError>,
     {
-        Self::default().header(key, value)
+        Self::builder().header(key, value)
     }
 
     #[must_use]
-    /// Set HTTP version of this response.
+    /// Sets the response HTTP version.
     pub fn version(mut self, ver: Version) -> Self {
         self.head.version = ver;
         self
     }
 
     #[must_use]
-    /// Append a header.
+    /// Appends a response header.
     pub fn header<K, V>(mut self, key: K, value: V) -> Self
     where
         HeaderName: TryFrom<K>,
@@ -67,7 +66,7 @@ impl TestResponse {
 
     #[must_use]
     #[cfg(feature = "cookie")]
-    /// Set cookie for this response.
+    /// Adds a response cookie.
     pub fn cookie<C>(mut self, cookie: C) -> Self
     where
         C: Into<Cookie<'static>>,
@@ -77,45 +76,29 @@ impl TestResponse {
     }
 
     #[must_use]
-    /// Set response's payload.
+    /// Sets the response payload.
     pub fn set_payload<B: Into<Bytes>>(mut self, data: B) -> Self {
         self.payload = Some(bstream::empty(Some(data.into())).into());
         self
     }
 
     #[must_use]
-    /// Complete response creation and generate `ClientResponse` instance.
-    pub fn finish(self) -> ClientResponse {
+    /// Builds the [`ClientResponse`].
+    pub fn build(self) -> ClientResponse {
         #[allow(unused_mut)]
         let mut head = self.head;
 
+        // one `Set-Cookie` header per cookie
         #[cfg(feature = "cookie")]
-        {
-            use percent_encoding::percent_encode;
-            use std::fmt::Write as FmtWrite;
-
-            use crate::http::header;
-
-            let mut cookie = String::new();
-            for c in self.cookies.delta() {
-                let name =
-                    percent_encode(c.name().as_bytes(), crate::http::helpers::USERINFO);
-                let value =
-                    percent_encode(c.value().as_bytes(), crate::http::helpers::USERINFO);
-                let _ = write!(cookie, "; {name}={value}");
-            }
-            if !cookie.is_empty() {
-                head.headers.insert(
-                    header::SET_COOKIE,
-                    HeaderValue::from_str(&cookie.as_str()[2..]).unwrap(),
-                );
-            }
+        for c in self.cookies.delta() {
+            let value = HeaderValue::from_str(&c.encoded().to_string()).unwrap();
+            head.headers.append(crate::http::header::SET_COOKIE, value);
         }
 
         if let Some(pl) = self.payload {
-            ClientResponse::new(head, pl, ClientConfig::default())
+            ClientResponse::new(head, pl, Cfg::default())
         } else {
-            ClientResponse::new(head, bstream::empty(None).into(), ClientConfig::default())
+            ClientResponse::new(head, bstream::empty(None).into(), Cfg::default())
         }
     }
 }
@@ -130,23 +113,52 @@ mod tests {
         let res = {
             #[cfg(feature = "cookie")]
             {
-                TestResponse::default()
+                TestResponse::builder()
                     .version(Version::HTTP_2)
                     .header(header::DATE, "data")
                     .cookie(coo_kie::Cookie::build(("name", "value")))
-                    .finish()
+                    .build()
             }
             #[cfg(not(feature = "cookie"))]
             {
-                TestResponse::default()
+                TestResponse::builder()
                     .version(Version::HTTP_2)
                     .header(header::DATE, "data")
-                    .finish()
+                    .build()
             }
         };
         #[cfg(feature = "cookie")]
         assert!(res.headers().contains_key(header::SET_COOKIE));
         assert!(res.headers().contains_key(header::DATE));
         assert_eq!(res.version(), Version::HTTP_2);
+    }
+
+    #[cfg(feature = "cookie")]
+    #[crate::rt_test]
+    async fn test_cookies() {
+        use crate::http::HttpMessage;
+        use coo_kie::Cookie;
+
+        let res = TestResponse::builder()
+            .cookie(Cookie::build(("c1", "v 1")).path("/p"))
+            .cookie(Cookie::build(("c2", "v2")))
+            .build();
+        assert_eq!(res.headers().get_all(header::SET_COOKIE).count(), 2);
+
+        let mut cookies: Vec<_> = res
+            .cookies()
+            .unwrap()
+            .iter()
+            .map(|c| (c.name().to_string(), c.value().to_string()))
+            .collect();
+        cookies.sort_unstable();
+        assert_eq!(
+            cookies,
+            [
+                ("c1".to_string(), "v 1".to_string()),
+                ("c2".to_string(), "v2".to_string())
+            ]
+        );
+        assert_eq!(res.cookie("c1").unwrap().path(), Some("/p"));
     }
 }

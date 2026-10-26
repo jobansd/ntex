@@ -1,144 +1,151 @@
 use std::{fmt, marker::PhantomData};
 
-use super::{Service, ServiceCtx, ServiceFactory};
+use super::{Ctx, Service, ServiceFactory};
 
-/// Service for the `map` combinator, changing the type of a service's response.
+/// Service produced by the `map` combinator.
 ///
-/// This is created by the `ServiceExt::map` method.
-pub struct Map<A, F, Req, Res> {
-    service: A,
+/// This is created by the `Service::map()` and `ServiceChain::map()` methods.
+/// Mapping responses preserves the wrapped service's readiness identity.
+pub struct Map<F, S, Res> {
     f: F,
-    _t: PhantomData<fn(Req) -> Res>,
+    svc: S,
+    _t: PhantomData<fn() -> Res>,
 }
 
-impl<A, F, Req, Res> Map<A, F, Req, Res> {
-    /// Create new `Map` combinator
-    pub(crate) fn new(service: A, f: F) -> Self
+impl<F, S, Res> Map<F, S, Res> {
+    /// Creates a new `Map` service.
+    pub(crate) fn new<St, Req>(f: F, svc: S) -> Self
     where
-        A: Service<Req>,
-        F: Fn(A::Response) -> Res,
+        F: Fn(S::Res) -> Res,
+        S: Service<St, Req>,
     {
         Self {
-            service,
             f,
+            svc,
             _t: PhantomData,
         }
     }
 }
 
-impl<A, F, Req, Res> Clone for Map<A, F, Req, Res>
+impl<F, S, Res> Clone for Map<F, S, Res>
 where
-    A: Clone,
     F: Clone,
+    S: Clone,
 {
     #[inline]
     fn clone(&self) -> Self {
         Map {
-            service: self.service.clone(),
             f: self.f.clone(),
+            svc: self.svc.clone(),
             _t: PhantomData,
         }
     }
 }
 
-impl<A, F, Req, Res> fmt::Debug for Map<A, F, Req, Res>
+impl<F, S, Res> fmt::Debug for Map<F, S, Res>
 where
-    A: fmt::Debug,
+    S: fmt::Debug,
 {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("Map")
-            .field("service", &self.service)
+            .field("svc", &self.svc)
             .field("map", &std::any::type_name::<F>())
             .finish()
     }
 }
 
-impl<A, F, Req, Res> Service<Req> for Map<A, F, Req, Res>
+impl<F, S, St, Req, Res> Service<St, Req> for Map<F, S, Res>
 where
-    A: Service<Req>,
-    F: Fn(A::Response) -> Res,
+    S: Service<St, Req>,
+    F: Fn(S::Res) -> Res,
 {
-    type Response = Res;
-    type Error = A::Error;
+    type Res = Res;
+    type Error = S::Error;
 
-    crate::forward_ready!(service);
-    crate::forward_poll!(service);
-    crate::forward_shutdown!(service);
+    crate::forward_bind!(St, svc);
 
     #[inline]
-    async fn call(
-        &self,
-        req: Req,
-        ctx: ServiceCtx<'_, Self>,
-    ) -> Result<Self::Response, Self::Error> {
-        ctx.call(&self.service, req).await.map(|r| (self.f)(r))
+    async fn call(&self, req: Req, ctx: Ctx<'_, Self, St>) -> Result<Res, S::Error> {
+        self.svc.call(req, ctx.cast()).await.map(|r| (self.f)(r))
+    }
+
+    #[inline]
+    async fn ready(&self, ctx: Ctx<'_, Self, St>) -> Result<(), S::Error> {
+        self.svc.ready(ctx.cast()).await
+    }
+
+    #[inline]
+    async fn shutdown(&self, ctx: Ctx<'_, Self, St>) {
+        self.svc.shutdown(ctx.cast()).await;
     }
 }
 
-/// `MapNewService` new service combinator
-pub struct MapFactory<A, F, Req, Res, Cfg> {
-    a: A,
+/// Service factory produced by the `map` combinator.
+///
+/// This is created by the `ServiceChainFactory::map()` method.
+pub struct MapFactory<F, Sf, Res> {
     f: F,
-    r: PhantomData<fn(Req, Cfg) -> Res>,
+    sf: Sf,
+    r: PhantomData<fn() -> Res>,
 }
 
-impl<A, F, Req, Res, Cfg> MapFactory<A, F, Req, Res, Cfg>
-where
-    A: ServiceFactory<Req, Cfg>,
-    F: Fn(A::Response) -> Res,
-{
-    /// Create new `Map` new service instance
-    pub(crate) fn new(a: A, f: F) -> Self {
+impl<F, Sf, Res> MapFactory<F, Sf, Res> {
+    /// Creates a new `MapFactory`.
+    pub(crate) fn new<St, Req>(f: F, sf: Sf) -> Self
+    where
+        F: Fn(Sf::Res) -> Res,
+        Sf: ServiceFactory<St, Req>,
+    {
         Self {
-            a,
             f,
+            sf,
             r: PhantomData,
         }
     }
 }
 
-impl<A, F, Req, Res, Cfg> Clone for MapFactory<A, F, Req, Res, Cfg>
+impl<F, Sf, Res> Clone for MapFactory<F, Sf, Res>
 where
-    A: Clone,
     F: Clone,
+    Sf: Clone,
 {
     #[inline]
     fn clone(&self) -> Self {
         Self {
-            a: self.a.clone(),
+            sf: self.sf.clone(),
             f: self.f.clone(),
             r: PhantomData,
         }
     }
 }
 
-impl<A, F, Req, Res, Cfg> fmt::Debug for MapFactory<A, F, Req, Res, Cfg>
+impl<F, Sf, Res> fmt::Debug for MapFactory<F, Sf, Res>
 where
-    A: fmt::Debug,
+    Sf: fmt::Debug,
 {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("MapFactory")
-            .field("factory", &self.a)
+            .field("factory", &self.sf)
             .field("map", &std::any::type_name::<F>())
             .finish()
     }
 }
 
-impl<A, F, Req, Res, Cfg> ServiceFactory<Req, Cfg> for MapFactory<A, F, Req, Res, Cfg>
+impl<F, Sf, St, Req, Res> ServiceFactory<St, Req> for MapFactory<F, Sf, Res>
 where
-    A: ServiceFactory<Req, Cfg>,
-    F: Fn(A::Response) -> Res + Clone,
+    F: Fn(Sf::Res) -> Res + Clone,
+    Sf: ServiceFactory<St, Req>,
 {
-    type Response = Res;
-    type Error = A::Error;
+    type Res = Res;
+    type Error = Sf::Error;
 
-    type Service = Map<A::Service, F, Req, Res>;
-    type InitError = A::InitError;
+    type Service = Map<F, Sf::Service, Res>;
+    type InitError = Sf::InitError;
 
     #[inline]
-    async fn create(&self, cfg: Cfg) -> Result<Self::Service, Self::InitError> {
+    async fn create(&self, st: &St) -> Result<Self::Service, Self::InitError> {
         Ok(Map {
-            service: self.a.create(cfg).await?,
+            svc: self.sf.create(st).await?,
             f: self.f.clone(),
             _t: PhantomData,
         })
@@ -149,24 +156,24 @@ where
 mod tests {
     use std::{cell::Cell, rc::Rc};
 
-    use crate::{Pipeline, Service, ServiceCtx, ServiceFactory, fn_factory};
+    use crate::{Ctx, Pipeline, Service, ServiceFactory, fn_factory, service};
 
     #[derive(Debug, Default, Clone)]
     struct Srv(Rc<Cell<usize>>);
 
-    impl Service<()> for Srv {
-        type Response = ();
+    impl Service<(), ()> for Srv {
+        type Res = ();
         type Error = ();
 
-        async fn ready(&self, _: ServiceCtx<'_, Self>) -> Result<(), Self::Error> {
+        async fn ready(&self, _: Ctx<'_, Self>) -> Result<(), Self::Error> {
             Ok(())
         }
 
-        async fn call(&self, _r: (), _: ServiceCtx<'_, Self>) -> Result<(), ()> {
+        async fn call(&self, _r: (), _: Ctx<'_, Self>) -> Result<(), ()> {
             Ok(())
         }
 
-        async fn shutdown(&self) {
+        async fn shutdown(&self, _: Ctx<'_, Self, ()>) {
             self.0.set(self.0.get() + 1);
         }
     }
@@ -174,7 +181,7 @@ mod tests {
     #[ntex::test]
     async fn test_service() {
         let cnt_sht = Rc::new(Cell::new(0));
-        let srv = Pipeline::new(Srv(cnt_sht.clone()).map(|()| "ok").clone());
+        let srv = Pipeline::new((), service(Srv(cnt_sht.clone())).map(|()| "ok").clone());
         let res = srv.call(()).await;
         assert!(res.is_ok());
         assert_eq!(res.unwrap(), "ok");
@@ -188,7 +195,7 @@ mod tests {
 
         let cnt_sht = Rc::new(Cell::new(0));
         let svc = Srv(cnt_sht.clone()).map(|()| "ok");
-        let srv = Pipeline::new(&svc);
+        let srv = Pipeline::new((), svc);
         let res = srv.call(()).await;
         assert!(res.is_ok());
         assert_eq!(res.unwrap(), "ok");
@@ -203,7 +210,7 @@ mod tests {
 
     #[ntex::test]
     async fn test_pipeline() {
-        let srv = Pipeline::new(crate::chain(Srv::default()).map(|()| "ok").clone());
+        let srv = Pipeline::new((), crate::service(Srv::default()).map(|()| "ok").clone());
         let res = srv.call(()).await;
         assert!(res.is_ok());
         assert_eq!(res.unwrap(), "ok");
@@ -214,10 +221,10 @@ mod tests {
 
     #[ntex::test]
     async fn test_factory() {
-        let new_srv = fn_factory(|| async { Ok::<_, ()>(Srv::default()) })
+        let new_srv = fn_factory(|(): &()| async { Ok::<_, ()>(Srv::default()) })
             .map(|()| "ok")
             .clone();
-        let srv = Pipeline::new(new_srv.create(&()).await.unwrap());
+        let srv = Pipeline::new((), new_srv.create(&()).await.unwrap());
         let res = srv.call(()).await;
         assert!(res.is_ok());
         assert_eq!(res.unwrap(), ("ok"));
@@ -227,11 +234,10 @@ mod tests {
 
     #[ntex::test]
     async fn test_pipeline_factory() {
-        let new_srv =
-            crate::chain_factory(fn_factory(|| async { Ok::<_, ()>(Srv::default()) }))
-                .map(|()| "ok")
-                .clone();
-        let srv = Pipeline::new(new_srv.create(&()).await.unwrap());
+        let new_srv = crate::fn_factory(|(): &()| async { Ok::<_, ()>(Srv::default()) })
+            .map(|()| "ok")
+            .clone();
+        let srv = Pipeline::new((), new_srv.create(&()).await.unwrap());
         let res = srv.call(()).await;
         assert!(res.is_ok());
         assert_eq!(res.unwrap(), ("ok"));

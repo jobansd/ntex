@@ -5,9 +5,12 @@ use ntex_service::cfg::SharedCfg;
 
 use super::Token;
 
+/// Accepted socket stream.
 #[derive(Debug)]
 pub enum Stream {
+    /// TCP stream.
     Tcp(net::TcpStream),
+    /// Unix domain socket stream.
     #[cfg(unix)]
     Uds(std::os::unix::net::UnixStream),
 }
@@ -22,6 +25,7 @@ impl Stream {
     }
 }
 
+/// Accepted connection dispatched to a worker.
 #[derive(Debug)]
 pub struct Connection {
     pub(crate) io: Stream,
@@ -104,13 +108,9 @@ impl Listener {
 
     pub(crate) fn accept(&self) -> io::Result<Option<Stream>> {
         match *self {
-            Listener::Tcp(ref lst) => {
-                lst.accept().map(|(stream, _)| Some(Stream::Tcp(stream)))
-            }
+            Listener::Tcp(ref lst) => lst.accept().map(|(stream, _)| Some(Stream::Tcp(stream))),
             #[cfg(unix)]
-            Listener::Uds(ref lst) => {
-                lst.accept().map(|(stream, _)| Some(Stream::Uds(stream)))
-            }
+            Listener::Uds(ref lst) => lst.accept().map(|(stream, _)| Some(Stream::Uds(stream))),
         }
     }
 

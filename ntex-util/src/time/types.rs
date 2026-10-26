@@ -1,9 +1,9 @@
 use std::ops;
 
-/// A Duration type to represent a span of time.
+/// A span of time in milliseconds, for timeouts.
 ///
-/// This type is designed for timeouts. Milliseconds resolution
-/// is too small to keep generic time.
+/// The value is a `u32`, so the longest representable span is about 49 days.
+/// Arithmetic saturates instead of overflowing.
 #[derive(Copy, Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct Millis(pub u32);
 
@@ -15,21 +15,24 @@ impl Millis {
     pub const ONE_SEC: Millis = Millis(1_000);
 
     #[inline]
+    /// Converts seconds to milliseconds, saturating at [`u32::MAX`].
     pub const fn from_secs(secs: u32) -> Millis {
-        Millis(secs * 1000)
+        Millis(secs.saturating_mul(1000))
     }
 
     #[inline]
+    /// Returns `true` if the duration is zero.
     pub const fn is_zero(&self) -> bool {
         self.0 == 0
     }
 
     #[inline]
+    /// Returns `true` if the duration is not zero.
     pub const fn non_zero(self) -> bool {
         self.0 != 0
     }
 
-    /// Call function `f` if duration is none zero.
+    /// Calls `f` if the duration is not zero.
     #[inline]
     pub fn map<F, R>(&self, f: F) -> Option<R>
     where
@@ -121,8 +124,8 @@ impl From<std::time::Duration> for Millis {
     #[inline]
     fn from(d: std::time::Duration) -> Millis {
         Self(d.as_millis().try_into().unwrap_or_else(|_| {
-            log::error!("time Duration is too large {d:?}");
-            1 << 31
+            log::error!("Duration is too large for Millis: {d:?}");
+            u32::MAX
         }))
     }
 }
@@ -134,7 +137,9 @@ impl From<Millis> for std::time::Duration {
     }
 }
 
-/// A Seconds type to represent a span of time in seconds.
+/// A span of time in whole seconds.
+///
+/// The value is a `u16`, so the longest representable span is about 18 hours.
 #[derive(Copy, Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct Seconds(pub u16);
 
@@ -146,11 +151,13 @@ impl Seconds {
     pub const ONE: Seconds = Seconds(1);
 
     #[inline]
+    /// Creates a duration of `secs` seconds.
     pub const fn new(secs: u16) -> Seconds {
         Seconds(secs)
     }
 
     #[inline]
+    /// Creates a duration of `secs` seconds, saturating at [`u16::MAX`].
     pub const fn checked_new(secs: usize) -> Seconds {
         let secs = if (u16::MAX as usize) < secs {
             u16::MAX
@@ -161,21 +168,24 @@ impl Seconds {
     }
 
     #[inline]
+    /// Returns `true` if the duration is zero.
     pub const fn is_zero(self) -> bool {
         self.0 == 0
     }
 
     #[inline]
+    /// Returns `true` if the duration is not zero.
     pub const fn non_zero(self) -> bool {
         self.0 != 0
     }
 
     #[inline]
+    /// Returns the number of seconds.
     pub const fn seconds(self) -> u64 {
         self.0 as u64
     }
 
-    /// Call function `f` if seconds is none zero.
+    /// Calls `f` with the duration in milliseconds if it is not zero.
     #[inline]
     pub fn map<F, R>(&self, f: F) -> Option<R>
     where
@@ -222,7 +232,11 @@ impl From<u16> for Seconds {
 impl From<i32> for Seconds {
     #[inline]
     fn from(i: i32) -> Seconds {
-        Seconds(if i < 0 { 0 } else { i as u16 })
+        Seconds(if i < 0 {
+            0
+        } else {
+            (i as u32).min(u32::from(u16::MAX)) as u16
+        })
     }
 }
 
@@ -277,10 +291,11 @@ mod tests {
         assert_eq!(m.0, 1000);
 
         let m = Millis::from(Duration::from_secs(u64::MAX));
-        assert_eq!(m.0, 2_147_483_648);
+        assert_eq!(m.0, u32::MAX);
 
         let m = Millis::from_secs(1);
         assert_eq!(m.0, 1000);
+        assert_eq!(Millis::from_secs(u32::MAX).0, u32::MAX);
 
         let m = Millis(0);
         assert_eq!(m.map(|m| m + Millis(1)), None);
@@ -302,6 +317,7 @@ mod tests {
 
         let s = Seconds::from(-10i32);
         assert_eq!(s.0, 0);
+        assert_eq!(Seconds::from(i32::MAX).0, u16::MAX);
 
         let s = Seconds::checked_new(10);
         assert_eq!(s.0, 10);
@@ -326,5 +342,21 @@ mod tests {
 
         let d = Duration::from(Seconds(100));
         assert_eq!(d.as_secs(), 100);
+    }
+
+    #[test]
+    fn time_types_conversions() {
+        assert!(Millis(1).non_zero());
+        assert!(!Millis::ZERO.non_zero());
+        assert_eq!(Millis::from(-5i32), Millis::ZERO);
+        assert_eq!(Millis::from(5i32), Millis(5));
+        assert_eq!(Millis::from(7usize), Millis(7));
+        assert_eq!(Seconds::from(7usize), Seconds(7));
+
+        #[cfg(target_pointer_width = "64")]
+        {
+            assert_eq!(Millis::from(usize::MAX), Millis(u32::MAX));
+            assert_eq!(Seconds::from(usize::MAX), Seconds(u16::MAX));
+        }
     }
 }

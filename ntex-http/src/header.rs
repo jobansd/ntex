@@ -6,22 +6,20 @@ pub use crate::value::{HeaderValue, InvalidHeaderValue, ToStrError};
 
 pub use http::header::{
     ACCEPT, ACCEPT_CHARSET, ACCEPT_ENCODING, ACCEPT_LANGUAGE, ACCEPT_RANGES,
-    ACCESS_CONTROL_ALLOW_CREDENTIALS, ACCESS_CONTROL_ALLOW_HEADERS,
-    ACCESS_CONTROL_ALLOW_METHODS, ACCESS_CONTROL_ALLOW_ORIGIN,
-    ACCESS_CONTROL_EXPOSE_HEADERS, ACCESS_CONTROL_MAX_AGE, ACCESS_CONTROL_REQUEST_HEADERS,
-    ACCESS_CONTROL_REQUEST_METHOD, AGE, ALLOW, ALT_SVC, AUTHORIZATION, CACHE_CONTROL,
-    CONNECTION, CONTENT_DISPOSITION, CONTENT_ENCODING, CONTENT_LANGUAGE, CONTENT_LENGTH,
-    CONTENT_LOCATION, CONTENT_RANGE, CONTENT_SECURITY_POLICY,
-    CONTENT_SECURITY_POLICY_REPORT_ONLY, CONTENT_TYPE, COOKIE, DATE, DNT, ETAG, EXPECT,
-    EXPIRES, FORWARDED, FROM, HOST, IF_MATCH, IF_MODIFIED_SINCE, IF_NONE_MATCH, IF_RANGE,
+    ACCESS_CONTROL_ALLOW_CREDENTIALS, ACCESS_CONTROL_ALLOW_HEADERS, ACCESS_CONTROL_ALLOW_METHODS,
+    ACCESS_CONTROL_ALLOW_ORIGIN, ACCESS_CONTROL_EXPOSE_HEADERS, ACCESS_CONTROL_MAX_AGE,
+    ACCESS_CONTROL_REQUEST_HEADERS, ACCESS_CONTROL_REQUEST_METHOD, AGE, ALLOW, ALT_SVC,
+    AUTHORIZATION, CACHE_CONTROL, CONNECTION, CONTENT_DISPOSITION, CONTENT_ENCODING,
+    CONTENT_LANGUAGE, CONTENT_LENGTH, CONTENT_LOCATION, CONTENT_RANGE, CONTENT_SECURITY_POLICY,
+    CONTENT_SECURITY_POLICY_REPORT_ONLY, CONTENT_TYPE, COOKIE, DATE, DNT, ETAG, EXPECT, EXPIRES,
+    FORWARDED, FROM, HOST, IF_MATCH, IF_MODIFIED_SINCE, IF_NONE_MATCH, IF_RANGE,
     IF_UNMODIFIED_SINCE, LAST_MODIFIED, LINK, LOCATION, MAX_FORWARDS, ORIGIN, PRAGMA,
-    PROXY_AUTHENTICATE, PROXY_AUTHORIZATION, PUBLIC_KEY_PINS, PUBLIC_KEY_PINS_REPORT_ONLY,
-    RANGE, REFERER, REFERRER_POLICY, REFRESH, RETRY_AFTER, SEC_WEBSOCKET_ACCEPT,
-    SEC_WEBSOCKET_EXTENSIONS, SEC_WEBSOCKET_KEY, SEC_WEBSOCKET_PROTOCOL,
-    SEC_WEBSOCKET_VERSION, SERVER, SET_COOKIE, STRICT_TRANSPORT_SECURITY, TE, TRAILER,
-    TRANSFER_ENCODING, UPGRADE, UPGRADE_INSECURE_REQUESTS, USER_AGENT, VARY, VIA, WARNING,
-    WWW_AUTHENTICATE, X_CONTENT_TYPE_OPTIONS, X_DNS_PREFETCH_CONTROL, X_FRAME_OPTIONS,
-    X_XSS_PROTECTION,
+    PROXY_AUTHENTICATE, PROXY_AUTHORIZATION, PUBLIC_KEY_PINS, PUBLIC_KEY_PINS_REPORT_ONLY, RANGE,
+    REFERER, REFERRER_POLICY, REFRESH, RETRY_AFTER, SEC_WEBSOCKET_ACCEPT, SEC_WEBSOCKET_EXTENSIONS,
+    SEC_WEBSOCKET_KEY, SEC_WEBSOCKET_PROTOCOL, SEC_WEBSOCKET_VERSION, SERVER, SET_COOKIE,
+    STRICT_TRANSPORT_SECURITY, TE, TRAILER, TRANSFER_ENCODING, UPGRADE, UPGRADE_INSECURE_REQUESTS,
+    USER_AGENT, VARY, VIA, WARNING, WWW_AUTHENTICATE, X_CONTENT_TYPE_OPTIONS,
+    X_DNS_PREFETCH_CONTROL, X_FRAME_OPTIONS, X_XSS_PROTECTION,
 };
 pub use http::header::{HeaderName, InvalidHeaderName};
 
@@ -36,6 +34,8 @@ pub enum ContentEncoding {
     Deflate,
     /// Gzip algorithm
     Gzip,
+    /// A format using the Zstandard algorithm
+    Zstd,
     /// Indicates the identity function (i.e. no compression, nor modification)
     Identity,
 }
@@ -54,6 +54,7 @@ impl ContentEncoding {
             ContentEncoding::Br => "br",
             ContentEncoding::Gzip => "gzip",
             ContentEncoding::Deflate => "deflate",
+            ContentEncoding::Zstd => "zstd",
             ContentEncoding::Identity | ContentEncoding::Auto => "identity",
         }
     }
@@ -63,6 +64,7 @@ impl ContentEncoding {
     pub fn quality(self) -> f64 {
         match self {
             ContentEncoding::Br => 1.1,
+            ContentEncoding::Zstd => 1.05,
             ContentEncoding::Gzip => 1.0,
             ContentEncoding::Deflate => 0.9,
             ContentEncoding::Identity | ContentEncoding::Auto => 0.1,
@@ -76,10 +78,12 @@ impl<'a> From<&'a str> for ContentEncoding {
 
         if s.eq_ignore_ascii_case("br") {
             ContentEncoding::Br
-        } else if s.eq_ignore_ascii_case("gzip") {
+        } else if s.eq_ignore_ascii_case("gzip") || s.eq_ignore_ascii_case("x-gzip") {
             ContentEncoding::Gzip
         } else if s.eq_ignore_ascii_case("deflate") {
             ContentEncoding::Deflate
+        } else if s.eq_ignore_ascii_case("zstd") {
+            ContentEncoding::Zstd
         } else {
             ContentEncoding::Identity
         }
@@ -96,5 +100,13 @@ mod tests {
         assert!(!ContentEncoding::Identity.is_compressed());
         assert!(!ContentEncoding::Auto.is_compressed());
         assert_eq!(format!("{:?}", ContentEncoding::Identity), "Identity");
+
+        assert!(ContentEncoding::Zstd.is_compressed());
+        assert_eq!(ContentEncoding::Zstd.as_str(), "zstd");
+        assert_eq!(ContentEncoding::from(" ZStd "), ContentEncoding::Zstd);
+        assert_eq!(ContentEncoding::from("X-Gzip"), ContentEncoding::Gzip);
+        assert_eq!(ContentEncoding::from("x-zstd"), ContentEncoding::Identity);
+        assert!(ContentEncoding::Br.quality() > ContentEncoding::Zstd.quality());
+        assert!(ContentEncoding::Zstd.quality() > ContentEncoding::Gzip.quality());
     }
 }

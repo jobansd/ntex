@@ -1,17 +1,19 @@
-use std::{cell::Cell, time};
+use std::{cell::Cell, cell::RefCell, rc::Rc, time};
 
-use crate::service::cfg::{Cfg, CfgContext, Configuration};
+use crate::http::header::HeaderValue;
+use crate::io::{IoRef, cfg::FrameReadRate};
+use crate::service::cfg::{CfgContext, Configuration};
 use crate::time::{Millis, Seconds, sleep};
-use crate::{io::cfg::FrameReadRate, service::Pipeline, util::BytePages, util::BytesMut};
+use crate::{channel::oneshot, util::BytePages, util::Bytes, util::BytesMut, util::HashSet};
 
 #[derive(Debug, PartialEq, Eq, Clone, Copy)]
-/// Server keep-alive setting
+/// Server keep-alive behavior.
 pub enum KeepAlive {
-    /// Keep alive in seconds
+    /// Close an idle connection after this timeout.
     Timeout(Seconds),
-    /// Relay on OS to shutdown tcp connection
+    /// Keep the connection open until the peer or operating system closes it.
     Os,
-    /// Disabled
+    /// Disable persistent connections.
     Disabled,
 }
 
@@ -38,14 +40,25 @@ impl From<Option<usize>> for KeepAlive {
 }
 
 #[derive(Debug)]
-/// Http service configuration
+#[allow(clippy::struct_excessive_bools)]
+/// Configuration shared by HTTP/1 and HTTP/2 server services.
+///
+/// The default configuration enables persistent HTTP/1 connections with a
+/// five-second idle timeout, allows 96 headers, limits the request or status
+/// line to 16 KiB and the message-head buffer to 64 KiB, and applies a
+/// one-second initial request-header timeout.
 pub struct HttpServiceConfig {
     pub(super) keep_alive: Seconds,
     pub(super) ka_enabled: bool,
-    pub(super) max_headers: usize,
+    pub(super) headers_vec: bool,
+    pub(super) validate_host: bool,
+    pub(super) max_headers: u16,
     pub(super) max_buf_size: usize,
+    pub(super) max_start_line_size: usize,
     pub(super) headers_read_rate: Option<FrameReadRate>,
     pub(super) payload_read_rate: Option<FrameReadRate>,
+    pub(super) write_timeout: Seconds,
+    pub(super) half_close: bool,
 
     config: CfgContext,
 }
@@ -70,12 +83,12 @@ impl Configuration for HttpServiceConfig {
 
 impl HttpServiceConfig {
     #[must_use]
-    /// Create instance of `HttpServiceConfig`.
+    /// Creates an HTTP service configuration with default settings.
     pub fn new() -> HttpServiceConfig {
-        Self::_new(KeepAlive::Timeout(Seconds(5)), Seconds::ONE)
+        Self::new_inner(KeepAlive::Timeout(Seconds(5)), Seconds::ONE)
     }
 
-    fn _new(keep_alive: KeepAlive, client_timeout: Seconds) -> HttpServiceConfig {
+    fn new_inner(keep_alive: KeepAlive, client_timeout: Seconds) -> HttpServiceConfig {
         let (keep_alive, ka_enabled) = match keep_alive {
             KeepAlive::Timeout(val) => (val, true),
             KeepAlive::Os => (Seconds::ZERO, true),
@@ -93,39 +106,58 @@ impl HttpServiceConfig {
             }),
             max_headers: 96,
             max_buf_size: 64 * 1024,
+            max_start_line_size: 16 * 1024,
+            headers_vec: false,
+            validate_host: true,
             payload_read_rate: None,
+            write_timeout: Seconds::ZERO,
+            half_close: false,
             config: CfgContext::default(),
         }
     }
 
     #[must_use]
-    /// Set the maximum number of headers.
+    /// Sets the maximum number of headers in a message.
     ///
-    /// When a request is received, the parser will reserve a buffer
-    /// to store headers for optimal performance.
+    /// Every header line counts, including repeated header names.
     ///
-    /// If server receives more headers than the buffer size, it responds
-    /// to the client with “431 Request Header Fields Too Large”.
-    ///
-    /// Default is set to 96
-    pub fn set_max_headers(mut self, val: usize) -> Self {
+    /// Requests exceeding this limit are rejected with
+    /// `431 Request Header Fields Too Large`. The default is 96.
+    pub fn set_max_headers(mut self, val: u16) -> Self {
         self.max_headers = val;
         self
     }
 
     #[must_use]
-    /// Set the maximum buffer size for parsing http message.
+    /// Sets the maximum cumulative size of an HTTP message head.
     ///
-    /// Default is 64kb
+    /// The request or response line, headers, and terminating empty line may
+    /// occupy up to and including this number of bytes. Larger message heads
+    /// are rejected. The default is 64 KiB.
     pub fn set_max_buf_size(mut self, val: usize) -> Self {
         self.max_buf_size = val;
         self
     }
 
     #[must_use]
-    /// Set server keep-alive setting.
+    /// Sets the maximum size of an HTTP/1 request or status line.
     ///
-    /// By default keep alive is set to a 5 seconds.
+    /// The line, including its line end, may occupy up to and including this
+    /// number of bytes. Requests with a longer request line are rejected with
+    /// `414 URI Too Long`. The line is also limited by
+    /// [`set_max_buf_size`](Self::set_max_buf_size). The default is 16 KiB.
+    pub fn set_max_start_line_size(mut self, val: usize) -> Self {
+        self.max_start_line_size = val;
+        self
+    }
+
+    #[must_use]
+    /// Sets the server keep-alive behavior.
+    ///
+    /// By default, idle persistent connections are closed after five seconds.
+    /// The keep-alive timeout does not apply before the first request. If
+    /// request-head timing is disabled, it also bounds a partially received
+    /// request head after the first request.
     pub fn set_keepalive<W: Into<KeepAlive>>(mut self, val: W) -> Self {
         let (keep_alive, ka_enabled) = match val.into() {
             KeepAlive::Timeout(val) => (val, true),
@@ -140,11 +172,12 @@ impl HttpServiceConfig {
     }
 
     #[must_use]
-    /// Set keep-alive timeout in seconds.
+    /// Sets the keep-alive timeout.
     ///
-    /// To disable timeout set value to 0.
-    ///
-    /// By default keep-alive timeout is set to 30 seconds.
+    /// A zero duration disables persistent connections rather than selecting
+    /// an unlimited timeout. Use [`KeepAlive::Os`] with
+    /// [`set_keepalive`](Self::set_keepalive) to leave connection lifetime to
+    /// the peer or operating system. The default is five seconds.
     pub fn set_keepalive_timeout(mut self, timeout: Seconds) -> Self {
         self.keep_alive = timeout;
         self.ka_enabled = !timeout.is_zero();
@@ -152,23 +185,33 @@ impl HttpServiceConfig {
     }
 
     #[must_use]
-    /// Set request headers read timeout.
+    /// Sets the initial timeout for reading request headers.
     ///
-    /// Defines a timeout for reading client request header. If a client does not transmit
-    /// the entire set headers within this time, the request is terminated with
-    /// the 408 (Request Time-out) error.
+    /// A new connection must send the first byte of its first request within
+    /// this period, otherwise it is rejected with `408 Request Timeout`. The
+    /// request-head read rate starts with that byte, and this period is also
+    /// its measurement interval. A zero duration disables header-read timing.
+    /// A new connection can then wait indefinitely for its first request,
+    /// while on a persistent connection the keep-alive timeout bounds both
+    /// waiting for the next request and reading its head. The default is one
+    /// second.
     ///
-    /// To disable timeout set value to 0.
+    /// HTTP/1 timers have one-second resolution, a timeout can expire up to
+    /// one second later than configured.
     ///
-    /// By default client timeout is set to 3 seconds.
+    /// This sets the measurement interval of the request-head read rate. The
+    /// cumulative limit and required rate configured by
+    /// [`set_headers_read_rate`](Self::set_headers_read_rate) are kept. If
+    /// header-read timing was disabled, it is enabled again with the default
+    /// rate of 256 bytes and a cumulative limit of `timeout` plus 15 seconds.
     pub fn set_client_timeout(mut self, timeout: Seconds) -> Self {
         if timeout.is_zero() {
             self.headers_read_rate = None;
         } else {
             let mut rate = self.headers_read_rate.unwrap_or(FrameReadRate {
                 rate: 256,
-                timeout: Seconds(5),
-                max_timeout: Seconds(15),
+                timeout,
+                max_timeout: timeout + Seconds(15),
             });
             rate.timeout = timeout;
             self.headers_read_rate = Some(rate);
@@ -177,13 +220,125 @@ impl HttpServiceConfig {
     }
 
     #[must_use]
-    /// Set read rate parameters for request headers.
+    /// Sets the HTTP/1 write backpressure timeout.
     ///
-    /// Set read timeout, max timeout and rate for reading request headers. If the client
-    /// sends `rate` amount of data within `timeout` period of time, extend timeout by `timeout` seconds.
-    /// But no more than `max_timeout` timeout.
+    /// Write backpressure is enabled when outstanding output reaches the I/O
+    /// write buffer high watermark, and disabled once the peer has accepted
+    /// enough of it. If backpressure is still enabled when the timeout
+    /// expires, the connection is closed, and the HTTP/1 control service
+    /// receives a peer-gone event with an [`io::ErrorKind::TimedOut`](std::io::ErrorKind::TimedOut)
+    /// error. An unfinished request payload stream receives a
+    /// [`PayloadError::Io`](crate::http::error::PayloadError::Io) with the
+    /// same error kind. Each backpressure period starts a fresh timeout.
     ///
-    /// By default headers read rate is set to 1sec with max timeout 5sec.
+    /// Without a write timeout, a client that stops reading responses can hold
+    /// the connection open indefinitely. Payload read-rate timing is paused
+    /// during write backpressure and resumes once it is disabled.
+    ///
+    /// Timers have one-second resolution, the timeout can expire up to one
+    /// second later than configured. A zero duration disables the timeout. It
+    /// is disabled by default.
+    pub fn set_write_timeout(mut self, timeout: Seconds) -> Self {
+        self.write_timeout = timeout;
+        self
+    }
+
+    #[must_use]
+    /// Keeps streaming an HTTP/1 response after the client half-closes the
+    /// connection.
+    ///
+    /// A client that closes its side of the connection is treated as gone:
+    /// when the read side reaches EOF, all buffered requests are handled and
+    /// the response body has no data ready, the dispatcher drops the body and
+    /// closes the connection. Otherwise an idle streaming response, e.g.
+    /// server-sent events, would hold the connection until the body produces
+    /// its next chunk.
+    ///
+    /// Enable this for clients that shut down their write side after sending
+    /// the request and still expect the full response. Such a response then
+    /// ends only when the body completes or a write fails. Responses that are
+    /// ready are sent either way. This setting does not affect HTTP/2. It is
+    /// disabled by default.
+    pub fn set_half_close(mut self, enabled: bool) -> Self {
+        self.half_close = enabled;
+        self
+    }
+
+    #[must_use]
+    /// Preserves headers in their original order and casing.
+    ///
+    /// When enabled, decoded headers are additionally copied into
+    /// [`RequestHead::headers_vec`](crate::http::RequestHead::headers_vec) or
+    /// [`ResponseHead::headers_vec`](crate::http::ResponseHead::headers_vec).
+    /// The normal header map remains populated. This is disabled by default.
+    pub fn set_headers_vec(mut self, enabled: bool) -> Self {
+        self.headers_vec = enabled;
+        self
+    }
+
+    #[must_use]
+    /// Enables validation of the HTTP/1 `Host` request header.
+    ///
+    /// When enabled, requests are rejected with `400 Bad Request` if they
+    /// contain more than one `Host` header or a `Host` value that is not a
+    /// valid host and optional port. HTTP/1.1 requests without a `Host`
+    /// header are rejected as well, see
+    /// [RFC 9112 section 3.2](https://www.rfc-editor.org/rfc/rfc9112#section-3.2).
+    /// An empty `Host` value is accepted. This setting does not affect HTTP/2.
+    /// It is enabled by default.
+    pub fn set_host_validation(mut self, enabled: bool) -> Self {
+        self.validate_host = enabled;
+        self
+    }
+
+    #[must_use]
+    /// Sets read-rate limits for request headers.
+    ///
+    /// This setting protects HTTP/1 connections from clients that send a
+    /// request line or headers too slowly. The timer starts when the first
+    /// bytes of a request head arrive, on a new connection as well as on a
+    /// persistent one. Until the first byte of the first request arrives, a
+    /// new connection waits for at most one `timeout` interval, the
+    /// [client timeout](Self::set_client_timeout), without rate extension.
+    ///
+    /// `timeout` is the duration of one measurement interval. When an interval
+    /// expires, the dispatcher grants another interval only if more than
+    /// `rate` new bytes were received. The request head must complete before
+    /// the cumulative `max_timeout` is exhausted. All newly received
+    /// request-head bytes count toward progress, including request-line and
+    /// header bytes that the incremental parser has already consumed.
+    ///
+    /// A zero `timeout` disables request-head timing. The first request of a
+    /// connection is then unbounded, and the keep-alive timeout bounds waiting
+    /// for and reading each following request head. A zero `max_timeout`
+    /// removes the cumulative limit, allowing the deadline to be extended
+    /// indefinitely while the required read rate is maintained. When
+    /// `max_timeout` is not an exact multiple of `timeout`, the final
+    /// measurement interval is shortened so the cumulative limit is not
+    /// exceeded. Intervals have one-second resolution and can expire up to one
+    /// second later than configured.
+    ///
+    /// If the request head misses its deadline, the HTTP/1 control service
+    /// receives
+    /// [`ProtocolError::SlowRequestTimeout`](crate::http::h1::ProtocolError::SlowRequestTimeout).
+    /// The default control service responds with `408 Request Timeout` and
+    /// closes the connection.
+    ///
+    /// By default, the timeout is 1 second and the maximum timeout is 16
+    /// seconds, with more than 256 bytes required for each extension.
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// use ntex::http::HttpServiceConfig;
+    /// use ntex::time::Seconds;
+    ///
+    /// let config = HttpServiceConfig::new().set_headers_read_rate(
+    ///     Seconds(2),  // measurement interval
+    ///     Seconds(10), // maximum time for one request head
+    ///     512,         // bytes required to extend the deadline for next 2 seconds
+    /// );
+    /// ```
     pub fn set_headers_read_rate(
         mut self,
         timeout: Seconds,
@@ -203,13 +358,58 @@ impl HttpServiceConfig {
     }
 
     #[must_use]
-    /// Set read rate parameters for request's payload.
+    /// Sets read-rate limits for request payloads.
     ///
-    /// Set read timeout, max timeout and rate for reading payload. If the client
-    /// sends `rate` amount of data within `timeout` period of time, extend timeout by `timeout` seconds.
-    /// But no more than `max_timeout` timeout.
+    /// This setting protects HTTP/1 connections from clients that send a
+    /// request body too slowly. The timer starts when the dispatcher begins
+    /// decoding a request payload. For a request with `Expect: 100-continue`,
+    /// it starts only once `100 Continue` has been sent, the request has been
+    /// passed to the application, or a response has been sent and the rest of
+    /// the payload is read, because the client does not send the body before
+    /// that. At the end of each `timeout` interval, another interval is
+    /// granted only if more than `rate` bytes were decoded.
     ///
-    /// By default payload read rate is disabled.
+    /// The timer runs only while the dispatcher can read and forward payload
+    /// data. It is paused while application payload backpressure or response
+    /// write backpressure prevents further reads, so those conditions are not
+    /// treated as a slow network peer. Write backpressure is bounded by the
+    /// [write timeout](Self::set_write_timeout). Pausing preserves the unused
+    /// portion of the current measurement interval, and resuming continues
+    /// that interval rather than starting a new one, so the bytes decoded
+    /// before and after the pause are measured together. If the interval
+    /// expired before the pause, already received payload data is decoded
+    /// on resume and then the read rate is checked. The timer stops when the
+    /// complete payload has been decoded.
+    ///
+    /// A zero `timeout` disables payload timing. A zero `max_timeout` removes
+    /// the cumulative limit, allowing the deadline to be extended indefinitely
+    /// while the required read rate is maintained. When `max_timeout` is not
+    /// an exact multiple of `timeout`, the final measurement interval is
+    /// shortened so the cumulative limit is not exceeded. Intervals have
+    /// one-second resolution and can expire up to one second later than
+    /// configured.
+    ///
+    /// If the payload misses its deadline, its stream receives a timed-out
+    /// [`PayloadError`](crate::http::error::PayloadError), and the HTTP/1
+    /// control service receives
+    /// [`ProtocolError::SlowPayloadTimeout`](crate::http::h1::ProtocolError::SlowPayloadTimeout).
+    /// The default control service responds with `408 Request Timeout` and
+    /// closes the connection.
+    ///
+    /// Payload read-rate limiting is disabled by default.
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// use ntex::http::HttpServiceConfig;
+    /// use ntex::time::Seconds;
+    ///
+    /// let config = HttpServiceConfig::new().set_payload_read_rate(
+    ///     Seconds(2),  // measurement interval
+    ///     Seconds(30), // maximum time for one request payload
+    ///     1024,        // bytes required to extend the deadline
+    /// );
+    /// ```
     pub fn set_payload_read_rate(
         mut self,
         timeout: Seconds,
@@ -237,61 +437,104 @@ bitflags::bitflags! {
     }
 }
 
-pub(super) struct DispatcherConfig<S, C> {
+#[derive(Clone)]
+pub(super) struct DispatcherConfig(Rc<DispatcherConfigInner>);
+
+struct DispatcherConfigInner {
     flags: Cell<Flags>,
-    pub(super) idx: Cell<usize>,
-    pub(super) config: Cfg<HttpServiceConfig>,
-    pub(super) service: Pipeline<S>,
-    pub(super) control: Pipeline<C>,
+    idx: Cell<usize>,
+    pub(super) inflight: RefCell<HashSet<IoRef>>,
+    rx: Cell<Option<oneshot::Receiver<()>>>,
+    tx: Cell<Option<oneshot::Sender<()>>>,
 }
 
-impl<S, C> DispatcherConfig<S, C> {
-    pub(super) fn new(config: Cfg<HttpServiceConfig>, service: S, control: C) -> Self {
-        DispatcherConfig {
-            idx: Cell::new(0),
-            service: service.into(),
-            control: control.into(),
-            flags: Cell::new(Flags::empty()),
-            config,
-        }
-    }
+impl Default for DispatcherConfig {
+    fn default() -> Self {
+        let (tx, rx) = oneshot::channel();
 
+        DispatcherConfig(Rc::new(DispatcherConfigInner {
+            idx: Cell::new(0),
+            flags: Cell::new(Flags::empty()),
+            rx: Cell::new(Some(rx)),
+            tx: Cell::new(Some(tx)),
+            inflight: RefCell::new(HashSet::default()),
+        }))
+    }
+}
+
+impl DispatcherConfig {
     /// Get connection id
     pub(super) fn next_id(&self) -> usize {
-        let id = self.idx.get();
-        self.idx.set(id + 1);
+        let id = self.0.idx.get();
+        self.0.idx.set(id + 1);
         id
     }
 
-    /// Return state of connection keep-alive functionality
-    pub(super) fn keep_alive(&self) -> Seconds {
-        self.config.keep_alive
-    }
-
-    /// Return state of connection keep-alive functionality
-    pub(super) fn keep_alive_enabled(&self) -> bool {
-        self.config.ka_enabled
-    }
-
-    pub(super) fn headers_read_rate(&self) -> Option<&FrameReadRate> {
-        self.config.headers_read_rate.as_ref()
-    }
-
-    pub(super) fn payload_read_rate(&self) -> Option<&FrameReadRate> {
-        self.config.payload_read_rate.as_ref()
+    /// Registers an in-flight connection.
+    ///
+    /// Returns the guard that unregisters the connection when dropped, and
+    /// the number of in-flight connections.
+    pub(super) fn insert_io(&self, io: &IoRef) -> (InflightGuard, usize) {
+        let mut inflight = self.0.inflight.borrow_mut();
+        inflight.insert(io.clone());
+        let guard = InflightGuard {
+            config: self.clone(),
+            io: io.clone(),
+        };
+        (guard, inflight.len())
     }
 
     /// Service is shutting down
     pub(super) fn is_shutdown(&self) -> bool {
-        self.flags.get().contains(Flags::SHUTDOWN)
+        self.0.flags.get().contains(Flags::SHUTDOWN)
     }
 
-    pub(super) fn shutdown(&self) {
+    pub(super) fn shutdown(&self) -> usize {
         ntex_h2::ServiceConfig::shutdown();
 
-        let mut flags = self.flags.get();
+        let mut flags = self.0.flags.get();
         flags.insert(Flags::SHUTDOWN);
-        self.flags.set(flags);
+        self.0.flags.set(flags);
+
+        let inflight = self.0.inflight.borrow();
+        for io in inflight.iter() {
+            io.notify_dispatcher();
+        }
+        inflight.len()
+    }
+
+    pub(super) async fn wait_shutdown(&self) {
+        if let Some(rx) = self.0.rx.take() {
+            let _ = rx.await;
+        }
+    }
+
+    pub(super) fn notify_shutdown(&self) {
+        if let Some(tx) = self.0.tx.take() {
+            let _ = tx.send(());
+        }
+    }
+}
+
+/// Unregisters an in-flight connection when dropped.
+///
+/// The connection is unregistered even if its future is dropped before it
+/// completes, a pending shutdown is notified once no connections are left.
+pub(super) struct InflightGuard {
+    config: DispatcherConfig,
+    io: IoRef,
+}
+
+impl Drop for InflightGuard {
+    fn drop(&mut self) {
+        let inflight = {
+            let mut inflight = self.config.0.inflight.borrow_mut();
+            inflight.remove(&self.io);
+            inflight.len()
+        };
+        if inflight == 0 && self.config.is_shutdown() {
+            self.config.notify_shutdown();
+        }
     }
 }
 
@@ -300,6 +543,11 @@ const DATE_VALUE_DEFAULT: [u8; DATE_VALUE_LENGTH_HDR] =
     *b"date: 00000000000000000000000000000\r\n\r\n";
 
 #[derive(Debug, Copy, Clone)]
+/// Generates the cached HTTP `Date` header used by the protocol encoders.
+///
+/// The cached value is refreshed periodically and avoids formatting the
+/// current system time for every response. Applications normally do not need
+/// to use this type directly.
 pub struct DateService;
 
 thread_local! {
@@ -311,6 +559,7 @@ struct DateServiceInner {
     current: Cell<bool>,
     current_time: Cell<time::Instant>,
     current_date: Cell<[u8; DATE_VALUE_LENGTH_HDR]>,
+    current_value: RefCell<Option<HeaderValue>>,
 }
 
 impl DateServiceInner {
@@ -319,6 +568,7 @@ impl DateServiceInner {
             current: Cell::new(false),
             current_time: Cell::new(time::Instant::now()),
             current_date: Cell::new(DATE_VALUE_DEFAULT),
+            current_value: RefCell::new(None),
         }
     }
 
@@ -330,6 +580,7 @@ impl DateServiceInner {
         let dt = httpdate::HttpDate::from(time::SystemTime::now()).to_string();
         bytes[6..35].copy_from_slice(dt.as_ref());
         self.current_date.set(bytes);
+        *self.current_value.borrow_mut() = None;
     }
 }
 
@@ -340,7 +591,7 @@ impl DateService {
                 date.update();
 
                 // periodic date update
-                crate::rt::spawn(async move {
+                crate::rt::spawn_detached(async move {
                     sleep(Millis(500)).await;
                     DATE.with(|date| {
                         date.current.set(false);
@@ -350,12 +601,21 @@ impl DateService {
         });
     }
 
-    pub(super) fn set_date<F: FnMut(&[u8])>(mut f: F) {
+    /// Returns the current date as a `Date` header value.
+    ///
+    /// The value is shared until the next date update.
+    pub(super) fn header_value() -> HeaderValue {
         DateService::check_date();
         DATE.with(|date| {
-            let date = date.current_date.get();
-            f(&date[6..35]);
-        });
+            date.current_value
+                .borrow_mut()
+                .get_or_insert_with(|| {
+                    let bytes = Bytes::copy_from_slice(&date.current_date.get()[6..35]);
+                    // SAFETY: the formatted date is visible ASCII
+                    unsafe { HeaderValue::from_shared_unchecked(bytes) }
+                })
+                .clone()
+        })
     }
 
     #[doc(hidden)]
@@ -400,6 +660,14 @@ mod tests {
         let mut buf2 = BytesMut::with_capacity(DATE_VALUE_LENGTH_HDR);
         DateService.bset_date_header(&mut buf2);
         assert_eq!(buf1, buf2);
+
+        // the header value is the cached date
+        let value = DateService::header_value();
+        assert_eq!(value.as_bytes(), &buf1[6..35]);
+        assert_eq!(DateService::header_value(), value);
+        DATE.with(DateServiceInner::update);
+        assert!(DATE.with(|date| date.current_value.borrow().is_none()));
+        assert_eq!(DateService::header_value().len(), 29);
     }
 
     #[test]
@@ -409,5 +677,39 @@ mod tests {
             KeepAlive::Timeout(Seconds(10)),
             Option::<usize>::Some(10).into()
         );
+    }
+
+    #[test]
+    fn keep_alive_settings() {
+        let cfg = HttpServiceConfig::new().set_keepalive(KeepAlive::Os);
+        assert_eq!(cfg.keep_alive, Seconds::ZERO);
+        assert!(cfg.ka_enabled);
+
+        let cfg = HttpServiceConfig::new().set_keepalive(KeepAlive::Disabled);
+        assert_eq!(cfg.keep_alive, Seconds::ZERO);
+        assert!(!cfg.ka_enabled);
+
+        let cfg = HttpServiceConfig::new().set_keepalive_timeout(Seconds(30));
+        assert_eq!(cfg.keep_alive, Seconds(30));
+        assert!(cfg.ka_enabled);
+
+        let cfg = HttpServiceConfig::new().set_keepalive_timeout(Seconds::ZERO);
+        assert_eq!(cfg.keep_alive, Seconds::ZERO);
+        assert!(!cfg.ka_enabled);
+    }
+
+    #[test]
+    fn read_rate_settings() {
+        let cfg = HttpServiceConfig::new()
+            .set_headers_read_rate(Seconds(1), Seconds(5), 128)
+            .set_payload_read_rate(Seconds(1), Seconds(5), 128);
+        assert!(cfg.headers_read_rate.is_some());
+        assert!(cfg.payload_read_rate.is_some());
+
+        let cfg = cfg
+            .set_headers_read_rate(Seconds::ZERO, Seconds(5), 128)
+            .set_payload_read_rate(Seconds::ZERO, Seconds(5), 128);
+        assert!(cfg.headers_read_rate.is_none());
+        assert!(cfg.payload_read_rate.is_none());
     }
 }

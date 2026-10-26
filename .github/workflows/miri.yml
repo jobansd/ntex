@@ -32,10 +32,34 @@ jobs:
         # Run all of your tests inside of Miri interpreter
         run: cargo miri test -p ntex-bytes
 
+      - name: Run Miri (bytes, tracker)
+        run: cargo miri test -p ntex-bytes --features tracker
+
+      - name: Run Miri (bytes, big-endian)
+        continue-on-error: true
+        run: cargo miri test -p ntex-bytes --target s390x-unknown-linux-gnu
+
       - name: Run Miri (ntex-service::cfg)
         # Run all of your tests inside of Miri interpreter
         run: cargo miri test -p ntex-service -- --test "cfg::tests::"
 
+      - name: Run Miri (ntex-service::pipeline)
+        # Pipelines are self-referential, which Stacked Borrows rejects
+        env:
+          MIRIFLAGS: -Zmiri-disable-stacked-borrows
+        run: cargo miri test -p ntex-service -- --test "miri_"
+
       - name: Run Miri (ntex-io)
         # Run all of your tests inside of Miri interpreter
         run: cargo miri test -p ntex-io -- --test "miri_"
+
+      - name: Run Miri (ntex-rt runtime task)
+        # the runtime and task tests, stress tests run fewer iterations
+        env:
+          MIRIFLAGS: -Zmiri-disable-isolation -Zmiri-many-seeds=0..8
+        run: cargo miri test -p ntex-rt --lib -- "rt::"
+
+      - name: Run loom (ntex-rt runtime task)
+        env:
+          RUSTFLAGS: --cfg ntex_loom
+        run: cargo test --release -p ntex-rt --lib -- task_loom

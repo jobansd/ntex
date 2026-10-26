@@ -1,26 +1,30 @@
-//! Test server
+//! Test server utilities.
 #![allow(clippy::missing_panics_doc)]
-use std::{fmt, io, marker::PhantomData, net, thread, time};
+use std::{fmt, io, marker::PhantomData, net, rc::Rc, thread, time};
 
 use ntex_io::{Io, IoConfig};
 use ntex_net::tcp_connect;
 use ntex_rt::System;
-use ntex_service::{ServiceFactory, cfg::SharedCfg};
+use ntex_service::{IntoService, Service, cfg::SharedCfg};
 use socket2::{Domain, SockAddr, Socket, Type};
 use uuid::Uuid;
 
-use super::{Server, ServerBuilder};
+use super::{NoConfig, Server, ServerAppConfig, ServerBuilder};
 
-/// Test server builder
-pub struct TestServerBuilder<F, R> {
+/// Builder for a single-worker test server.
+///
+/// The server listens on an ephemeral `127.0.0.1` port and runs in a separate
+/// thread with its own runtime.
+pub struct TestServerBuilder<Cfg, F, Sf, I> {
     id: Uuid,
+    cfg: Cfg,
     factory: F,
     config: SharedCfg,
     client_config: SharedCfg,
-    _t: PhantomData<R>,
+    _t: PhantomData<(Sf, I)>,
 }
 
-impl<F, R> fmt::Debug for TestServerBuilder<F, R> {
+impl<Cfg, F, Sf, I> fmt::Debug for TestServerBuilder<Cfg, F, Sf, I> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("TestServerBuilder")
             .field("id", &self.id)
@@ -30,15 +34,38 @@ impl<F, R> fmt::Debug for TestServerBuilder<F, R> {
     }
 }
 
-impl<F, R> TestServerBuilder<F, R>
+impl<F, S, I> TestServerBuilder<NoConfig, F, S, I>
 where
-    F: AsyncFn() -> R + Send + Clone + 'static,
-    R: ServiceFactory<Io, SharedCfg> + 'static,
+    F: AsyncFn() -> I + Send + Clone + 'static,
+    I: IntoService<S, (), Io> + 'static,
+    S: Service<(), Io> + 'static,
 {
     #[must_use]
-    /// Create test server builder
+    /// Creates a test server builder for the specified service factory.
     pub fn new(factory: F) -> Self {
         Self {
+            factory,
+            id: Uuid::now_v7(),
+            cfg: NoConfig,
+            config: SharedCfg::new("TEST-SERVER").into(),
+            client_config: SharedCfg::new("TEST-CLIENT").into(),
+            _t: PhantomData,
+        }
+    }
+}
+
+impl<Cfg, F, S, I> TestServerBuilder<Cfg, F, S, I>
+where
+    F: AsyncFn() -> I + Send + Clone + 'static,
+    I: IntoService<S, Cfg::State, Io> + 'static,
+    S: Service<Cfg::State, Io> + 'static,
+    Cfg: ServerAppConfig + 'static,
+{
+    #[must_use]
+    /// Creates a test server builder with application configuration.
+    pub fn with(cfg: Cfg, factory: F) -> Self {
+        Self {
+            cfg,
             factory,
             id: Uuid::now_v7(),
             config: SharedCfg::new("TEST-SERVER").into(),
@@ -48,44 +75,43 @@ where
     }
 
     #[must_use]
-    /// Set server io configuration
+    /// Sets the I/O configuration for accepted server connections.
     pub fn config<T: Into<SharedCfg>>(mut self, cfg: T) -> Self {
         self.config = cfg.into();
         self
     }
 
     #[must_use]
-    /// Set client io configuration
+    /// Sets the I/O configuration used by [`TestServer::connect`].
     pub fn client_config<T: Into<SharedCfg>>(mut self, cfg: T) -> Self {
         self.client_config = cfg.into();
         self
     }
 
-    /// Start test server
+    /// Starts the test server and returns its controller.
     pub fn start(self) -> TestServer {
         log::debug!("Starting test server {:?}", self.id);
+        let cfg = self.cfg;
         let config = self.config;
         let factory = self.factory;
-        let cfg = System::current().config();
+        let sys_cfg = System::current().config();
         let name = System::current().name().to_string();
 
         let (tx, rx) = oneshot::channel();
         // run server in separate thread
         thread::spawn(move || {
-            let sys = System::with_config(&name, cfg);
+            let sys = System::with_config(&name, sys_cfg);
             let tcp = net::TcpListener::bind("127.0.0.1:0").unwrap();
             let local_addr = tcp.local_addr().unwrap();
 
             sys.run(move || {
-                let server = Server::builder()
-                    .listen("test", tcp, async move |_| factory().await)?
-                    .config("test", config)
+                let server = ServerBuilder::new(cfg)
+                    .listen("test", tcp, config, async move |_| factory().await)?
                     .workers(1)
                     .disable_signals()
-                    .enable_affinity()
                     .run();
 
-                ntex_rt::spawn(async move {
+                ntex_rt::spawn_detached(async move {
                     tx.send((System::current(), local_addr, server))
                         .expect("Failed to send Server to TestServer");
                 });
@@ -98,18 +124,20 @@ where
 
         TestServer {
             addr,
-            server,
-            system,
-            id: self.id,
-            cfg: self.client_config,
+            inner: Rc::new(TestServerInner {
+                server,
+                system,
+                id: self.id,
+                cfg: self.client_config,
+            }),
         }
     }
 }
 
-/// Start test server
+/// Starts a test server for the specified service factory.
 ///
-/// `TestServer` is very simple test server that simplify process of writing
-/// integration tests cases for ntex web applications.
+/// [`TestServer`] is a simple server that makes it easier to write
+/// integration tests for ntex applications.
 ///
 /// # Examples
 ///
@@ -123,32 +151,37 @@ where
 ///
 /// #[ntex::test]
 /// async fn test_example() {
-///     let mut srv = server::test_server(
+///     let srv = server::test_server(
 ///         async || http::HttpService::new(
 ///             App::new().service(
 ///                 web::resource("/").to(my_handler))
 ///         )
 ///     );
 ///
-///     let req = Client::new().get("http://127.0.0.1:{}", srv.addr().port());
+///     let req = Client::new().get(format!("http://127.0.0.1:{}", srv.addr().port()).as_str());
 ///     let response = req.send().await.unwrap();
 ///     assert!(response.status().is_success());
 /// }
 /// ```
-pub fn test_server<F, R>(factory: F) -> TestServer
+pub fn test_server<F, S>(factory: F) -> TestServer
 where
-    F: AsyncFn() -> R + Send + Clone + 'static,
-    R: ServiceFactory<Io, SharedCfg> + 'static,
+    F: AsyncFn() -> S + Send + Clone + 'static,
+    S: Service<(), Io> + 'static,
 {
     TestServerBuilder::new(factory).start()
 }
 
-/// Start new server with server builder
-pub fn build_test_server<F>(factory: F) -> TestServer
+/// Starts a test server configured by a server builder.
+///
+/// `factory` receives a single-worker builder with signals disabled and must
+/// register the listeners. The returned server's address is `127.0.0.1:0`;
+/// call [`TestServer::set_addr`] before using [`TestServer::connect`].
+pub fn build_test_server<Cfg, F>(cfg: Cfg, factory: F) -> TestServer
 where
-    F: AsyncFnOnce(ServerBuilder) -> ServerBuilder + Send + 'static,
+    Cfg: ServerAppConfig,
+    F: AsyncFnOnce(ServerBuilder<Cfg>) -> ServerBuilder<Cfg> + Send + 'static,
 {
-    let cfg = System::current().config();
+    let sys = System::current().config();
     let name = System::current().name().to_string();
 
     let id = Uuid::now_v7();
@@ -158,10 +191,10 @@ where
 
     // run server in separate thread
     thread::spawn(move || {
-        let sys = System::with_config(&name, cfg);
+        let sys = System::with_config(&name, sys);
 
         sys.block_on(async move {
-            let server = factory(super::build())
+            let server = factory(ServerBuilder::new(cfg))
                 .await
                 .workers(1)
                 .disable_signals()
@@ -175,52 +208,68 @@ where
     thread::sleep(time::Duration::from_millis(25));
 
     TestServer {
-        id,
-        system,
-        server,
         addr: "127.0.0.1:0".parse().unwrap(),
-        cfg: SharedCfg::new("TEST-CLIENT").add(IoConfig::new()).into(),
+        inner: Rc::new(TestServerInner {
+            id,
+            system,
+            server,
+            cfg: SharedCfg::new("TEST-CLIENT").add(IoConfig::new()).into(),
+        }),
     }
 }
 
-#[derive(Debug)]
-/// Test server controller
+#[derive(Clone, Debug)]
+/// Test server controller.
+///
+/// Dropping the last clone stops the server and its runtime, blocking the
+/// current thread for about 100 ms.
 pub struct TestServer {
-    id: Uuid,
     addr: net::SocketAddr,
+    inner: Rc<TestServerInner>,
+}
+
+#[derive(Debug)]
+struct TestServerInner {
+    id: Uuid,
     system: System,
     server: Server,
     cfg: SharedCfg,
 }
 
 impl TestServer {
-    /// Test server socket addr
+    /// Returns the server address.
     pub fn addr(&self) -> net::SocketAddr {
         self.addr
     }
 
     #[must_use]
+    /// Sets the address used by [`connect`](Self::connect).
     pub fn set_addr(mut self, addr: net::SocketAddr) -> Self {
         self.addr = addr;
         self
     }
 
-    /// Test client shared config
+    /// Returns the client I/O configuration.
     pub fn config(&self) -> SharedCfg {
-        self.cfg.clone()
+        self.inner.cfg.clone()
     }
 
-    /// Connect to server, return Io
+    /// Connects to the server address.
     pub async fn connect(&self) -> io::Result<Io> {
-        tcp_connect(self.addr, self.cfg.clone()).await
+        tcp_connect(self.addr, self.inner.cfg.clone()).await
     }
 
-    /// Stop http server by stopping the runtime.
+    /// Requests a graceful server stop.
+    ///
+    /// Returns without waiting for the stop to complete.
     pub fn stop(&self) {
-        drop(self.server.stop(true));
+        drop(self.inner.server.stop(true));
     }
 
-    /// Get first available unused address
+    /// Returns a currently unused local address.
+    ///
+    /// The port is released before this returns, so another process may take
+    /// it first.
     pub fn unused_addr() -> net::SocketAddr {
         let addr: net::SocketAddr = "127.0.0.1:0".parse().unwrap();
         let socket = Socket::new(Domain::IPV4, Type::STREAM, None).unwrap();
@@ -230,15 +279,15 @@ impl TestServer {
         tcp.local_addr().unwrap()
     }
 
-    /// Get access to the running Server
+    /// Returns the running server controller.
     pub fn server(&self) -> Server {
-        self.server.clone()
+        self.inner.server.clone()
     }
 }
 
-impl Drop for TestServer {
+impl Drop for TestServerInner {
     fn drop(&mut self) {
-        log::debug!("Stopping test server {:?}", self.id);
+        log::debug!("Stopping test server (dropped) {:?}", self.id);
         drop(self.server.stop(false));
         thread::sleep(time::Duration::from_millis(75));
         self.system.stop();

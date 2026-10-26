@@ -1,5 +1,161 @@
 # Changes
 
+## [4.4.0] - 2026-10-21
+
+* Subscribe TLS acceptors to the max handshake counter in `Service::bind`, so
+  cached readiness is invalidated when the counter fills or frees a slot
+
+* rustls: stop feeding an empty ciphertext buffer to the session after the
+  input is drained, saving a read/process cycle per read and no longer
+  signalling a false transport EOF to rustls
+
+* openssl: join small write pages in a per-thread staging buffer instead of
+  allocating 16 KiB for every joined record, unwritten bytes are kept for retry
+
+* Defer peer-close shutdown until mutable TLS state and buffer borrows are
+  released in all backends, preventing aliasing with inline read-task wakers
+
+* schannel: scan fragmented handshake records without copying while a message
+  is incomplete, and repack completed messages directly from the received
+  records with a single copy
+
+* schannel: borrow single-record handshake input during coalescing and SNI
+  extraction, avoiding temporary payload copies while retaining fragmented
+  handshake support and input limits
+
+* schannel: support custom connectors returning filtered I/O, preserving the
+  existing filter chain beneath TLS
+
+* schannel: release opened CNG key handles when deleting a temporary private
+  key fails, including certificate-setup rollback, and log cleanup failures
+
+* schannel: reject empty plaintext handshake records and limit handshake
+  reassembly to 64 KiB per message and 1024 records, preventing unbounded
+  ciphertext buffering and repeated parsing while waiting for a message
+
+* rustls: batch up to 32 queued plaintext pages per write without a gathering
+  copy, reducing TLS records for many small pages while retaining partial writes
+
+## [4.3.1] - 2026-10-07
+
+* Use new BytesMut allocation api
+
+## [4.3.0] - 2026-10-06
+
+* openssl: `use_global_allocator()` routes OpenSSL allocations to the Rust global allocator
+
+## [4.2.0] - 2026-10-04
+
+* Add `PeerCertDer` and `PeerCertChainDer` queries supported by all tls filters
+
+* Share handshake, timeout and alpn handling between the tls filters: a rustls handshake interrupted by eof fails with `UnexpectedEof` instead of `NotConnected`, only the exact `h2` alpn protocol selects http/2, schannel connect errors carry the service name
+
+## [4.1.0] - 2026-10-01
+
+* openssl: do not drop application data when a write reports `WANT_READ`
+  during a handshake, the write is retried later
+
+* openssl: reading does not report already buffered output as output produced
+  by reading, which paused reads while the write buffer was full
+
+* openssl: join small write buffer pages into one TLS record, e.g. response
+  headers and a body up to 16 KiB are sent as one record instead of two
+
+* rustls: write two consecutive write buffer pages into one TLS record when
+  they fit, and move pending records out before each write so they do not
+  shrink the next record
+
+* schannel: add `TlsAcceptor` and `accept()` for server connections, configured
+  by `ServerConfig` with ALPN, SNI (`Servername`) and optional client certificates
+
+* schannel: the server repacks a client handshake message fragmented over several
+  records into one record, Windows Server 2025 fails the handshake otherwise
+
+* schannel: add `ClientConfig::set_client_cert()` with `Certificate::from_store()`,
+  `Certificate::from_store_by_subject()` and `Certificate::from_pkcs12()`
+
+* schannel: do not send a client certificate picked from the user's store,
+  complete the handshake without one when the server requests it
+
+* schannel: enable TLS 1.3 with `SCH_CREDENTIALS` (`SCHANNEL_CRED` before
+  Windows 10 1809), process post-handshake messages (session tickets, key updates,
+  renegotiation) instead of failing the connection, including application data
+  the peer sends during a TLS 1.2 renegotiation
+
+* schannel: share the credentials handle between connections made with the
+  same `ClientConfig`, so Schannel can resume TLS sessions
+
+* schannel: graceful shutdown waits for the peer's `close_notify` (or read eof),
+  like the openssl and rustls filters
+
+* rustls: graceful shutdown waits for the peer's `close_notify` (or read eof),
+  like the openssl filter, instead of completing right after sending its own
+
+* schannel: complete the handshake when the peer's last handshake flight is read
+  together with its eof, instead of failing with `UnexpectedEof`
+
+* schannel: start a graceful shutdown when the peer sends `close_notify`,
+  instead of leaving the connection half-open
+
+* schannel: locate decrypted data and extra input by buffer type instead of
+  fixed `DecryptMessage` buffer positions
+
+* rustls: a zero handshake timeout disables the timeout on the acceptor as
+  documented, instead of failing handshakes that take longer than a timer tick
+
+* rustls: complete the handshake when the peer's last handshake flight is read
+  together with its eof, instead of failing with `NotConnected`
+
+* openssl: a zero handshake timeout disables the timeout on the acceptor as
+  documented, instead of failing handshakes that take longer than a timer tick
+
+* openssl: complete the handshake when the peer's last handshake flight is read
+  together with its eof, instead of failing with `UnexpectedEof`
+
+* schannel: send a fatal alert to the peer when the handshake fails
+
+* schannel: add `ClientConfig::set_alpn_protocols()`, send ALPN only with the ClientHello
+
+* schannel: encrypt records in place into write pages, no per-record allocation and copy
+
+* Fix IPv6 server name extraction in openssl, rustls and schannel connectors
+
+* openssl: enable read-ahead, fewer BIO reads per TLS record
+
+* openssl: read into uninitialized buffer via ssl_read_uninit
+
+* openssl: replace RefCell with UnsafeCell in SslFilter
+
+* schannel: encrypt all pending write pages in one pass, not one record per transport write
+
+* schannel: continue the handshake when a step leaves buffered input
+
+* schannel: send close_notify on shutdown
+
+* schannel: replace RefCell with UnsafeCell in SchannelFilter
+
+* openssl: complete shutdown after a clean peer EOF, its close_notify will never arrive
+
+## [4.0.0] - 2026-09-14
+
+* Migrate to ntex-service 5
+
+## [3.8.0] - 2026-07-17
+
+* Add `schannel` support #904
+
+## [3.7.0] - 2026-06-18
+
+* Add `.connect()` methods for openssl connectors
+
+## [3.6.3] - 2026-06-12
+
+* rustls: Send close_notify on filter shutdown
+
+* rustls: Flush tls records generated while processing incoming data (e.g. KeyUpdate responses)
+
+* rustls: Start io shutdown when peer sends close_notify
+
 ## [3.6.2] - 2026-03-22
 
 * Init connect/accept process before adding to filters

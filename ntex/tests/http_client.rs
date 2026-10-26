@@ -1,20 +1,18 @@
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::{
-    cell::RefCell, collections::HashMap, io, io::Read, io::Write, rc::Rc, sync::Arc,
-};
+use std::{cell::RefCell, collections::HashMap, io, io::Read, io::Write, net, rc::Rc, sync::Arc};
 
 use coo_kie::Cookie;
 use flate2::{Compression, read::GzDecoder, write::GzEncoder, write::ZlibEncoder};
 use rand::Rng;
 
-use ntex::client::{Client, Connector, error::ClientError};
+use ntex::client::{Client, ClientConfig, error::ClientError};
 use ntex::http::test::server as test_server;
 use ntex::http::{HttpMessage, HttpService, Method, Response, header};
 use ntex::io::IoConfig;
-use ntex::service::{ServiceFactory, cfg::SharedCfg, chain_factory, fn_layer};
+use ntex::service::{cfg::SharedCfg, fn_layer, service};
 use ntex::web::middleware::Compress;
-use ntex::web::{self, App, BodyEncoding, Error, HttpRequest, HttpResponse, test};
-use ntex::{client, time::Millis, time::Seconds, time::sleep, util::Bytes, util::Ready};
+use ntex::web::{self, App, BodyEncoding, HttpRequest, HttpResponse, test};
+use ntex::{client, time::Millis, time::Seconds, time::sleep, util::Bytes};
 
 const STR: &str = "Hello World Hello World Hello World Hello World Hello World \
                    Hello World Hello World Hello World Hello World Hello World \
@@ -40,12 +38,9 @@ const STR: &str = "Hello World Hello World Hello World Hello World Hello World \
 
 #[ntex::test]
 async fn test_simple() {
-    let srv = test::server(async || {
-        App::new().service(
-            web::resource("/").route(web::to(|| async { HttpResponse::Ok().body(STR) })),
-        )
-    })
-    .await;
+    let srv = test::server(async |_| {
+        App::new().service(web::resource("/").route(web::to(async || HttpResponse::Ok().body(STR))))
+    });
 
     let request = srv.get("/").header("x-test", "111").send();
     let response = request.await.unwrap();
@@ -65,12 +60,11 @@ async fn test_simple() {
 
 #[ntex::test]
 async fn test_json() {
-    let srv = test::server(async || {
+    let srv = test::server(async |_| {
         App::new().service(web::resource("/").route(web::to(
-            |_: web::types::Json<String>| async { HttpResponse::Ok() },
+            async |_: web::types::Json<String>| HttpResponse::Ok(),
         )))
-    })
-    .await;
+    });
 
     let response = srv
         .get("/")
@@ -83,12 +77,11 @@ async fn test_json() {
 
 #[ntex::test]
 async fn test_form() {
-    let srv = test::server(async || {
+    let srv = test::server(async |_| {
         App::new().service(web::resource("/").route(web::to(
-            |_: web::types::Form<HashMap<String, String>>| async { HttpResponse::Ok() },
+            async |_: web::types::Form<HashMap<String, String>>| HttpResponse::Ok(),
         )))
-    })
-    .await;
+    });
 
     let mut data = HashMap::new();
     let _ = data.insert("key".to_string(), "TEST".to_string());
@@ -100,50 +93,62 @@ async fn test_form() {
 
 #[ntex::test]
 async fn test_timeout() {
-    let srv = test::server(async || {
-        App::new().service(web::resource("/").route(web::to(|| async {
+    let srv = test::server(async |_| {
+        App::new().service(web::resource("/").route(web::to(async || {
             sleep(Millis(5000)).await;
             HttpResponse::Ok().body(STR)
         })))
-    })
-    .await;
+    });
 
-    let connector = Connector::default().connector(ntex::connect::Connector::new());
+    let client = Client::with_config(
+        SharedCfg::new("SVC")
+            .add(IoConfig::new().set_connect_timeout(2500))
+            .add(ClientConfig::new().set_response_timeout(Millis(300))),
+    );
 
-    let client = Client::builder()
-        .connector::<&str>(connector)
-        .response_timeout(Seconds(3))
-        .build(SharedCfg::new("SVC").add(IoConfig::new().set_connect_timeout(2500)))
-        .await
-        .unwrap();
-
-    let request = client.get(srv.url("/")).send().await;
-    match request {
-        Err(ClientError::Timeout) => (),
-        _ => panic!(),
-    }
+    let err = client.get(srv.url("/")).send().await.err().unwrap();
+    assert!(matches!(err.into_error(), ClientError::Timeout));
 }
 
 #[ntex::test]
 async fn test_timeout_override() {
-    let srv = test::server(async || {
-        App::new().service(web::resource("/").route(web::to(|| async {
+    let srv = test::server(async |_| {
+        App::new().service(web::resource("/").route(web::to(async || {
             sleep(Millis(2000)).await;
             HttpResponse::Ok().body(STR)
         })))
-    })
-    .await;
+    });
 
-    let client = Client::builder()
-        .response_timeout(Seconds(50))
-        .build(SharedCfg::default())
+    let client = Client::with_config(ClientConfig::new().set_response_timeout(Seconds(50)));
+
+    let err = client
+        .get(srv.url("/"))
+        .timeout(Millis(200))
+        .send()
+        .await
+        .err();
+    assert!(matches!(err.unwrap().into_error(), ClientError::Timeout));
+}
+
+#[ntex::test]
+async fn test_timeout_disable_override() {
+    let srv = test::server(async |_| {
+        App::new().service(web::resource("/").route(web::to(async || {
+            sleep(Millis(500)).await;
+            HttpResponse::Ok().body(STR)
+        })))
+    });
+
+    let client = Client::with_config(ClientConfig::new().set_response_timeout(Millis(100)));
+
+    // zero disables the client-wide timeout for this request
+    let res = client
+        .get(srv.url("/"))
+        .timeout(Millis::ZERO)
+        .send()
         .await
         .unwrap();
-    let request = client.get(srv.url("/")).timeout(Seconds(1)).send();
-    match request.await {
-        Err(ClientError::Timeout) => (),
-        _ => panic!(),
-    }
+    assert!(res.status().is_success());
 }
 
 #[ntex::test]
@@ -151,23 +156,18 @@ async fn test_connection_reuse() {
     let num = Arc::new(AtomicUsize::new(0));
     let num2 = num.clone();
 
-    let srv = test_server(async move || {
+    let srv = test_server(async move |_| {
         let num2 = num2.clone();
-        chain_factory(move |io| {
+        service(async move |io| {
             num2.fetch_add(1, Ordering::Relaxed);
-            Ready::Ok(io)
+            Ok(io)
         })
-        .and_then(HttpService::new(App::new().service(
-            web::resource("/").route(web::to(|| async { HttpResponse::Ok() })),
-        )))
-    })
-    .await;
+        .and_then(HttpService::new(
+            App::new().service(web::resource("/").route(web::to(async || HttpResponse::Ok()))),
+        ))
+    });
 
-    let client = Client::builder()
-        .response_timeout(Seconds(30))
-        .build(SharedCfg::default())
-        .await
-        .unwrap();
+    let client = Client::with_config(ClientConfig::new().set_response_timeout(Seconds(30)));
 
     // req 1
     let request = client.get(srv.url("/")).send();
@@ -185,11 +185,9 @@ async fn test_connection_reuse() {
 
 #[ntex::test]
 async fn test_connection_close() {
-    let srv = test_server(async move || {
-        HttpService::new(|_| Ready::Ok::<_, io::Error>(Response::Ok().body(STR)))
-            .map(|_| ())
-    })
-    .await;
+    let srv = test_server(async move |_| {
+        HttpService::new(async |_| Ok::<_, io::Error>(Response::Ok().body(STR)))
+    });
 
     let response = srv
         .request(Method::GET, "/")
@@ -205,23 +203,18 @@ async fn test_connection_force_close() {
     let num = Arc::new(AtomicUsize::new(0));
     let num2 = num.clone();
 
-    let srv = test_server(async move || {
+    let srv = test_server(async move |_| {
         let num2 = num2.clone();
-        chain_factory(move |io| {
+        service(async move |io| {
             num2.fetch_add(1, Ordering::Relaxed);
-            Ready::Ok(io)
+            Ok(io)
         })
-        .and_then(HttpService::new(App::new().service(
-            web::resource("/").route(web::to(|| async { HttpResponse::Ok() })),
-        )))
-    })
-    .await;
+        .and_then(HttpService::new(
+            App::new().service(web::resource("/").route(web::to(async || HttpResponse::Ok()))),
+        ))
+    });
 
-    let client = Client::builder()
-        .response_timeout(Seconds(30))
-        .build(SharedCfg::default())
-        .await
-        .unwrap();
+    let client = Client::with_config(ClientConfig::new().set_response_timeout(Seconds(30)));
 
     // req 1
     let request = client.get(srv.url("/")).force_close().send();
@@ -229,11 +222,7 @@ async fn test_connection_force_close() {
     assert!(response.status().is_success());
 
     // req 2
-    let client = Client::builder()
-        .response_timeout(Seconds(30))
-        .build(SharedCfg::default())
-        .await
-        .unwrap();
+    let client = Client::with_config(ClientConfig::new().set_response_timeout(Seconds(30)));
     let req = client.post(srv.url("/")).force_close();
     let response = req.send().await.unwrap();
     assert!(response.status().is_success());
@@ -247,25 +236,18 @@ async fn test_connection_server_close() {
     let num = Arc::new(AtomicUsize::new(0));
     let num2 = num.clone();
 
-    let srv = test_server(async move || {
+    let srv = test_server(async move |_| {
         let num2 = num2.clone();
-        chain_factory(move |io| {
+        service(async move |io| {
             num2.fetch_add(1, Ordering::Relaxed);
-            Ready::Ok(io)
+            Ok(io)
         })
         .and_then(HttpService::new(App::new().service(
-            web::resource("/").route(web::to(|| async {
-                HttpResponse::Ok().force_close().finish()
-            })),
+            web::resource("/").route(web::to(async || HttpResponse::Ok().force_close().build())),
         )))
-    })
-    .await;
+    });
 
-    let client = Client::builder()
-        .response_timeout(Seconds(30))
-        .build(SharedCfg::default())
-        .await
-        .unwrap();
+    let client = Client::with_config(ClientConfig::new().set_response_timeout(Seconds(30)));
 
     // req 1
     let request = client.get(srv.url("/")).send();
@@ -286,24 +268,22 @@ async fn test_connection_wait_queue() {
     let num = Arc::new(AtomicUsize::new(0));
     let num2 = num.clone();
 
-    let srv = test_server(async move || {
+    let srv = test_server(async move |_| {
         let num2 = num2.clone();
-        chain_factory(move |io| {
+        service(async move |io| {
             num2.fetch_add(1, Ordering::Relaxed);
-            Ready::Ok(io)
+            Ok(io)
         })
         .and_then(HttpService::new(App::new().service(
-            web::resource("/").route(web::to(|| async { HttpResponse::Ok().body(STR) })),
+            web::resource("/").route(web::to(async || HttpResponse::Ok().body(STR))),
         )))
-    })
-    .await;
+    });
 
-    let client = Client::builder()
-        .response_timeout(Seconds(30))
-        .connector::<&str>(Connector::default().limit(1))
-        .build(SharedCfg::default())
-        .await
-        .unwrap();
+    let client = Client::with_config(
+        ClientConfig::new()
+            .set_response_timeout(Seconds(30))
+            .set_h1_connection_limit(1),
+    );
 
     // req 1
     let request = client.get(srv.url("/")).send();
@@ -331,26 +311,22 @@ async fn test_connection_wait_queue_force_close() {
     let num = Arc::new(AtomicUsize::new(0));
     let num2 = num.clone();
 
-    let srv = test_server(async move || {
+    let srv = test_server(async move |_| {
         let num2 = num2.clone();
-        chain_factory(move |io| {
+        service(async move |io| {
             num2.fetch_add(1, Ordering::Relaxed);
-            Ready::Ok(io)
+            Ok(io)
         })
         .and_then(HttpService::new(App::new().service(
-            web::resource("/").route(web::to(|| async {
-                HttpResponse::Ok().force_close().body(STR)
-            })),
+            web::resource("/").route(web::to(async || HttpResponse::Ok().force_close().body(STR))),
         )))
-    })
-    .await;
+    });
 
-    let client = Client::builder()
-        .response_timeout(Seconds(30))
-        .connector::<&str>(Connector::default().limit(1))
-        .build(SharedCfg::default())
-        .await
-        .unwrap();
+    let client = Client::with_config(
+        ClientConfig::new()
+            .set_h1_connection_limit(1)
+            .set_response_timeout(Seconds(30)),
+    );
 
     // req 1
     let request = client.get(srv.url("/")).send();
@@ -375,16 +351,15 @@ async fn test_connection_wait_queue_force_close() {
 
 #[ntex::test]
 async fn test_with_query_parameter() {
-    let srv = test::server(async || {
-        App::new().service(web::resource("/").to(|req: HttpRequest| async move {
+    let srv = test::server(async |_| {
+        App::new().service(web::resource("/").to(async move |req: HttpRequest| {
             if req.query_string().contains("qp") {
                 HttpResponse::Ok()
             } else {
                 HttpResponse::BadRequest()
             }
         }))
-    })
-    .await;
+    });
 
     let res = srv.get("/?qp=5").send().await.unwrap();
     assert!(res.status().is_success());
@@ -396,22 +371,17 @@ async fn test_with_query_parameter() {
 
 #[ntex::test]
 async fn test_no_decompress() {
-    let srv = test::server(async || {
+    let srv = test::server(async |_| {
         App::new()
             .middleware(Compress::default())
-            .service(web::resource("/").route(web::to(|| async {
+            .service(web::resource("/").route(web::to(async || {
                 let mut res = HttpResponse::Ok().body(STR);
                 res.encoding(header::ContentEncoding::Gzip);
                 res
             })))
-    })
-    .await;
+    });
 
-    let client = Client::builder()
-        .response_timeout(Seconds(30))
-        .build(SharedCfg::default())
-        .await
-        .unwrap();
+    let client = Client::builder().build(ClientConfig::new().set_response_timeout(Seconds(30)));
 
     let res = client
         .get(srv.url("/"))
@@ -446,9 +416,30 @@ async fn test_no_decompress() {
 }
 
 #[ntex::test]
+async fn test_client_zstd_encoding() {
+    let srv = test::server(async |_| {
+        App::new().service(web::resource("/").route(web::to(async |req: HttpRequest| {
+            assert_eq!(
+                req.headers().get(header::ACCEPT_ENCODING).unwrap(),
+                "gzip, deflate, zstd"
+            );
+            HttpResponse::Ok()
+                .header("content-encoding", "zstd")
+                .body(zstd::encode_all(STR.as_bytes(), 0).unwrap())
+        })))
+    });
+
+    let response = srv.post("/").send().await.unwrap();
+    assert!(response.status().is_success());
+    assert!(!response.headers().contains_key("content-encoding"));
+    let bytes = response.body().await.unwrap();
+    assert_eq!(bytes, Bytes::from_static(STR.as_ref()));
+}
+
+#[ntex::test]
 async fn test_client_gzip_encoding() {
-    let srv = test::server(async || {
-        App::new().service(web::resource("/").route(web::to(|| async {
+    let srv = test::server(async |_| {
+        App::new().service(web::resource("/").route(web::to(async || {
             let mut e = GzEncoder::new(Vec::new(), Compression::default());
             e.write_all(STR.as_ref()).unwrap();
             let data = e.finish().unwrap();
@@ -457,22 +448,39 @@ async fn test_client_gzip_encoding() {
                 .header("content-encoding", "gzip")
                 .body(data)
         })))
-    })
-    .await;
+    });
 
     // client request
     let response = srv.post("/").send().await.unwrap();
     assert!(response.status().is_success());
+    // headers of the encoded payload are removed
+    assert!(!response.headers().contains_key("content-encoding"));
+    assert!(!response.headers().contains_key("content-length"));
 
     // read response
     let bytes = response.body().await.unwrap();
     assert_eq!(bytes, Bytes::from_static(STR.as_ref()));
+
+    // encoded payload
+    let response = srv.post("/").no_decompress().send().await.unwrap();
+    assert_eq!(response.headers().get("content-encoding").unwrap(), "gzip");
+    let len: usize = response
+        .headers()
+        .get("content-length")
+        .unwrap()
+        .to_str()
+        .unwrap()
+        .parse()
+        .unwrap();
+    let bytes = response.body().await.unwrap();
+    assert_eq!(bytes.len(), len);
+    assert_ne!(bytes, Bytes::from_static(STR.as_ref()));
 }
 
 #[ntex::test]
 async fn test_client_gzip_encoding_large() {
-    let srv = test::server(async || {
-        App::new().service(web::resource("/").route(web::to(|| async {
+    let srv = test::server(async |_| {
+        App::new().service(web::resource("/").route(web::to(async || {
             let mut e = GzEncoder::new(Vec::new(), Compression::default());
             e.write_all(STR.repeat(10).as_ref()).unwrap();
             let data = e.finish().unwrap();
@@ -481,8 +489,7 @@ async fn test_client_gzip_encoding_large() {
                 .header("content-encoding", "gzip")
                 .body(data)
         })))
-    })
-    .await;
+    });
 
     // client request
     let response = srv.post("/").send().await.unwrap();
@@ -501,10 +508,15 @@ async fn test_client_gzip_encoding_large_random() {
         .map(char::from)
         .collect::<String>();
 
-    let srv = test::server(async || {
-        App::new()
-            .state(web::types::PayloadConfig::default().limit(1_048_576))
-            .service(web::resource("/").route(web::to(|data: Bytes| async move {
+    let srv = test::server_with(
+        test::config().server_cfg(
+            SharedCfg::new("SRV").add(
+                web::WebAppConfig::new()
+                    .set_state(web::types::PayloadConfig::default().limit(1_048_576)),
+            ),
+        ),
+        async |_| {
+            App::new().service(web::resource("/").route(web::to(async move |data: Bytes| {
                 let mut e = GzEncoder::new(Vec::new(), Compression::default());
                 e.write_all(&data).unwrap();
                 let data = e.finish().unwrap();
@@ -512,8 +524,8 @@ async fn test_client_gzip_encoding_large_random() {
                     .header("content-encoding", "gzip")
                     .body(data)
             })))
-    })
-    .await;
+        },
+    );
 
     // client request
     let response = srv.post("/").send_body(data.clone()).await.unwrap();
@@ -526,8 +538,8 @@ async fn test_client_gzip_encoding_large_random() {
 
 #[ntex::test]
 async fn test_client_deflate_encoding() {
-    let srv = test::server(async || {
-        App::new().service(web::resource("/").route(web::to(|data: Bytes| async move {
+    let srv = test::server(async |_| {
+        App::new().service(web::resource("/").route(web::to(async move |data: Bytes| {
             let mut e = ZlibEncoder::new(Vec::new(), flate2::Compression::fast());
             e.write_all(&data).unwrap();
             let data = e.finish().unwrap();
@@ -536,8 +548,7 @@ async fn test_client_deflate_encoding() {
                 .header("content-encoding", "deflate")
                 .body(data)
         })))
-    })
-    .await;
+    });
 
     // client request
     let response = srv.post("/").send_body(STR).await.unwrap();
@@ -556,8 +567,8 @@ async fn test_client_deflate_encoding_large_random() {
         .map(char::from)
         .collect::<String>();
 
-    let srv = test::server(async || {
-        App::new().service(web::resource("/").route(web::to(|data: Bytes| async move {
+    let srv = test::server(async |_| {
+        App::new().service(web::resource("/").route(web::to(async move |data: Bytes| {
             let mut e = ZlibEncoder::new(Vec::new(), flate2::Compression::fast());
             e.write_all(&data).unwrap();
             let data = e.finish().unwrap();
@@ -566,8 +577,7 @@ async fn test_client_deflate_encoding_large_random() {
                 .header("content-encoding", "deflate")
                 .body(data)
         })))
-    })
-    .await;
+    });
 
     // client request
     let response = srv.post("/").send_body(data.clone()).await.unwrap();
@@ -589,7 +599,7 @@ async fn test_client_deflate_encoding_large_random() {
 //         })
 //     });
 
-//     let request = srv.get("/").finish().unwrap();
+//     let request = srv.get("/").build().unwrap();
 //     let response = srv.execute(request.send()).unwrap();
 //     assert!(response.status().is_success());
 
@@ -612,44 +622,34 @@ async fn test_client_cookie_handling() {
     let cookie1b = cookie1.clone();
     let cookie2b = cookie2.clone();
 
-    let srv =
-        test::server(async move || {
-            let cookie1 = cookie1b.clone();
-            let cookie2 = cookie2b.clone();
+    let srv = test::server(async move |_| {
+        let cookie1 = cookie1b.clone();
+        let cookie2 = cookie2b.clone();
 
-            App::new().route(
-                "/",
-                web::to(web::dev::__assert_handler1(move |req: HttpRequest| {
+        App::new().route(
+            "/",
+            web::to(web::dev::__assert_handler1(
+                async move |req: HttpRequest| {
                     let cookie1 = cookie1.clone();
                     let cookie2 = cookie2.clone();
 
-                    async move {
-                        // Check cookies were sent correctly
-                        let res: Result<(), Error> =
-                            req.cookie("cookie1")
-                                .ok_or(())
-                                .and_then(|c1| {
-                                    if c1.value() == "value1" { Ok(()) } else { Err(()) }
-                                })
-                                .and_then(|()| req.cookie("cookie2").ok_or(()))
-                                .and_then(|c2| {
-                                    if c2.value() == "value2" { Ok(()) } else { Err(()) }
-                                })
-                                .map_err(|_| {
-                                    Error::new(IoError::from(ErrorKind::NotFound))
-                                });
+                    // Check cookies were sent correctly
+                    let res: Result<(), io::Error> = req
+                        .cookie("cookie1")
+                        .ok_or(())
+                        .and_then(|c1| if c1.value() == "value1" { Ok(()) } else { Err(()) })
+                        .and_then(|()| req.cookie("cookie2").ok_or(()))
+                        .and_then(|c2| if c2.value() == "value2" { Ok(()) } else { Err(()) })
+                        .map_err(|_| IoError::from(ErrorKind::NotFound));
 
-                        res?;
+                    res?;
 
-                        // Send some cookies back
-                        Ok::<_, Error>(
-                            HttpResponse::Ok().cookie(cookie1).cookie(cookie2).finish(),
-                        )
-                    }
-                })),
-            )
-        })
-        .await;
+                    // Send some cookies back
+                    Ok::<_, io::Error>(HttpResponse::Ok().cookie(cookie1).cookie(cookie2).build())
+                },
+            )),
+        )
+    });
 
     let request = srv.get("/").cookie(cookie1.clone()).cookie(cookie2.clone());
     let response = request.send().await.unwrap();
@@ -662,16 +662,13 @@ async fn test_client_cookie_handling() {
 
 #[ntex::test]
 async fn test_client_timeout() {
-    let srv = test_server(async move || {
-        HttpService::new(|_| async {
+    let srv = test_server(async move |_| {
+        HttpService::new(async |_| {
             sleep(Seconds(10)).await;
             Ok::<_, io::Error>(Response::Ok().body(STR))
         })
-        .map(|_| ())
     })
-    .await
-    .set_client_timeout(Seconds(1), Millis(30_000))
-    .await;
+    .set_client_timeout(Seconds(1), Millis(30_000));
 
     let err = srv
         .request(Method::GET, "/")
@@ -680,7 +677,7 @@ async fn test_client_timeout() {
         .await
         .err()
         .unwrap();
-    assert!(matches!(err, ClientError::Timeout));
+    assert!(matches!(err.into_error(), ClientError::Timeout));
 }
 
 #[ntex::test]
@@ -696,22 +693,20 @@ async fn client_read_until_eof() {
                 log::debug!("Reading request");
                 let res = stream.read(&mut b).unwrap();
                 log::debug!("Read {res:?}");
-                let res = stream
-                    .write_all(b"HTTP/1.0 200 OK\r\nconnection: close\r\n\r\nwelcome!");
-                log::debug!("Sent {res:?}");
+                const S: &[u8] = b"HTTP/1.0 200 OK\r\nconnection: close\r\n\r\nwelcome!";
+                let res = stream.write_all(S);
+                log::debug!("Sent {res:?} cnt:{}", S.len());
+                let _ = stream.shutdown(net::Shutdown::Both);
             } else {
                 break;
             }
         }
     });
-    sleep(Millis(500)).await;
+    sleep(Millis(250)).await;
 
     // client request
     let req = Client::builder()
-        .response_timeout(Seconds(30))
-        .build(SharedCfg::default())
-        .await
-        .unwrap()
+        .build(ClientConfig::new().set_response_timeout(Seconds(30)))
         .get(format!("http://{addr}/").as_str());
     let response = req.send().await.unwrap();
     assert!(response.status().is_success());
@@ -721,12 +716,102 @@ async fn client_read_until_eof() {
     assert_eq!(bytes, Bytes::from_static(b"welcome!"));
 }
 
+/// Starts a raw server that answers every request with `response`, then closes.
+fn raw_server(response: &'static [u8]) -> std::net::SocketAddr {
+    let addr = ntex::server::TestServer::unused_addr();
+    let lst = std::net::TcpListener::bind(addr).unwrap();
+    std::thread::spawn(move || {
+        for mut stream in lst.incoming().flatten() {
+            let mut b = [0; 1000];
+            let _ = stream.read(&mut b);
+            let _ = stream.write_all(response);
+            let _ = stream.shutdown(net::Shutdown::Both);
+        }
+    });
+    addr
+}
+
+#[ntex::test]
+async fn client_read_until_eof_http11() {
+    let addr = raw_server(b"HTTP/1.1 200 OK\r\nconnection: close\r\n\r\nwelcome!");
+
+    let response = Client::new()
+        .get(format!("http://{addr}/").as_str())
+        .send()
+        .await
+        .unwrap();
+    assert!(response.status().is_success());
+    let bytes = response.body().await.unwrap();
+    assert_eq!(bytes, Bytes::from_static(b"welcome!"));
+}
+
+#[ntex::test]
+async fn client_payload_poll_after_eof() {
+    let addr = raw_server(b"HTTP/1.1 200 OK\r\ncontent-length: 8\r\n\r\nwelcome!");
+
+    let response = Client::new()
+        .get(format!("http://{addr}/").as_str())
+        .no_decompress()
+        .send()
+        .await
+        .unwrap();
+    let mut payload = response.take_payload();
+    let chunk = ntex::util::stream_recv(&mut payload)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(chunk, Bytes::from_static(b"welcome!"));
+    assert!(ntex::util::stream_recv(&mut payload).await.is_none());
+    assert!(ntex::util::stream_recv(&mut payload).await.is_none());
+}
+
+#[ntex::test]
+async fn client_early_response() {
+    let addr = ntex::server::TestServer::unused_addr();
+    let lst = std::net::TcpListener::bind(addr).unwrap();
+    std::thread::spawn(move || {
+        for mut stream in lst.incoming().flatten() {
+            let mut b = [0; 1024];
+            let _ = stream.read(&mut b);
+            let _ = stream
+                .write_all(b"HTTP/1.1 413 Payload Too Large\r\ncontent-length: 8\r\n\r\ntoo big!");
+            std::thread::sleep(std::time::Duration::from_millis(200));
+            // close with unread request body
+            drop(stream);
+        }
+    });
+
+    let body = Bytes::from(vec![b'x'; 64 * 1024 * 1024]);
+    let response = Client::builder()
+        .build(ClientConfig::new().set_response_timeout(Seconds(30)))
+        .post(format!("http://{addr}/").as_str())
+        .send_body(body)
+        .await
+        .unwrap();
+    assert_eq!(response.status(), ntex::http::StatusCode::PAYLOAD_TOO_LARGE);
+    let bytes = response.body().await.unwrap();
+    assert_eq!(bytes, Bytes::from_static(b"too big!"));
+}
+
+#[ntex::test]
+async fn client_truncated_body_http10() {
+    let addr = raw_server(b"HTTP/1.0 200 OK\r\ncontent-length: 20\r\n\r\nwelcome!");
+
+    let response = Client::new()
+        .get(format!("http://{addr}/").as_str())
+        .send()
+        .await
+        .unwrap();
+    assert!(response.status().is_success());
+    assert!(response.body().await.is_err());
+}
+
 #[ntex::test]
 async fn client_basic_auth() {
-    let srv = test::server(async || {
+    let srv = test::server(async |_| {
         App::new().route(
             "/",
-            web::to(|req: HttpRequest| async move {
+            web::to(async move |req: HttpRequest| {
                 if req
                     .headers()
                     .get(header::AUTHORIZATION)
@@ -741,8 +826,7 @@ async fn client_basic_auth() {
                 }
             }),
         )
-    })
-    .await;
+    });
 
     // set authorization header to Basic <base64 encoded username:password>
     let request = srv.get("/").basic_auth("username", Some("password"));
@@ -752,10 +836,10 @@ async fn client_basic_auth() {
 
 #[ntex::test]
 async fn client_bearer_auth() {
-    let srv = test::server(async || {
+    let srv = test::server(async |_| {
         App::new().route(
             "/",
-            web::to(|req: HttpRequest| async move {
+            web::to(async move |req: HttpRequest| {
                 if req
                     .headers()
                     .get(header::AUTHORIZATION)
@@ -770,8 +854,7 @@ async fn client_bearer_auth() {
                 }
             }),
         )
-    })
-    .await;
+    });
 
     // set authorization header to Bearer <token>
     let request = srv.get("/").bearer_auth("someS3cr3tAutht0k3n");
@@ -781,12 +864,9 @@ async fn client_bearer_auth() {
 
 #[ntex::test]
 async fn middleware() {
-    let srv = test::server(async || {
-        App::new().service(
-            web::resource("/").route(web::to(|| async { HttpResponse::Ok().body(STR) })),
-        )
-    })
-    .await;
+    let srv = test::server(async |_| {
+        App::new().service(web::resource("/").route(web::to(async || HttpResponse::Ok().body(STR))))
+    });
 
     let data = Rc::new(RefCell::new(Vec::new()));
     let data2 = data.clone();
@@ -797,16 +877,14 @@ async fn middleware() {
             async move |mut req: client::ServiceRequest, svc| {
                 assert!(req.headers().is_empty());
                 assert!(req.address().is_none());
-                let s = format!("{:?}", req.head().uri);
+                let s = req.head().uri.to_string();
                 data2.borrow_mut().push(format!("1 -- {}", s));
                 let result = svc.call(req).await;
                 data2.borrow_mut().push(format!("2 -- {}", s));
                 result
             },
         ))
-        .build(SharedCfg::default())
-        .await
-        .unwrap();
+        .build(SharedCfg::default());
 
     assert!(client.ready().await.is_ok());
 
@@ -827,10 +905,9 @@ async fn middleware() {
 
 #[ntex::test]
 async fn test_h1_v2() {
-    let srv = test_server(async move || {
-        HttpService::new(|_| Ready::Ok::<_, io::Error>(Response::Ok().body(STR)))
-    })
-    .await;
+    let srv = test_server(async move |_| {
+        HttpService::new(async |_| Ok::<_, io::Error>(Response::Ok().body(STR)))
+    });
 
     let response = srv.request(Method::GET, "/").send().await.unwrap();
     assert!(response.status().is_success());
@@ -849,4 +926,106 @@ async fn test_h1_v2() {
     // read response
     let bytes = response.body().await.unwrap();
     assert_eq!(bytes, Bytes::from_static(STR.as_ref()));
+}
+
+/// Server receives the truncated Host header.
+#[ntex::test]
+async fn untruncated_host_header() {
+    let srv = test::server(async |_| {
+        App::new().route(
+            "/host",
+            web::get().to(async move |req: HttpRequest| {
+                req.headers()
+                    .get(ntex::http::header::HOST)
+                    .and_then(|v| v.to_str().ok())
+                    .unwrap_or("<missing>")
+                    .to_string()
+            }),
+        )
+    });
+
+    let port = srv.addr().port();
+    let resp = srv
+        .request(ntex::http::Method::GET, srv.url("/host"))
+        .send()
+        .await
+        .unwrap();
+    let body = resp.body().await.unwrap();
+    let received = String::from_utf8(body.to_vec()).unwrap();
+
+    assert_eq!(received, format!("localhost:{port}"));
+}
+
+/// Test the newly added QUERY method.
+#[ntex::test]
+async fn test_query_method() {
+    use ntex::util::BytesMut;
+    let srv = test::server(async |_| {
+        App::new().route(
+            "/query",
+            web::query().to(async move |mut payload: web::types::Payload| {
+                let mut bytes = BytesMut::new();
+                while let Some(item) = ntex::util::stream_recv(&mut payload).await {
+                    bytes.extend_from_slice(&item.unwrap());
+                }
+                bytes
+            }),
+        )
+    });
+
+    let test_body = Bytes::from_static(b"SuperBody");
+
+    let resp = srv
+        .query("/query")
+        .send_body(test_body.clone())
+        .await
+        .unwrap();
+    let body = resp.body().await.unwrap();
+
+    assert_eq!(test_body, body);
+}
+
+#[ntex::test]
+async fn client_invalid_chunked_body() {
+    let addr =
+        raw_server(b"HTTP/1.1 200 OK\r\ntransfer-encoding: chunked\r\n\r\n4\r\ndataX\r\n0\r\n\r\n");
+
+    let response = Client::new()
+        .get(format!("http://{addr}/").as_str())
+        .send()
+        .await
+        .unwrap();
+    assert!(response.status().is_success());
+    let err = response.body().await.unwrap_err().into_error();
+    assert!(
+        matches!(*err, ntex::http::error::PayloadError::Decode(_)),
+        "{err:?}"
+    );
+}
+
+#[ntex::test]
+async fn client_no_response() {
+    let addr = raw_server(b"");
+
+    let err = Client::new()
+        .get(format!("http://{addr}/").as_str())
+        .send()
+        .await
+        .unwrap_err();
+    assert!(matches!(
+        err.into_error(),
+        ClientError::Connect(client::error::ConnectError::Disconnected(_))
+    ));
+}
+
+#[ntex::test]
+async fn client_invalid_response_head() {
+    let addr = raw_server(b"HTTP/1.1 2x0 OK\r\n\r\n");
+
+    let err = Client::new()
+        .get(format!("http://{addr}/").as_str())
+        .send()
+        .await
+        .unwrap_err();
+    assert!(matches!(err.into_error(), ClientError::Response(_)));
 }

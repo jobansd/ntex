@@ -1,22 +1,21 @@
 use std::any::{Any, TypeId};
-use std::collections::{HashMap, VecDeque};
-use std::sync::{Arc, atomic::AtomicUsize, atomic::Ordering};
+use std::collections::VecDeque;
+use std::sync::{Arc, atomic::AtomicBool, atomic::AtomicUsize, atomic::Ordering};
 use std::time::{Duration, Instant};
-use std::{cell::Cell, cell::RefCell, fmt, future::Future, panic, pin::Pin};
+use std::{cell::RefCell, fmt, future::Future, pin::Pin};
 
 use async_channel::{Receiver, Sender, unbounded};
 use futures_timer::Delay;
-use parking_lot::RwLock;
+use parking_lot::{Mutex, RwLock};
 
-use crate::pool::ThreadPool;
-use crate::{Arbiter, BlockingResult, Builder, Handle, Runner, SystemRunner};
+use crate::arbiter::Arbiter;
+use crate::pool::{PoolMetrics, ThreadPool};
+use crate::{BlockingResult, Builder, Handle, HashMap, Runner, SystemRunner};
 
 static SYSTEM_COUNT: AtomicUsize = AtomicUsize::new(0);
 
 thread_local!(
-    static ARBITERS: RefCell<Arbiters> = RefCell::new(Arbiters::default());
-    static PINGS: RefCell<HashMap<Id, VecDeque<PingRecord>>> =
-        RefCell::new(HashMap::default());
+    static PINGS: RefCell<HashMap<Id, VecDeque<PingRecord>>> = RefCell::new(HashMap::default());
 );
 
 #[derive(Default)]
@@ -25,28 +24,36 @@ struct Arbiters {
     list: Vec<Arbiter>,
 }
 
-/// System id
+/// Identifier assigned to a running [`System`].
 #[derive(Copy, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Debug)]
 pub struct Id(pub(crate) usize);
 
-/// System is a runtime manager
-pub struct System {
+/// Runtime manager for a group of arbiter threads.
+///
+/// A system stores runtime configuration, manages arbiters, dispatches process
+/// signals, and owns the blocking thread pool.
+pub struct System(pub(crate) Arc<SystemInner>);
+
+pub(crate) struct SystemInner {
     id: usize,
-    arbiter: Cell<Option<Arbiter>>,
-    config: SystemConfig,
+    arbiter: Arbiter,
+    pub(crate) config: SystemConfig,
     sender: Sender<SystemCommand>,
     receiver: Receiver<SystemCommand>,
-    rt: Arc<RwLock<Arbiter>>,
-    storage: Arc<RwLock<HashMap<TypeId, Box<dyn Any + Sync + Send>>>>,
+    storage: RwLock<HashMap<TypeId, Box<dyn Any + Sync + Send>>>,
+    arbiters: Mutex<Arbiters>,
+    signals: AtomicBool,
     pool: ThreadPool,
 }
 
+/// Configuration shared by a running [`System`].
 #[derive(Clone)]
 pub struct SystemConfig {
     pub(super) name: String,
     pub(super) stack_size: usize,
-    pub(super) stop_on_panic: bool,
     pub(super) ping_interval: usize,
+    pub(super) ping_threshold: usize,
+    pub(super) latency_interval: usize,
     pub(super) pool_limit: usize,
     pub(super) pool_recv_timeout: Duration,
     pub(super) testing: bool,
@@ -59,85 +66,85 @@ thread_local!(
 
 impl Clone for System {
     fn clone(&self) -> Self {
-        Self {
-            id: self.id,
-            arbiter: Cell::new(None),
-            config: self.config.clone(),
-            sender: self.sender.clone(),
-            receiver: self.receiver.clone(),
-            rt: self.rt.clone(),
-            storage: self.storage.clone(),
-            pool: self.pool.clone(),
-        }
+        Self(self.0.clone())
+    }
+}
+
+impl SystemInner {
+    /// Returns the registered arbiters.
+    pub(crate) fn arbiters(&self) -> Vec<Arbiter> {
+        self.arbiters.lock().list.clone()
     }
 }
 
 impl System {
     /// Constructs new system and sets it as current
-    pub(super) fn construct(config: SystemConfig) -> Self {
+    pub(super) fn start(config: SystemConfig) -> (Self, oneshot::Receiver<i32>) {
         let id = SYSTEM_COUNT.fetch_add(1, Ordering::SeqCst);
         let (sender, receiver) = unbounded();
 
-        let pool =
-            ThreadPool::new(&config.name, config.pool_limit, config.pool_recv_timeout);
+        let pool = ThreadPool::new(&config.name, config.pool_limit, config.pool_recv_timeout);
+        let (arbiter, controller) = Arbiter::new_system(id, config.name.clone());
 
-        System {
+        let mut arbiters = Arbiters::default();
+        arbiters.all.insert(arbiter.id(), arbiter.clone());
+        arbiters.list.push(arbiter.clone());
+
+        let sys = System(Arc::new(SystemInner {
             id,
             config,
+            arbiter,
             sender,
             receiver,
             pool,
-            rt: Arc::new(RwLock::new(Arbiter::dummy())),
-            storage: Arc::new(RwLock::new(HashMap::default())),
-            arbiter: Cell::new(None),
-        }
-    }
+            arbiters: Mutex::new(arbiters),
+            storage: RwLock::new(HashMap::default()),
+            signals: AtomicBool::new(false),
+        }));
+        System::set_current(sys.clone());
 
-    /// Constructs new system and sets it as current
-    pub(super) fn start(&mut self) -> oneshot::Receiver<i32> {
         let (stop_tx, stop) = oneshot::channel();
-        let (arb, controller) = Arbiter::new_system(self.clone(), self.config.name.clone());
-
-        self.arbiter.set(Some(arb.clone()));
-        *self.rt.write() = arb.clone();
-        System::set_current(self.clone());
 
         // system support tasks
-        crate::spawn(SystemSupport::new(self, stop_tx).run(arb.id(), arb));
-        crate::spawn(controller.run());
+        crate::spawn_detached(SystemSupport::new(&sys, stop_tx).run());
+        crate::spawn_detached(controller.run(sys.clone()));
 
-        stop
+        (sys, stop)
     }
 
-    /// Build a new system with a customized runtime
+    /// Creates a builder for a system with a customized runtime.
     ///
-    /// This allows to customize the runtime. See struct level docs on
-    /// `Builder` for more information.
+    /// See [`Builder`] for the available configuration options.
     pub fn build() -> Builder {
         Builder::new()
     }
 
     #[allow(clippy::new_ret_no_self)]
-    /// Create new system
+    /// Creates a system runner with the specified name and runtime runner.
     ///
-    /// This method panics if it can not create runtime
+    /// # Panics
+    ///
+    /// Panics if the runtime cannot be created.
     pub fn new<R: Runner>(name: &str, runner: R) -> SystemRunner {
         Self::build().name(name).build(runner)
     }
 
     #[allow(clippy::new_ret_no_self)]
-    /// Create new system
-    ///
-    /// This method panics if it can not create runtime
-    pub fn with_config(name: &str, config: SystemConfig) -> SystemRunner {
-        Self::build().name(name).build_with(config)
-    }
-
-    /// Get current running system
+    /// Creates a system runner from an existing configuration.
     ///
     /// # Panics
     ///
-    /// Panics if System is not running
+    /// Panics if the runtime cannot be created.
+    pub fn with_config(name: &str, mut config: SystemConfig) -> SystemRunner {
+        name.clone_into(&mut config.name);
+        Self::build().name(name).build_with(config)
+    }
+
+    /// Returns the system running on the current thread.
+    ///
+    /// # Panics
+    ///
+    /// Panics if no system is running on the current thread.
     pub fn current() -> System {
         CURRENT.with(|cell| match *cell.borrow() {
             Some(ref sys) => sys.clone(),
@@ -145,7 +152,7 @@ impl System {
         })
     }
 
-    /// Runs a function using the system context.
+    /// Returns the system running on the current thread, if one exists.
     pub fn try_current() -> Option<System> {
         CURRENT.with(|cell| cell.borrow().as_ref().map(Clone::clone))
     }
@@ -153,10 +160,33 @@ impl System {
     /// Set current running system
     #[doc(hidden)]
     pub fn set_current(sys: System) {
-        sys.arbiter().set_current();
         CURRENT.with(|s| {
             *s.borrow_mut() = Some(sys);
         });
+    }
+
+    pub(crate) fn register_arbiter(&self, arb: Arbiter) {
+        CURRENT.with(|s| {
+            *s.borrow_mut() = Some(self.clone());
+        });
+        let mut arbiters = self.0.arbiters.lock();
+        arbiters.all.insert(arb.id(), arb.clone());
+        arbiters.list.push(arb);
+    }
+
+    pub(crate) fn unregister_arbiter(&self, id: Id) {
+        CURRENT.with(|s| {
+            *s.borrow_mut() = None;
+        });
+        let mut arbiters = self.0.arbiters.lock();
+        if let Some(hnd) = arbiters.all.remove(&id) {
+            for (idx, arb) in arbiters.list.iter().enumerate() {
+                if &hnd == arb {
+                    arbiters.list.remove(idx);
+                    break;
+                }
+            }
+        }
     }
 
     pub(super) fn remove_current() {
@@ -165,109 +195,163 @@ impl System {
         });
     }
 
-    /// System id
+    /// Unregisters all arbiters of the system.
+    pub(super) fn take_arbiters(&self) -> Vec<Arbiter> {
+        let mut arbiters = self.0.arbiters.lock();
+        arbiters.all.clear();
+        std::mem::take(&mut arbiters.list)
+    }
+
+    /// Stops and unregisters all arbiters of the system.
+    pub(super) fn stop_arbiters(&self) {
+        for arb in self.take_arbiters() {
+            arb.stop();
+        }
+    }
+
+    /// Returns the system identifier.
     pub fn id(&self) -> Id {
-        Id(self.id)
+        Id(self.0.id)
     }
 
-    /// System name
+    /// Returns the system name.
     pub fn name(&self) -> &str {
-        &self.config.name
+        &self.0.config.name
     }
 
-    /// Stop the system
+    /// Stops the system with exit code `0`.
     pub fn stop(&self) {
         self.stop_with_code(0);
     }
 
-    /// Stop the system with a particular exit code
+    /// Stops the system with the specified exit code.
     pub fn stop_with_code(&self, code: i32) {
-        let _ = self.sender.try_send(SystemCommand::Exit(code));
+        let _ = self.0.sender.try_send(SystemCommand::Exit(code));
     }
 
-    /// Return status of `stop_on_panic` option
+    /// Returns whether process signal handling is enabled.
+    pub fn signals(&self) -> bool {
+        self.0.signals.load(Ordering::Relaxed)
+    }
+
+    /// Enables process signal handling.
     ///
-    /// It controls whether the System is stopped when an
-    /// uncaught panic is thrown from a worker thread.
-    pub fn stop_on_panic(&self) -> bool {
-        self.config.stop_on_panic
+    /// Signals are handled by one system at a time, this has no effect while
+    /// another system handles signals.
+    pub fn enable_signals(&self) {
+        if !self.signals() && crate::signals::start(self) {
+            self.0.signals.store(true, Ordering::Relaxed);
+        }
     }
 
-    /// System arbiter
+    /// Disables process signal handling.
+    pub fn disable_signals(&self) {
+        if self.signals() {
+            crate::signals::stop(self);
+            self.0.signals.store(false, Ordering::Relaxed);
+        }
+    }
+
+    /// Returns the system's primary arbiter.
     ///
     /// # Panics
     ///
-    /// Panics if system is not started
+    /// Panics if the system has not been started.
     pub fn arbiter(&self) -> Arbiter {
-        if let Some(arb) = self.arbiter.take() {
-            self.arbiter.set(Some(arb.clone()));
-            if arb.hnd.is_some() {
-                return arb;
-            }
-        }
-
-        let arb = self.rt.read().clone();
-        self.arbiter.set(Some(arb.clone()));
-        arb
+        self.0.arbiter.clone()
     }
 
-    /// Retrieves a list of all arbiters in the system
+    /// Provides access to all arbiters registered with this system.
+    ///
+    /// The callback receives a snapshot of the registered arbiters.
     ///
     /// This method should be called from the thread where the system has been initialized,
     /// typically the "main" thread.
-    pub fn list_arbiters<F, R>(f: F) -> R
+    pub fn list_arbiters<F, R>(&self, f: F) -> R
     where
         F: FnOnce(&[Arbiter]) -> R,
     {
-        ARBITERS.with(|arbs| f(arbs.borrow().list.as_ref()))
+        f(&self.0.arbiters())
     }
 
-    /// Retrieves a list of last pings records for specified arbiter
+    /// Visits the latest ping records for each registered arbiter.
     ///
     /// This method should be called from the thread where the system has been initialized,
     /// typically the "main" thread.
-    pub fn list_arbiter_pings<F, R>(id: Id, f: F) -> R
+    pub fn list_arbiter_pings<F>(mut f: F)
     where
-        F: FnOnce(Option<&VecDeque<PingRecord>>) -> R,
+        F: FnMut(&Arbiter, &mut VecDeque<PingRecord>),
     {
         PINGS.with(|pings| {
-            if let Some(recs) = pings.borrow().get(&id) {
-                f(Some(recs))
-            } else {
-                f(None)
+            let mut p = pings.borrow_mut();
+            let sys = System::current();
+            let arbiters: Vec<_> = {
+                let arbiters = sys.0.arbiters.lock();
+                p.keys()
+                    .filter_map(|id| arbiters.all.get(id).map(|arb| (*id, arb.clone())))
+                    .collect()
+            };
+
+            // callbacks run without the registry lock
+            for (id, arb) in &arbiters {
+                if let Some(recs) = p.get_mut(id) {
+                    f(arb, recs);
+                }
             }
-        })
+        });
     }
 
-    pub(super) fn sys(&self) -> &Sender<SystemCommand> {
-        &self.sender
+    #[doc(hidden)]
+    /// Set arbiter latency callback.
+    ///
+    /// This callback is called with the backtrace of a stalled arbiter, see
+    /// [`Builder::ping_threshold`]. Backtraces are captured on Linux and
+    /// Windows. The provided backtrace is not resolved. The location is the
+    /// spawn location of the task that blocks the arbiter, see
+    /// [`Handle::current_task`].
+    pub fn set_latency_callback<F>(f: F)
+    where
+        F: Fn(ntex_error::Backtrace, Option<&'static std::panic::Location<'static>>)
+            + Send
+            + Sync
+            + 'static,
+    {
+        crate::watchdog::set_latency_callback(Arc::new(f));
     }
 
-    /// System config
+    /// Returns a clone of the system configuration.
     pub fn config(&self) -> SystemConfig {
-        self.config.clone()
+        self.0.config.clone()
     }
 
     #[inline]
-    /// Runtime handle for main thread
+    /// Returns a runtime handle for the primary arbiter.
     pub fn handle(&self) -> Handle {
         self.arbiter().handle().clone()
     }
 
-    /// Testing flag
+    /// Returns whether the system is configured for testing.
     pub fn testing(&self) -> bool {
-        self.config.testing()
+        self.0.config.testing()
     }
 
-    /// Spawns a blocking task in a new thread, and wait for it
+    /// Spawns a blocking task on a new thread and waits for it to complete.
     ///
-    /// The task will not be cancelled even if the future is dropped.
+    /// Dropping the returned future prevents queued work from starting, but
+    /// cannot interrupt work that is already running. Call
+    /// [`BlockingResult::detach`] to let queued work continue even if its
+    /// result is no longer needed.
     pub fn spawn_blocking<F, R>(&self, f: F) -> BlockingResult<R>
     where
         F: FnOnce() -> R + Send + 'static,
         R: Send + 'static,
     {
-        self.pool.execute(f)
+        self.0.pool.execute(f)
+    }
+
+    /// Returns a snapshot of the blocking thread pool metrics.
+    pub fn pool_metrics(&self) -> PoolMetrics {
+        self.0.pool.metrics()
     }
 
     /// Returns a previously registered type, or inserts and returns a new one.
@@ -278,13 +362,14 @@ impl System {
     where
         T: Clone + Send + Sync + 'static,
     {
-        if let Some(boxed) = self.storage.read().get(&TypeId::of::<T>())
+        if let Some(boxed) = self.0.storage.read().get(&TypeId::of::<T>())
             && let Some(val) = (&**boxed as &(dyn Any + 'static)).downcast_ref::<T>()
         {
             val.clone()
         } else {
             let val = f();
-            self.storage
+            self.0
+                .storage
                 .write()
                 .insert(TypeId::of::<T>(), Box::new(val.clone()));
             val
@@ -294,7 +379,7 @@ impl System {
 
 impl SystemConfig {
     #[inline]
-    /// Is current system is testing
+    /// Returns whether the system is configured for testing.
     pub fn testing(&self) -> bool {
         self.testing
     }
@@ -303,9 +388,10 @@ impl SystemConfig {
 impl fmt::Debug for System {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("System")
-            .field("id", &self.id)
-            .field("config", &self.config)
-            .field("pool", &self.pool)
+            .field("id", &self.0.id)
+            .field("config", &self.0.config)
+            .field("signals", &self.signals())
+            .field("pool", &self.0.pool)
             .finish()
     }
 }
@@ -316,7 +402,6 @@ impl fmt::Debug for SystemConfig {
             .field("name", &self.name)
             .field("testing", &self.testing)
             .field("stack_size", &self.stack_size)
-            .field("stop_on_panic", &self.stop_on_panic)
             .finish()
     }
 }
@@ -324,77 +409,61 @@ impl fmt::Debug for SystemConfig {
 #[derive(Debug)]
 pub(super) enum SystemCommand {
     Exit(i32),
-    RegisterArbiter(Id, Arbiter),
-    UnregisterArbiter(Id),
 }
 
 #[derive(Debug)]
 struct SystemSupport {
+    sys: System,
     stop: Option<oneshot::Sender<i32>>,
     commands: Receiver<SystemCommand>,
-    ping_interval: Duration,
+    watchdog: Option<Arc<AtomicBool>>,
+}
+
+impl Drop for SystemSupport {
+    fn drop(&mut self) {
+        self.stop_watchdog();
+    }
 }
 
 impl SystemSupport {
     fn new(sys: &System, stop: oneshot::Sender<i32>) -> Self {
         Self {
+            sys: sys.clone(),
             stop: Some(stop),
-            commands: sys.receiver.clone(),
-            ping_interval: Duration::from_millis(sys.config.ping_interval as u64),
+            commands: sys.0.receiver.clone(),
+            watchdog: None,
         }
     }
 
-    async fn run(mut self, id: Id, arb: Arbiter) {
-        ARBITERS.with(move |arbs| {
-            let mut arbiters = arbs.borrow_mut();
-            arbiters.all.clear();
-            arbiters.list.clear();
+    fn stop_watchdog(&mut self) {
+        if let Some(stop) = self.watchdog.take() {
+            stop.store(true, Ordering::Relaxed);
+        }
+    }
 
-            // system arbiter
-            arbiters.all.insert(id, arb.clone());
-            arbiters.list.push(arb.clone());
-            crate::spawn(ping_arbiter(arb, self.ping_interval));
-        });
+    async fn run(mut self) {
+        crate::metrics::start_latency_sampler(
+            &self.sys.0.arbiter.0.latency,
+            self.sys.0.config.latency_interval,
+        );
+        self.watchdog = crate::watchdog::start(&self.sys);
+        if self.sys.0.config.ping_interval != 0 {
+            crate::spawn_detached(ping_arbiters(self.sys.clone()));
+        }
 
         loop {
             match self.commands.recv().await {
                 Ok(SystemCommand::Exit(code)) => {
                     log::debug!("Stopping system with {code} code");
+                    self.stop_watchdog();
+                    self.sys.stop_arbiters();
 
-                    // stop arbiters
-                    ARBITERS.with(move |arbs| {
-                        let mut arbiters = arbs.borrow_mut();
-                        for arb in arbiters.list.drain(..) {
-                            arb.stop();
-                        }
-                        arbiters.all.clear();
-                    });
+                    crate::arbiter::run_shutdown_callbacks();
 
                     // stop event loop
                     if let Some(stop) = self.stop.take() {
                         let _ = stop.send(code);
                     }
-                }
-                Ok(SystemCommand::RegisterArbiter(id, hnd)) => {
-                    crate::spawn(ping_arbiter(hnd.clone(), self.ping_interval));
-                    ARBITERS.with(move |arbs| {
-                        let mut arbiters = arbs.borrow_mut();
-                        arbiters.all.insert(id, hnd.clone());
-                        arbiters.list.push(hnd);
-                    });
-                }
-                Ok(SystemCommand::UnregisterArbiter(id)) => {
-                    ARBITERS.with(move |arbs| {
-                        let mut arbiters = arbs.borrow_mut();
-                        if let Some(hnd) = arbiters.all.remove(&id) {
-                            for (idx, arb) in arbiters.list.iter().enumerate() {
-                                if &hnd == arb {
-                                    arbiters.list.remove(idx);
-                                    break;
-                                }
-                            }
-                        }
-                    });
                 }
                 Err(_) => {
                     log::debug!("System stopped");
@@ -413,47 +482,49 @@ pub struct PingRecord {
     pub rtt: Option<Duration>,
 }
 
-async fn ping_arbiter(arb: Arbiter, interval: Duration) {
+async fn ping_arbiters(sys: System) {
+    let interval = Duration::from_millis(sys.0.config.ping_interval as u64);
+
     loop {
+        // interval between pings
         Delay::new(interval).await;
 
-        // check if arbiter is still active
-        let is_alive = ARBITERS.with(|arbs| arbs.borrow().all.contains_key(&arb.id()));
-
-        if !is_alive {
-            PINGS.with(|pings| pings.borrow_mut().remove(&arb.id()));
-            break;
-        }
-
-        // calc ttl
         let start = Instant::now();
-        PINGS.with(|pings| {
-            let mut p = pings.borrow_mut();
-            let recs = p.entry(arb.id()).or_default();
-            recs.push_front(PingRecord { start, rtt: None });
-            recs.truncate(10);
-        });
+        let arbiters = sys.0.arbiters.lock();
 
-        let result = arb
-            .handle()
-            .spawn(async {
-                yield_to().await;
-            })
-            .await;
-
-        if result.is_err() {
-            break;
-        }
-
+        // drop records of stopped arbiters
         PINGS.with(|pings| {
             pings
                 .borrow_mut()
-                .get_mut(&arb.id())
-                .unwrap()
-                .front_mut()
-                .unwrap()
-                .rtt = Some(start.elapsed());
+                .retain(|id, _| arbiters.all.contains_key(id));
         });
+
+        for arb in &arbiters.list {
+            let id = arb.id();
+            let fut = arb.handle().spawn(async move {
+                yield_to().await;
+            });
+
+            PINGS.with(|pings| {
+                let mut p = pings.borrow_mut();
+                let recs = p.entry(id).or_default();
+                recs.push_front(PingRecord { start, rtt: None });
+                recs.truncate(10);
+            });
+
+            crate::spawn_detached(async move {
+                if fut.await.is_ok() {
+                    PINGS.with(|pings| {
+                        // a late pong belongs to its own round
+                        if let Some(recs) = pings.borrow_mut().get_mut(&id)
+                            && let Some(rec) = recs.iter_mut().find(|r| r.start == start)
+                        {
+                            rec.rtt = Some(start.elapsed());
+                        }
+                    });
+                }
+            });
+        }
     }
 }
 
@@ -480,16 +551,195 @@ async fn yield_to() {
     Yield { completed: false }.await;
 }
 
-pub(super) trait FnExec: Send + 'static {
-    fn call_box(self: Box<Self>);
+#[cfg(test)]
+mod ping_tests {
+    use super::*;
+    use crate::testing::TestRunner;
+
+    #[test]
+    fn ping_records_pruned() {
+        System::build()
+            .name("test")
+            .ping_interval(5)
+            .build(TestRunner)
+            .block_on(async {
+                let mut arb = Arbiter::new();
+                let id = arb.id();
+                let answered = || {
+                    PINGS.with(|p| {
+                        p.borrow()
+                            .get(&id)
+                            .is_some_and(|recs| recs.iter().any(|r| r.rtt.is_some()))
+                    })
+                };
+                let has = || PINGS.with(|p| p.borrow().contains_key(&id));
+
+                for _ in 0..400 {
+                    if answered() {
+                        break;
+                    }
+                    Delay::new(Duration::from_millis(5)).await;
+                }
+                assert!(answered());
+
+                arb.stop();
+                arb.join().unwrap();
+                for _ in 0..400 {
+                    if !has() {
+                        break;
+                    }
+                    Delay::new(Duration::from_millis(5)).await;
+                }
+                assert!(!has());
+            });
+    }
+
+    #[test]
+    fn latency_sampling() {
+        System::build()
+            .name("test")
+            .latency_interval(5)
+            .build(TestRunner)
+            .block_on(async {
+                let mut arb = Arbiter::new();
+                let sampled = |arb: &Arbiter| arb.latency().unwrap().histogram.count() >= 2;
+                let sys_arb = System::current().arbiter();
+
+                for _ in 0..400 {
+                    if sampled(&arb) && sampled(&sys_arb) {
+                        break;
+                    }
+                    Delay::new(Duration::from_millis(5)).await;
+                }
+                assert!(sampled(&arb));
+                assert!(sampled(&sys_arb));
+
+                let m = arb.latency().unwrap();
+                assert_eq!(m.interval, Duration::from_millis(5));
+                assert!(m.last_sample.unwrap() <= Instant::now());
+
+                arb.stop();
+                arb.join().unwrap();
+            });
+
+        System::build()
+            .name("test")
+            .latency_interval(0)
+            .build(TestRunner)
+            .block_on(async {
+                assert_eq!(System::current().arbiter().latency(), None);
+                let mut arb = Arbiter::new();
+                assert_eq!(arb.latency(), None);
+                arb.stop();
+                arb.join().unwrap();
+            });
+    }
 }
 
-impl<F> FnExec for F
-where
-    F: FnOnce() + Send + 'static,
-{
-    #[allow(clippy::boxed_local)]
-    fn call_box(self: Box<Self>) {
-        (*self)();
+#[cfg(test)]
+mod api_tests {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    use super::*;
+    use crate::testing::TestRunner;
+
+    #[test]
+    #[should_panic(expected = "System is not running")]
+    fn current_without_system() {
+        assert!(System::try_current().is_none());
+        let _ = System::current();
+    }
+
+    #[test]
+    fn system_api() {
+        let config = System::new("base", TestRunner).block_on(async {
+            let sys = System::current();
+            assert_eq!(sys.name(), "base");
+            assert!(!sys.testing());
+            assert!(!sys.signals());
+            assert_eq!(System::try_current().unwrap().id(), sys.id());
+            assert_eq!(sys.arbiter(), Arbiter::current());
+            assert!(format!("{sys:?}").contains("base"));
+            assert!(format!("{:?}", sys.config()).contains("base"));
+
+            // values are stored once per system
+            assert_eq!(sys.get_value(|| 1usize), 1);
+            assert_eq!(sys.get_value(|| 2usize), 1);
+
+            assert_eq!(sys.spawn_blocking(|| 10).await, Ok(10));
+
+            let cnt = Arc::new(AtomicUsize::new(0));
+            let cnt2 = cnt.clone();
+            sys.handle()
+                .spawn(async move {
+                    cnt2.fetch_add(1, Ordering::Relaxed);
+                })
+                .await
+                .unwrap();
+            assert_eq!(cnt.load(Ordering::Relaxed), 1);
+            sys.list_arbiters(|arbs| assert_eq!(arbs, [sys.arbiter()]));
+            sys.config()
+        });
+        assert!(System::try_current().is_none());
+
+        System::with_config("copy", config).block_on(async {
+            let sys = System::current();
+            assert_eq!(sys.name(), "copy");
+            assert_eq!(Arbiter::current().name(), "copy");
+        });
+    }
+
+    #[test]
+    fn list_arbiter_pings() {
+        System::build()
+            .name("test")
+            .ping_interval(5)
+            .build(TestRunner)
+            .block_on(async {
+                let mut arb = Arbiter::new();
+                let visited = || {
+                    let mut found = false;
+                    System::list_arbiter_pings(|a, recs| {
+                        if a == &arb && recs.iter().any(|r| r.rtt.is_some()) {
+                            found = true;
+                        }
+                    });
+                    found
+                };
+                for _ in 0..400 {
+                    if visited() {
+                        break;
+                    }
+                    Delay::new(Duration::from_millis(5)).await;
+                }
+                assert!(visited());
+
+                // callbacks may access the arbiter registry
+                let mut visited = false;
+                System::list_arbiter_pings(|_, _| {
+                    visited = true;
+                    assert!(System::current().0.arbiters.try_lock().is_some());
+                });
+                assert!(visited);
+
+                arb.stop();
+                arb.join().unwrap();
+            });
+    }
+
+    #[test]
+    fn list_arbiters_callback_joins_worker() {
+        System::new("list-join", TestRunner).block_on(async {
+            let sys = System::current();
+            let worker = Arbiter::new();
+            sys.list_arbiters(|arbs| {
+                // the registry is not locked while the callback runs
+                assert!(sys.0.arbiters.try_lock().is_some());
+                let mut arb = arbs.iter().find(|arb| **arb == worker).unwrap().clone();
+                arb.stop();
+                arb.join().unwrap();
+                sys.list_arbiters(|arbs| assert!(!arbs.contains(&worker)));
+            });
+        });
     }
 }

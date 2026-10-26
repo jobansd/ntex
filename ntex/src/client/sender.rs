@@ -1,64 +1,49 @@
-use crate::{Service, ServiceCtx};
-
 #[cfg(feature = "compress")]
-use crate::http::Payload;
-#[cfg(feature = "compress")]
-use crate::http::encoding::Decoder;
+use crate::http::{Payload, encoding::Decoder, header};
+use crate::{Ctx, Service, SharedCfg, error::Error, http::body::MessageBody};
 
-use crate::http::body::MessageBody;
-
-use super::connector::ConnectorService;
-use super::error::ClientError;
 use super::{ClientConfig, ClientRawRequest, Connect, ServiceRequest, ServiceResponse};
+use super::{connector::Connector, error::ClientError};
 
 #[derive(Debug)]
 pub struct Sender {
-    config: ClientConfig,
-    connector: ConnectorService,
+    connector: Connector,
 }
 
 impl Sender {
-    pub(crate) fn new(connector: ConnectorService, config: ClientConfig) -> Self {
-        Self { config, connector }
+    pub(super) fn new(connector: Connector) -> Self {
+        Self { connector }
     }
 }
 
 #[allow(unused_variables)]
-impl Service<ServiceRequest> for Sender {
-    type Response = ServiceResponse;
-    type Error = ClientError;
+impl Service<SharedCfg, ServiceRequest> for Sender {
+    type Res = ServiceResponse;
+    type Error = Error<ClientError>;
 
-    crate::forward_ready!(connector);
-    crate::forward_poll!(connector);
-    crate::forward_shutdown!(connector);
+    crate::forward_bind!(SharedCfg, connector);
+    crate::forward_ready!(SharedCfg, connector);
+    crate::forward_shutdown!(SharedCfg, connector);
 
     async fn call(
         &self,
         req: ServiceRequest,
-        ctx: ServiceCtx<'_, Self>,
-    ) -> Result<Self::Response, Self::Error> {
+        ctx: Ctx<'_, Self, SharedCfg>,
+    ) -> Result<Self::Res, Self::Error> {
         let ServiceRequest {
             head,
             addr,
             body,
             headers,
-            mut timeout,
+            timeout,
             response_decompress,
         } = req;
 
-        let con = ctx
-            .call(
-                &self.connector,
-                Connect {
-                    addr,
-                    uri: head.uri.clone(),
-                },
-            )
-            .await?;
+        let uri = head.uri.clone();
+        let con = ctx.call(&self.connector, Connect { uri, addr }).await?;
+        let config = ctx.st().get::<ClientConfig>();
 
-        if timeout.is_zero() {
-            timeout = self.config.timeout();
-        }
+        let timeout = timeout.unwrap_or_else(|| config.response_timeout());
 
         let req = ClientRawRequest {
             head,
@@ -66,23 +51,29 @@ impl Service<ServiceRequest> for Sender {
             size: body.size(),
         };
 
-        let (head, payload) = con.send_request(req, body, timeout).await?;
+        #[allow(unused_mut)]
+        let (mut head, payload) = con.send_request(req, body, timeout).await?;
 
         #[cfg(feature = "compress")]
         if response_decompress {
-            let payload =
-                Payload::from_stream(Decoder::from_headers(payload, &head.headers));
+            let decoder = Decoder::from_headers(payload, &head.headers);
+            if decoder.is_decoding() {
+                // the headers describe the encoded payload
+                head.headers.remove(&header::CONTENT_ENCODING);
+                head.headers.remove(&header::CONTENT_LENGTH);
+            }
+            let payload = Payload::from_stream(decoder);
             return Ok(ServiceResponse {
                 head,
                 payload,
-                config: self.config.clone(),
+                config: config.clone(),
             });
         }
 
         Ok(ServiceResponse {
             head,
             payload,
-            config: self.config.clone(),
+            config,
         })
     }
 }

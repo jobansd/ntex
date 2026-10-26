@@ -1,4 +1,4 @@
-//! Utilities for futures
+//! Future and stream utilities.
 use std::future::{Future, poll_fn};
 use std::task::{Context, Poll, ready};
 use std::{mem, pin::Pin};
@@ -9,21 +9,21 @@ mod either;
 mod join;
 mod lazy;
 mod on_drop;
-mod ready;
 mod select;
 
 pub use self::either::Either;
 pub use self::join::{join, join_all};
 pub use self::lazy::{Lazy, lazy};
 pub use self::on_drop::{OnDropFn, OnDropFuture, OnDropFutureExt};
-pub use self::ready::Ready;
 pub use self::select::select;
 
-/// An owned dynamically typed Future for use in cases where
-/// you can't statically type your result or need to add some indirection.
+/// An owned, dynamically dispatched future.
+///
+/// This is useful when a concrete future type cannot be named or when type
+/// erasure is required.
 pub type BoxFuture<'a, T> = Pin<Box<dyn Future<Output = T> + 'a>>;
 
-/// Creates a future that resolves to the next item in the stream.
+/// Waits for and returns the next item from a stream.
 pub async fn stream_recv<S>(stream: &mut S) -> Option<S::Item>
 where
     S: Stream + Unpin,
@@ -70,5 +70,33 @@ impl<F: Future> Future for MaybeDone<F> {
             }
         }
         Poll::Ready(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::{future::pending, future::ready, pin::pin};
+
+    use super::*;
+
+    #[ntex::test]
+    async fn maybe_done_take_output() {
+        let mut fut = pin!(MaybeDone::Pending(pending::<()>()));
+        assert!(fut.as_mut().take_output().is_none());
+
+        let mut fut = pin!(MaybeDone::Pending(ready(1)));
+        fut.as_mut().await;
+        assert_eq!(fut.as_mut().take_output(), Some(1));
+        // the output is taken once
+        assert!(fut.as_mut().take_output().is_none());
+    }
+
+    #[ntex::test]
+    #[should_panic(expected = "MaybeDone polled after value taken")]
+    async fn maybe_done_poll_after_take() {
+        let mut fut = pin!(MaybeDone::Pending(ready(1)));
+        fut.as_mut().await;
+        assert_eq!(fut.as_mut().take_output(), Some(1));
+        fut.as_mut().await;
     }
 }

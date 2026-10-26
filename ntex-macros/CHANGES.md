@@ -1,5 +1,39 @@
 # Changes
 
+## [4.2.0] - 2026-10-10
+
+* Replace `syn` with `unsynn`
+
+## [4.1.0] - 2026-10-08
+
+* Fix `unused_braces` warning for one-line `main` and `test` bodies
+
+* Fix route and `main` macro error messages listing wrong arguments
+
+* Fix and extend macro docs, update README
+
+* Box the `test` macro future to reduce generated code
+
+## [4.0.0] - 2026-10-02
+
+* Update proc marcos for ntex v4
+
+## [3.5.0] - 2026-08-10
+
+* Add "panic_handling" parameters to `main` macro
+
+## [3.5.0] - 2026-08-10
+
+* Add "rt" parameter to main, `runner` parameter for rt::Builder::build() method
+
+## [3.4.0] - 2026-07-31
+
+* Update to syn v3
+
+## [3.3.0] - 2026-02-25
+
+* Add "name", "signals" and "ping_interval" parameters to `main` macro
+
 ## [3.2.0] - 2026-02-20
 
 * Upgrade to syn2

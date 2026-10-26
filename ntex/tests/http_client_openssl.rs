@@ -1,3 +1,4 @@
+#![recursion_limit = "256"]
 #![cfg(feature = "openssl")]
 use std::sync::{Arc, atomic::AtomicUsize, atomic::Ordering};
 
@@ -5,11 +6,10 @@ use tls_openssl::ssl::{
     AlpnError, SslAcceptor, SslConnector, SslFiletype, SslMethod, SslVerifyMode,
 };
 
-use ntex::client::{Client, Connector};
-use ntex::http::{HttpService, Version, test::server as test_server};
-use ntex::service::chain_factory;
+use ntex::client::Client;
+use ntex::http::{self, HttpService, Version, test::server as test_server};
 use ntex::web::{self, App, HttpResponse};
-use ntex::{SharedCfg, time::Seconds, util::Ready};
+use ntex::{SharedCfg, service, time::Seconds};
 
 fn ssl_acceptor() -> SslAcceptor {
     // load ssl keys
@@ -37,20 +37,19 @@ async fn test_connection_reuse_h2() {
     let num = Arc::new(AtomicUsize::new(0));
     let num2 = num.clone();
 
-    let srv = test_server(async move || {
+    let srv = test_server(async move |_| {
         let num2 = num2.clone();
-        chain_factory(move |io| {
+        service(async move |io| {
             num2.fetch_add(1, Ordering::Relaxed);
-            Ready::Ok(io)
+            Ok(io)
         })
-        .and_then(
-            HttpService::h2(App::new().service(
-                web::resource("/").route(web::to(|| async { HttpResponse::Ok() })),
-            ))
-            .openssl(ssl_acceptor()), //.map_err(|_| ()),
-        )
-    })
-    .await;
+        .and_then(http::openssl(
+            ssl_acceptor(),
+            HttpService::h2(
+                App::new().service(web::resource("/").route(web::to(async || HttpResponse::Ok()))),
+            ),
+        ))
+    });
 
     // disable ssl verification
     let mut builder = SslConnector::builder(SslMethod::tls()).unwrap();
@@ -60,10 +59,8 @@ async fn test_connection_reuse_h2() {
         .map_err(|e| log::error!("Cannot set alpn protocol: {e:?}"));
 
     let client = Client::builder()
-        .connector::<&str>(Connector::default().openssl(builder.build()))
-        .build(SharedCfg::default())
-        .await
-        .unwrap();
+        .openssl(builder.build())
+        .build(SharedCfg::default());
 
     // req 1
     let request = client.get(srv.surl("/")).timeout(Seconds(30)).send();
@@ -78,4 +75,298 @@ async fn test_connection_reuse_h2() {
 
     // one connection
     assert_eq!(num.load(Ordering::Relaxed), 1);
+}
+
+#[ntex::test]
+async fn test_h2_stream_limit_waits_for_payload() {
+    use ntex::client::ClientConfig;
+    use ntex::http::{Request, Response};
+    use ntex::time::{Millis, now, sleep};
+    use ntex::util::Bytes;
+
+    let num = Arc::new(AtomicUsize::new(0));
+    let num2 = num.clone();
+
+    let srv = test_server(async move |_| {
+        let num2 = num2.clone();
+        service(async move |io| {
+            num2.fetch_add(1, Ordering::Relaxed);
+            Ok(io)
+        })
+        .and_then(http::openssl(
+            ssl_acceptor(),
+            HttpService::h2(async |req: Request| {
+                let slow = req.path() == "/slow";
+                let body = futures_util::stream::once(Box::pin(async move {
+                    if slow {
+                        sleep(Millis(500)).await;
+                    }
+                    Ok::<_, std::io::Error>(Bytes::from_static(b"data"))
+                }));
+                Ok::<_, std::io::Error>(Response::Ok().streaming(body))
+            }),
+        ))
+    });
+
+    let mut builder = SslConnector::builder(SslMethod::tls()).unwrap();
+    builder.set_verify(SslVerifyMode::NONE);
+    let _ = builder.set_alpn_protos(b"\x02h2\x08http/1.1");
+
+    let client = Client::builder().openssl(builder.build()).build(
+        SharedCfg::new("CLI")
+            .add(
+                ClientConfig::new()
+                    .set_h2_connection_limit(1)
+                    .set_h2_max_streams(1),
+            )
+            .build(),
+    );
+
+    // response head is received, payload is not completed yet
+    let response = client.get(srv.surl("/slow")).send().await.unwrap();
+    assert_eq!(response.version(), Version::HTTP_2);
+
+    // second request waits for the free stream
+    let start = now();
+    let response2 = client.get(srv.surl("/")).send().await.unwrap();
+    assert!(now() - start >= std::time::Duration::from_millis(300));
+    assert!(response2.status().is_success());
+
+    assert_eq!(response.body().await.unwrap(), Bytes::from_static(b"data"));
+    assert_eq!(num.load(Ordering::Relaxed), 1);
+}
+
+#[ntex::test]
+async fn test_h2_keepalive_waits_for_request_body() {
+    use ntex::client::ClientConfig;
+    use ntex::http::{Payload, Request, Response};
+    use ntex::time::{Millis, sleep};
+    use ntex::util::{Bytes, stream_recv};
+
+    let num = Arc::new(AtomicUsize::new(0));
+    let num2 = num.clone();
+
+    let srv = test_server(async move |_| {
+        let num2 = num2.clone();
+        service(async move |io| {
+            num2.fetch_add(1, Ordering::Relaxed);
+            Ok(io)
+        })
+        .and_then(http::openssl(
+            ssl_acceptor(),
+            HttpService::h2(async |mut req: Request| {
+                // drain the request body after the response is sent
+                let mut pl: Payload = req.take_payload();
+                ntex::rt::spawn(
+                    async move { while let Some(Ok(_)) = stream_recv(&mut pl).await {} },
+                );
+                Ok::<_, std::io::Error>(Response::Ok().body("ok"))
+            }),
+        ))
+    });
+
+    let mut builder = SslConnector::builder(SslMethod::tls()).unwrap();
+    builder.set_verify(SslVerifyMode::NONE);
+    let _ = builder.set_alpn_protos(b"\x02h2\x08http/1.1");
+
+    let client = Client::builder().openssl(builder.build()).build(
+        SharedCfg::new("CLI")
+            .add(ClientConfig::new().set_h2_keepalive(Seconds(1)))
+            .build(),
+    );
+
+    // request body upload outlives the response
+    let body = Box::pin(futures_util::stream::unfold(0, async |i| {
+        if i < 10 {
+            sleep(Millis(200)).await;
+            Some((Ok::<_, std::io::Error>(Bytes::from_static(b"chunk")), i + 1))
+        } else {
+            None
+        }
+    }));
+    let response = client.post(srv.surl("/")).send_stream(body).await.unwrap();
+    assert_eq!(response.version(), Version::HTTP_2);
+    assert_eq!(response.body().await.unwrap(), Bytes::from_static(b"ok"));
+
+    // upload is still active, connection is not idle
+    sleep(Millis(1500)).await;
+    let response = client.get(srv.surl("/")).send().await.unwrap();
+    assert!(response.status().is_success());
+    assert_eq!(num.load(Ordering::Relaxed), 1);
+}
+
+#[ntex::test]
+async fn test_h2_unread_request_body_is_reset() {
+    use std::sync::atomic::AtomicBool;
+
+    use ntex::http::{Request, Response};
+    use ntex::time::{Millis, sleep, timeout};
+    use ntex::util::Bytes;
+
+    let srv = test_server(async |_| {
+        http::openssl(
+            ssl_acceptor(),
+            HttpService::h2(async |_: Request| Ok::<_, std::io::Error>(Response::Ok().body("ok"))),
+        )
+    });
+
+    let mut builder = SslConnector::builder(SslMethod::tls()).unwrap();
+    builder.set_verify(SslVerifyMode::NONE);
+    let _ = builder.set_alpn_protos(b"\x02h2\x08http/1.1");
+    let client = Client::builder()
+        .openssl(builder.build())
+        .build(SharedCfg::default());
+
+    struct Guard(Arc<AtomicBool>);
+    impl Drop for Guard {
+        fn drop(&mut self) {
+            self.0.store(true, Ordering::Relaxed);
+        }
+    }
+
+    // request body upload outlives the response
+    let dropped = Arc::new(AtomicBool::new(false));
+    let guard = Guard(dropped.clone());
+    let body = Box::pin(futures_util::stream::unfold(0, move |i| {
+        let _g = &guard;
+        async move {
+            if i < 50 {
+                sleep(Millis(100)).await;
+                Some((Ok::<_, std::io::Error>(Bytes::from_static(b"chunk")), i + 1))
+            } else {
+                None
+            }
+        }
+    }));
+    let response = client.post(srv.surl("/")).send_stream(body).await.unwrap();
+    assert_eq!(response.version(), Version::HTTP_2);
+    assert_eq!(response.body().await.unwrap(), Bytes::from_static(b"ok"));
+
+    // server resets the unread request body, the upload stops
+    timeout(Millis(1_000), async {
+        while !dropped.load(Ordering::Relaxed) {
+            sleep(Millis(50)).await;
+        }
+    })
+    .await
+    .expect("request body upload is not stopped");
+}
+
+#[ntex::test]
+async fn test_h2_stalled_request_body_is_dropped_on_reset() {
+    use std::sync::atomic::AtomicBool;
+
+    use ntex::http::{Request, Response};
+    use ntex::time::{Millis, sleep, timeout};
+    use ntex::util::Bytes;
+
+    let srv = test_server(async |_| {
+        http::openssl(
+            ssl_acceptor(),
+            HttpService::h2(async |_: Request| Ok::<_, std::io::Error>(Response::Ok().body("ok"))),
+        )
+    });
+
+    let mut builder = SslConnector::builder(SslMethod::tls()).unwrap();
+    builder.set_verify(SslVerifyMode::NONE);
+    let _ = builder.set_alpn_protos(b"\x02h2\x08http/1.1");
+    let client = Client::builder()
+        .openssl(builder.build())
+        .build(SharedCfg::default());
+
+    struct Guard(Arc<AtomicBool>);
+    impl Drop for Guard {
+        fn drop(&mut self) {
+            self.0.store(true, Ordering::Relaxed);
+        }
+    }
+
+    // the request body waits for data forever after the first chunk
+    let dropped = Arc::new(AtomicBool::new(false));
+    let guard = Guard(dropped.clone());
+    let body = Box::pin(futures_util::stream::unfold(0, move |i| {
+        let _g = &guard;
+        async move {
+            if i == 0 {
+                Some((Ok::<_, std::io::Error>(Bytes::from_static(b"chunk")), 1))
+            } else {
+                std::future::pending().await
+            }
+        }
+    }));
+    let response = client.post(srv.surl("/")).send_stream(body).await.unwrap();
+    assert_eq!(response.version(), Version::HTTP_2);
+    assert_eq!(response.body().await.unwrap(), Bytes::from_static(b"ok"));
+
+    // server resets the unread request body, the stalled upload is dropped
+    timeout(Millis(1_000), async {
+        while !dropped.load(Ordering::Relaxed) {
+            sleep(Millis(50)).await;
+        }
+    })
+    .await
+    .expect("stalled request body upload is not dropped");
+}
+
+#[ntex::test]
+async fn test_h2_request_body_dropped_after_response_is_reset() {
+    use std::sync::atomic::AtomicBool;
+
+    use ntex::http::{Payload, Request, Response};
+    use ntex::time::{Millis, sleep, timeout};
+    use ntex::util::{Bytes, stream_recv};
+
+    let srv = test_server(async |_| {
+        http::openssl(
+            ssl_acceptor(),
+            HttpService::h2(async |mut req: Request| {
+                // the request body is dropped after the response is complete
+                let mut pl: Payload = req.take_payload();
+                ntex::rt::spawn(async move {
+                    let _ = stream_recv(&mut pl).await;
+                });
+                Ok::<_, std::io::Error>(Response::Ok().body("ok"))
+            }),
+        )
+    });
+
+    let mut builder = SslConnector::builder(SslMethod::tls()).unwrap();
+    builder.set_verify(SslVerifyMode::NONE);
+    let _ = builder.set_alpn_protos(b"\x02h2\x08http/1.1");
+    let client = Client::builder()
+        .openssl(builder.build())
+        .build(SharedCfg::default());
+
+    struct Guard(Arc<AtomicBool>);
+    impl Drop for Guard {
+        fn drop(&mut self) {
+            self.0.store(true, Ordering::Relaxed);
+        }
+    }
+
+    let dropped = Arc::new(AtomicBool::new(false));
+    let guard = Guard(dropped.clone());
+    let body = Box::pin(futures_util::stream::unfold(0, move |i| {
+        let _g = &guard;
+        async move {
+            if i < 50 {
+                sleep(Millis(100)).await;
+                Some((Ok::<_, std::io::Error>(Bytes::from_static(b"chunk")), i + 1))
+            } else {
+                None
+            }
+        }
+    }));
+    let response = client.post(srv.surl("/")).send_stream(body).await.unwrap();
+    assert_eq!(response.version(), Version::HTTP_2);
+    assert_eq!(response.body().await.unwrap(), Bytes::from_static(b"ok"));
+
+    // server resets the stream on the next data chunk, the upload stops
+    timeout(Millis(1_000), async {
+        while !dropped.load(Ordering::Relaxed) {
+            sleep(Millis(50)).await;
+        }
+    })
+    .await
+    .expect("request body upload is not stopped");
 }

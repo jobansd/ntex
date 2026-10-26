@@ -1,4 +1,8 @@
 //! Utilities for tracking time.
+//!
+//! Use [`sleep`], [`deadline`] or [`interval`] for asynchronous waits. To run a
+//! short synchronous callback without polling a timer future, retain a
+//! [`CallbackTimer`].
 #![allow(
     clippy::cast_possible_truncation,
     clippy::cast_sign_loss,
@@ -6,46 +10,51 @@
 )]
 use std::{cmp, future::Future, future::poll_fn, pin::Pin, task, task::Poll};
 
+mod callbacks;
 mod types;
 mod wheel;
 
+pub use self::callbacks::CallbackTimer;
 pub use self::types::{Millis, Seconds};
-pub use self::wheel::{TimerHandle, now, query_system_time, system_time};
+pub use self::wheel::{TimerHandle, now, system_time};
 
-/// Waits until `duration` has elapsed.
+/// Waits until `dur` has elapsed.
 ///
-/// No work is performed while awaiting on the sleep future to complete. `Sleep`
-/// operates at 16 millisecond granularity and should not be used for tasks that
-/// require high-resolution timers. `Sleep` sleeps at least one tick (16 millis)
-/// even if 0 millis duration is used.
+/// No work is performed while awaiting the returned [`Sleep`]. Timers have a
+/// granularity of approximately 16 milliseconds and are not suitable for
+/// high-resolution timing. A zero duration still waits for at least one timer
+/// tick.
 #[inline]
 pub fn sleep<T: Into<Millis>>(dur: T) -> Sleep {
     Sleep::new(dur.into())
 }
 
-/// Waits until `duration` has elapsed.
+/// Waits until `dur` has elapsed.
 ///
-/// This is similar to `sleep` future, but in case of `0` duration deadline future
-/// never completes.
+/// Unlike [`sleep`], a zero-duration deadline never completes.
 #[inline]
 pub fn deadline<T: Into<Millis>>(dur: T) -> Deadline {
     Deadline::new(dur.into())
 }
 
-/// Creates new [`Interval`] that yields with interval of `period`.
+/// Creates an [`Interval`] that ticks every `period`.
 ///
-/// An interval will tick indefinitely. At any time, the [`Interval`] value can
-/// be dropped. This cancels the interval.
+/// The first tick completes immediately, and each later tick completes
+/// `period` after the previous one was observed. An interval will tick
+/// indefinitely. At any time, the [`Interval`] value can be dropped. This
+/// cancels the interval.
 #[inline]
 pub fn interval<T: Into<Millis>>(period: T) -> Interval {
     Interval::new(period.into())
 }
 
-/// Require a `Future` to complete before the specified duration has elapsed.
+/// Requires a future to complete before `dur` has elapsed.
 ///
 /// If the future completes before the duration has elapsed, then the completed
 /// value is returned. Otherwise, an error is returned and the future is
-/// canceled.
+/// canceled. A zero duration still represents an active timeout of at least
+/// one timer tick; use [`timeout_checked`] to disable the timeout with zero. If
+/// the future and timer are both ready during the same poll, the future wins.
 #[inline]
 pub fn timeout<T, U>(dur: U, future: T) -> Timeout<T>
 where
@@ -55,11 +64,11 @@ where
     Timeout::new_with_delay(future, Sleep::new(dur.into()))
 }
 
-/// Require a `Future` to complete before the specified duration has elapsed.
+/// Requires a future to complete before `dur` has elapsed.
 ///
 /// If the future completes before the duration has elapsed, then the completed
 /// value is returned. Otherwise, an error is returned and the future is
-/// canceled. If duration value is zero then timeout is disabled.
+/// canceled. A zero duration disables the timeout.
 #[inline]
 pub fn timeout_checked<T, U>(dur: U, future: T) -> TimeoutChecked<T>
 where
@@ -92,7 +101,9 @@ pub struct Sleep {
 }
 
 impl Sleep {
-    /// Create new sleep future
+    /// Creates a new sleep future.
+    ///
+    /// A zero duration is rounded up to 1 ms.
     #[inline]
     pub fn new(duration: Millis) -> Sleep {
         Sleep {
@@ -106,7 +117,7 @@ impl Sleep {
         self.hnd.is_elapsed()
     }
 
-    /// Complete sleep timer.
+    /// Completes the timer immediately.
     #[inline]
     pub fn elapse(&self) {
         self.hnd.elapse();
@@ -118,18 +129,19 @@ impl Sleep {
     /// future completes without having to create new associated state.
     ///
     /// This function can be called both before and after the future has
-    /// completed.
+    /// completed. A zero duration is rounded up to 1 ms.
     pub fn reset<T: Into<Millis>>(&self, millis: T) {
-        self.hnd.reset(u64::from(millis.into().0));
+        self.hnd.reset(u64::from(cmp::max(millis.into().0, 1)));
     }
 
     #[inline]
-    /// Wait when `Sleep` instance get elapsed.
+    /// Waits until this timer has elapsed.
     pub async fn wait(&self) {
         poll_fn(|cx| self.hnd.poll_elapsed(cx)).await;
     }
 
     #[inline]
+    /// Polls until this timer has elapsed.
     pub fn poll_elapsed(&self, cx: &mut task::Context<'_>) -> Poll<()> {
         self.hnd.poll_elapsed(cx)
     }
@@ -165,7 +177,9 @@ pub struct Deadline {
 }
 
 impl Deadline {
-    /// Create new deadline future
+    /// Creates a new deadline future.
+    ///
+    /// A zero duration creates a deadline that never completes.
     #[inline]
     pub fn new(duration: Millis) -> Deadline {
         if duration.0 != 0 {
@@ -178,7 +192,7 @@ impl Deadline {
     }
 
     #[inline]
-    /// Wait when `Sleep` instance get elapsed.
+    /// Waits until this deadline has elapsed.
     pub async fn wait(&self) {
         poll_fn(|cx| self.poll_elapsed(cx)).await;
     }
@@ -204,12 +218,19 @@ impl Deadline {
     }
 
     /// Returns `true` if `Deadline` has elapsed.
+    ///
+    /// A disabled zero-duration deadline is reported as elapsed here even
+    /// though polling it remains pending. Use this method to determine whether
+    /// there is an active future deadline to wait for.
     #[inline]
     pub fn is_elapsed(&self) -> bool {
         self.hnd.as_ref().is_none_or(TimerHandle::is_elapsed)
     }
 
     #[inline]
+    /// Polls until this deadline has elapsed.
+    ///
+    /// A zero-duration deadline remains pending until it is reset.
     pub fn poll_elapsed(&self, cx: &mut task::Context<'_>) -> Poll<()> {
         self.hnd
             .as_ref()
@@ -311,7 +332,7 @@ where
     }
 }
 
-/// Interval returned by [`interval`]
+/// An interval returned by [`interval`].
 ///
 /// This type allows you to wait on a sequence of instants with a certain
 /// duration between each instant.
@@ -323,21 +344,26 @@ pub struct Interval {
 }
 
 impl Interval {
-    /// Create new sleep future
+    /// Creates an interval with the specified period.
+    ///
+    /// The first tick completes immediately. A zero period is rounded up to
+    /// 1 ms.
     #[inline]
     pub fn new(period: Millis) -> Interval {
         Interval {
-            hnd: TimerHandle::new(u64::from(period.0)),
-            period: period.0,
+            hnd: TimerHandle::new(0),
+            period: cmp::max(period.0, 1),
         }
     }
 
     #[inline]
+    /// Waits for the next interval tick.
     pub async fn tick(&self) {
         poll_fn(|cx| self.poll_tick(cx)).await;
     }
 
     #[inline]
+    /// Polls for the next interval tick.
     pub fn poll_tick(&self, cx: &mut task::Context<'_>) -> Poll<()> {
         if self.hnd.poll_elapsed(cx).is_ready() {
             self.hnd.reset(u64::from(self.period));
@@ -352,10 +378,7 @@ impl crate::Stream for Interval {
     type Item = ();
 
     #[inline]
-    fn poll_next(
-        self: Pin<&mut Self>,
-        cx: &mut task::Context<'_>,
-    ) -> Poll<Option<Self::Item>> {
+    fn poll_next(self: Pin<&mut Self>, cx: &mut task::Context<'_>) -> Poll<Option<Self::Item>> {
         self.poll_tick(cx).map(|()| Some(()))
     }
 }
@@ -368,22 +391,25 @@ mod tests {
     use super::*;
     use crate::future::lazy;
 
-    /// State Under Test: Two calls of `now()` return the same value if they are done within resolution interval.
+    /// State Under Test: `now()` returns the start of the current runtime turn.
     ///
-    /// Expected Behavior: Two back-to-back calls of `now()` return the same value.
+    /// Expected Behavior: `now()` is not later than the current instant and is close to it.
     #[ntex::test]
-    async fn lowres_time_does_not_immediately_change() {
+    async fn now_is_current() {
         sleep(Millis(25)).await;
 
-        assert_eq!(now(), now());
+        let now = now();
+        let cur = time::Instant::now();
+        assert!(cur >= now);
+        assert!(cur - now < time::Duration::from_millis(50));
     }
 
-    /// State Under Test: `now()` updates returned value every ~1ms period.
+    /// State Under Test: `now()` advances between runtime turns.
     ///
     /// Expected Behavior: Two calls of `now()` made in subsequent resolution interval return different values
     /// and second value is greater than the first one at least by a 1ms interval.
     #[ntex::test]
-    async fn lowres_time_updates_after_resolution_interval() {
+    async fn now_updates_after_sleep() {
         sleep(Millis(50)).await;
 
         let first_time = now();
@@ -394,7 +420,8 @@ mod tests {
         assert!(second_time - first_time >= time::Duration::from_millis(25));
     }
 
-    /// State Under Test: Two calls of `system_time()` return the same value if they are done within 1ms interval.
+    /// State Under Test: Two calls of `system_time()` return the same value if they are done within the
+    /// resolution interval.
     ///
     /// Expected Behavior: Two back-to-back calls of `now()` return the same value.
     #[ntex::test]
@@ -402,10 +429,9 @@ mod tests {
         sleep(Seconds(1)).await;
 
         assert_eq!(system_time(), system_time());
-        assert_eq!(system_time(), query_system_time());
     }
 
-    /// State Under Test: `system_time()` updates returned value every 1ms period.
+    /// State Under Test: `system_time()` updates returned value every resolution interval (150ms).
     ///
     /// Expected Behavior: Two calls of `system_time()` made in subsequent resolution interval return different values
     /// and second value is greater than the first one at least by a resolution interval.
@@ -413,7 +439,7 @@ mod tests {
     async fn system_time_service_time_updates_after_resolution_interval() {
         sleep(Millis(100)).await;
 
-        let wait_time = 300;
+        let wait_time = 600;
 
         let first_time = system_time()
             .duration_since(time::SystemTime::UNIX_EPOCH)
@@ -435,34 +461,43 @@ mod tests {
     async fn test_sleep_0() {
         sleep(Seconds(1)).await;
 
-        let first_time = now();
+        let first_time = time::Instant::now();
         sleep(Millis(0)).await;
-        let second_time = now();
+        let second_time = time::Instant::now();
         assert!(second_time - first_time >= time::Duration::from_millis(1));
 
-        let first_time = now();
+        let first_time = time::Instant::now();
         sleep(Millis(1)).await;
-        let second_time = now();
+        let second_time = time::Instant::now();
         assert!(second_time - first_time >= time::Duration::from_millis(1));
 
-        let first_time = now();
+        let first_time = time::Instant::now();
         let fut = sleep(Millis(10000));
         assert!(!fut.is_elapsed());
+        // a zero delay is rounded up to 1 ms
         fut.reset(Millis::ZERO);
+        assert!(!fut.is_elapsed());
         fut.await;
-        let second_time = now();
-        assert!(second_time - first_time < time::Duration::from_millis(1));
+        let second_time = time::Instant::now();
+        assert!(second_time - first_time >= time::Duration::from_millis(1));
 
-        let first_time = now();
+        let fut = sleep(Millis::ZERO);
+        assert!(!fut.is_elapsed());
+        fut.await;
+
+        // `now()` may advance between two calls, measure
+        // with the clock. An elapsed timer completes without waiting for the
+        // timer driver, the bound leaves room for scheduling latency
+        let first_time = time::Instant::now();
         let fut = Sleep {
             hnd: TimerHandle::new(0),
         };
         assert!(fut.is_elapsed());
         fut.await;
-        let second_time = now();
-        assert!(second_time - first_time < time::Duration::from_millis(1));
+        let second_time = time::Instant::now();
+        assert!(second_time - first_time < time::Duration::from_millis(50));
 
-        let first_time = now();
+        let first_time = time::Instant::now();
         let fut = Rc::new(sleep(Millis(10_0000)));
         let s = fut.clone();
         ntex::rt::spawn(async move {
@@ -470,8 +505,8 @@ mod tests {
         });
         poll_fn(|cx| fut.poll_elapsed(cx)).await;
         assert!(fut.is_elapsed());
-        let second_time = now();
-        assert!(second_time - first_time < time::Duration::from_millis(1));
+        let second_time = time::Instant::now();
+        assert!(second_time - first_time < time::Duration::from_millis(50));
     }
 
     #[ntex::test]
@@ -505,8 +540,23 @@ mod tests {
     }
 
     #[ntex::test]
+    async fn test_interval_zero_period() {
+        let int = interval(Millis::ZERO);
+        int.tick().await;
+
+        // a zero period is rounded up to 1 ms instead of ticking on every poll
+        assert!(lazy(|cx| int.poll_tick(cx)).await.is_pending());
+        int.tick().await;
+    }
+
+    #[ntex::test]
     async fn test_interval() {
         let mut int = interval(Millis(250));
+
+        // the first tick completes immediately
+        let time = time::Instant::now();
+        int.tick().await;
+        assert!(time.elapsed() < time::Duration::from_millis(50));
 
         let time = time::Instant::now();
         int.tick().await;
@@ -530,6 +580,7 @@ mod tests {
     #[ntex::test]
     async fn test_interval_one_sec() {
         let int = interval(Millis::ONE_SEC);
+        int.tick().await;
 
         for _i in 0..3 {
             let time = time::Instant::now();
@@ -548,10 +599,26 @@ mod tests {
         let result = timeout_checked(Millis(200), sleep(Millis(100))).await;
         assert!(result.is_ok());
 
-        let result = timeout_checked(Millis(5), sleep(Millis(100))).await;
+        // a future that never completes, a late timer driver would elapse
+        // a competing sleep in the same pass
+        let result = timeout_checked(Millis(5), std::future::pending::<()>()).await;
         assert!(result.is_err());
 
         let result = timeout_checked(Millis(0), sleep(Millis(100))).await;
         assert!(result.is_ok());
+    }
+
+    #[ntex::test]
+    async fn sleep_and_deadline_wait() {
+        let start = now();
+        sleep(Millis(5)).wait().await;
+        deadline(Millis(5)).wait().await;
+        assert!(now() >= start);
+
+        let hnd = Deadline::new(Millis::ZERO);
+        assert!(
+            crate::time::timeout(Millis(20), hnd.wait()).await.is_err(),
+            "zero deadline never completes"
+        );
     }
 }

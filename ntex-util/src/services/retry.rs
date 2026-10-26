@@ -1,41 +1,42 @@
-#![allow(async_fn_in_trait)]
-use ntex_service::{Middleware, Service, ServiceCtx};
+use ntex_service::{Ctx, Middleware, Service};
 
-/// Trait defines retry policy
-pub trait Policy<Req, S: Service<Req>>: Sized + Clone {
-    async fn retry(&mut self, req: &Req, res: &Result<S::Response, S::Error>) -> bool;
+/// Determines whether and how a failed service call is retried.
+pub trait Policy<S: Service<St, Req>, St, Req>: Sized + Clone {
+    /// Returns whether the call should be retried.
+    async fn retry(&mut self, req: &Req, res: &Result<S::Res, S::Error>) -> bool;
 
+    /// Clones or reconstructs a request for a possible retry.
+    ///
+    /// Returning `None` prevents retries for this request.
     fn clone_request(&self, req: &Req) -> Option<Req>;
 }
 
 #[derive(Clone, Debug)]
-/// Retry middleware
+/// Middleware that retries service calls according to a [`Policy`].
 ///
-/// Retry middleware allows to retry service call
+/// The policy is cloned for each request.
 pub struct Retry<P> {
     policy: P,
 }
 
 #[derive(Clone, Debug)]
-/// Retry service
-///
-/// Retry service allows to retry service call
+/// A service that retries calls according to a [`Policy`].
 pub struct RetryService<P, S> {
     policy: P,
     service: S,
 }
 
 impl<P> Retry<P> {
-    /// Create retry middleware
+    /// Creates retry middleware with the specified policy.
     pub fn new(policy: P) -> Self {
         Retry { policy }
     }
 }
 
-impl<P: Clone, S, C> Middleware<S, C> for Retry<P> {
+impl<P: Clone, S, St> Middleware<S, St> for Retry<P> {
     type Service = RetryService<P, S>;
 
-    fn create(&self, service: S, _: C) -> Self::Service {
+    fn create(&self, _: &St, service: S) -> Self::Service {
         RetryService {
             service,
             policy: self.policy.clone(),
@@ -44,57 +45,53 @@ impl<P: Clone, S, C> Middleware<S, C> for Retry<P> {
 }
 
 impl<P, S> RetryService<P, S> {
-    /// Create retry service
+    /// Wraps a service with the specified retry policy.
     pub fn new(policy: P, service: S) -> Self {
         RetryService { policy, service }
     }
 }
 
-impl<P, S, R> Service<R> for RetryService<P, S>
+impl<P, S, St, Req> Service<St, Req> for RetryService<P, S>
 where
-    P: Policy<R, S>,
-    S: Service<R>,
+    P: Policy<S, St, Req>,
+    S: Service<St, Req>,
 {
-    type Response = S::Response;
+    type Res = S::Res;
     type Error = S::Error;
 
-    ntex_service::forward_poll!(service);
-    ntex_service::forward_ready!(service);
-    ntex_service::forward_shutdown!(service);
-
-    async fn call(
-        &self,
-        mut request: R,
-        ctx: ServiceCtx<'_, Self>,
-    ) -> Result<S::Response, S::Error> {
+    #[allow(
+        deprecated,
+        reason = "preserve the validated first-attempt bypass; retries use Ctx::call"
+    )]
+    async fn call(&self, req: Req, ctx: Ctx<'_, Self, St>) -> Result<S::Res, S::Error> {
         let mut policy = self.policy.clone();
-        let mut cloned = policy.clone_request(&request);
+        let mut cloned = policy.clone_request(&req);
+        // the first call is covered by the outer readiness check
+        let mut result = ctx.call_nowait(&self.service, req).await;
 
-        loop {
-            let result = ctx.call(&self.service, request).await;
-
-            cloned = if let Some(req) = cloned.take() {
-                if policy.retry(&req, &result).await {
-                    request = req;
-                    policy.clone_request(&request)
-                } else {
-                    return result;
-                }
-            } else {
-                return result;
+        while let Some(r) = cloned.take() {
+            if !policy.retry(&r, &result).await {
+                break;
             }
+            cloned = policy.clone_request(&r);
+            result = ctx.call(&self.service, r).await;
         }
+        result
     }
+
+    ntex_service::forward_bind!(St, service);
+    ntex_service::forward_ready!(St, service);
+    ntex_service::forward_shutdown!(St, service);
 }
 
 #[derive(Copy, Clone, Debug)]
-/// Default retry policy
+/// A retry policy that retries every service error.
 ///
-/// This policy retries on any error. By default retry count is 3
+/// The default policy permits up to three retries after the initial call.
 pub struct DefaultRetryPolicy(u16);
 
 impl DefaultRetryPolicy {
-    /// Create default retry policy
+    /// Creates a policy that permits up to `retry` retries.
     pub fn new(retry: u16) -> Self {
         DefaultRetryPolicy(retry)
     }
@@ -106,12 +103,12 @@ impl Default for DefaultRetryPolicy {
     }
 }
 
-impl<R, S> Policy<R, S> for DefaultRetryPolicy
+impl<S, St, Req> Policy<S, St, Req> for DefaultRetryPolicy
 where
-    R: Clone,
-    S: Service<R>,
+    S: Service<St, Req>,
+    Req: Clone,
 {
-    async fn retry(&mut self, _: &R, res: &Result<S::Response, S::Error>) -> bool {
+    async fn retry(&mut self, _: &Req, res: &Result<S::Res, S::Error>) -> bool {
         if res.is_err() {
             if self.0 == 0 {
                 false
@@ -124,13 +121,14 @@ where
         }
     }
 
-    fn clone_request(&self, req: &R) -> Option<R> {
+    fn clone_request(&self, req: &Req) -> Option<Req> {
         Some(req.clone())
     }
 }
 
 #[cfg(test)]
 mod tests {
+    #![allow(clippy::unused_async_trait_impl)]
     use std::{cell::Cell, rc::Rc};
 
     use ntex_service::{Pipeline, apply, fn_factory};
@@ -140,11 +138,11 @@ mod tests {
     #[derive(Clone, Debug, PartialEq)]
     struct TestService(Rc<Cell<usize>>);
 
-    impl Service<()> for TestService {
-        type Response = ();
+    impl Service<(), ()> for TestService {
+        type Res = ();
         type Error = ();
 
-        async fn call(&self, _r: (), _: ServiceCtx<'_, Self>) -> Result<(), ()> {
+        async fn call(&self, _r: (), _: Ctx<'_, Self>) -> Result<(), ()> {
             let cnt = self.0.get();
             if cnt == 0 {
                 Ok(())
@@ -159,8 +157,8 @@ mod tests {
     async fn test_retry() {
         let cnt = Rc::new(Cell::new(5));
         let svc = Pipeline::new(
-            RetryService::new(DefaultRetryPolicy::default(), TestService(cnt.clone()))
-                .clone(),
+            (),
+            RetryService::new(DefaultRetryPolicy::default(), TestService(cnt.clone())).clone(),
         );
         assert_eq!(svc.call(()).await, Err(()));
         assert_eq!(svc.ready().await, Ok(()));
@@ -169,16 +167,45 @@ mod tests {
 
         let factory = apply(
             Retry::new(DefaultRetryPolicy::new(3)).clone(),
-            fn_factory(|| async { Ok::<_, ()>(TestService(Rc::new(Cell::new(2)))) }),
+            fn_factory(|(): &()| async { Ok::<_, ()>(TestService(Rc::new(Cell::new(2)))) }),
         );
-        let srv = factory.pipeline(&()).await.unwrap();
+        let srv = factory.pipeline(()).await.unwrap();
         assert_eq!(srv.call(()).await, Ok(()));
 
         let factory = apply(
             Retry::new(DefaultRetryPolicy::new(3)).clone(),
-            fn_factory(|| async { Ok::<_, ()>(TestService(Rc::new(Cell::new(2)))) }),
+            fn_factory(|(): &()| async { Ok::<_, ()>(TestService(Rc::new(Cell::new(2)))) }),
         );
-        let srv = factory.pipeline(&()).await.unwrap();
+        let srv = factory.pipeline(()).await.unwrap();
         assert_eq!(srv.call(()).await, Ok(()));
+    }
+
+    #[derive(Clone)]
+    struct CloneOnce(Rc<Cell<usize>>);
+
+    impl Policy<TestService, (), ()> for CloneOnce {
+        async fn retry(&mut self, (): &(), res: &Result<(), ()>) -> bool {
+            res.is_err()
+        }
+
+        fn clone_request(&self, (): &()) -> Option<()> {
+            let n = self.0.get();
+            self.0.set(n + 1);
+            if n == 0 { Some(()) } else { None }
+        }
+    }
+
+    #[ntex::test]
+    async fn test_retry_without_clone() {
+        // the retried request cannot be cloned again, its result is returned
+        let cnt = Rc::new(Cell::new(5));
+        let clones = Rc::new(Cell::new(0));
+        let svc = Pipeline::new(
+            (),
+            RetryService::new(CloneOnce(clones.clone()), TestService(cnt.clone())),
+        );
+        assert_eq!(svc.call(()).await, Err(()));
+        assert_eq!(cnt.get(), 3);
+        assert_eq!(clones.get(), 2);
     }
 }

@@ -1,18 +1,66 @@
 //! Request extractors
-use super::error::ErrorRenderer;
-use super::httprequest::HttpRequest;
+use std::convert::Infallible;
+
+use super::{HttpRequest, State, WebResponseError};
 use crate::http::Payload;
 
-#[allow(async_fn_in_trait)]
-/// Trait implemented by types that can be extracted from request.
+/// Turns request data into a value that a handler can use.
 ///
-/// Types that implement this trait can be used with `Route` handlers.
-pub trait FromRequest<Err>: Sized {
-    /// The associated error which can be returned.
+/// Each argument accepted by a handler registered with
+/// [`Route::to()`](super::Route::to) is an extractor. Before calling the
+/// handler, ntex asks each argument type to create its value from the incoming
+/// request.
+///
+/// An extractor can look at the application state, request headers, path, and
+/// other request information. It can also read the request body through the
+/// payload. Extractors run in the same order as the handler arguments and
+/// share that payload, so an extractor that reads the body may leave nothing
+/// for the next one. For that reason, a handler should normally have only one
+/// body-reading extractor.
+///
+/// When an extractor returns an error, ntex turns it into an HTTP response and
+/// skips the handler. The error must implement [`WebResponseError`] for the
+/// application. If the handler should still run, use `Option<T>` to receive
+/// `None`, or `Result<T, T::Error>` to receive the original error.
+///
+/// # Example
+///
+/// A custom extractor can turn a request header into a handler argument:
+///
+/// ```rust
+/// use ntex::http::Payload;
+/// use ntex::web::{self, FromRequest, HttpRequest, InternalError};
+///
+/// struct ClientName(String);
+///
+/// impl<St: web::State> FromRequest<St> for ClientName {
+///     type Error = InternalError<&'static str>;
+///
+///     async fn from_request(_: &St, req: &HttpRequest, _: &mut Payload) -> Result<Self, Self::Error> {
+///         req.headers()
+///             .get("x-client-name")
+///             .and_then(|value| value.to_str().ok())
+///             .map(|value| ClientName(value.to_owned()))
+///             .ok_or_else(|| web::error::ErrorBadRequest("Missing client name"))
+///     }
+/// }
+///
+/// async fn hello(client: ClientName) -> String {
+///     format!("Hello, {}!", client.0)
+/// }
+///
+/// let app = web::App::default().route("/", web::get().to(hello));
+/// ```
+pub trait FromRequest<St>: Sized {
+    /// The error returned when extraction fails.
+    ///
+    /// For a route handler, ntex must be able to turn this error into an HTTP
+    /// response through [`WebResponseError`].
     type Error;
 
-    /// Convert request to a Self
+    /// Creates the extractor value for this request.
     async fn from_request(
+        st: &St,
         req: &HttpRequest,
         payload: &mut Payload,
     ) -> Result<Self, Self::Error>;
@@ -26,7 +74,7 @@ pub trait FromRequest<Err>: Sized {
 ///
 /// ```rust
 /// use ntex::http;
-/// use ntex::web::{self, error, App, HttpRequest, FromRequest, DefaultError};
+/// use ntex::web::{self, error, App, HttpRequest, FromRequest, InternalError};
 /// use rand;
 ///
 /// #[derive(Debug, serde::Deserialize)]
@@ -34,14 +82,14 @@ pub trait FromRequest<Err>: Sized {
 ///     name: String
 /// }
 ///
-/// impl<Err> FromRequest<Err> for Thing {
-///     type Error = error::Error;
+/// impl<St> FromRequest<St> for Thing {
+///     type Error = InternalError<&'static str>;
 ///
-///     async fn from_request(req: &HttpRequest, payload: &mut http::Payload) -> Result<Self, Self::Error> {
+///     async fn from_request(st: &St, req: &HttpRequest, payload: &mut http::Payload) -> Result<Self, Self::Error> {
 ///         if rand::random() {
 ///             Ok(Thing { name: "thingy".into() })
 ///         } else {
-///             Err(error::ErrorBadRequest("no luck").into())
+///             Err(error::ErrorBadRequest("no luck"))
 ///         }
 ///     }
 /// }
@@ -56,29 +104,30 @@ pub trait FromRequest<Err>: Sized {
 /// }
 ///
 /// fn main() {
-///     let app = App::new().service(
-///         web::resource("/users/:first").route(
+///     let app = App::default().service(
+///         web::resource("/users/{first}").route(
 ///             web::post().to(index))
 ///     );
 /// }
 /// ```
-impl<T, Err> FromRequest<Err> for Option<T>
+impl<St, T> FromRequest<St> for Option<T>
 where
-    T: FromRequest<Err>,
-    Err: ErrorRenderer,
-    <T as FromRequest<Err>>::Error: Into<Err::Container>,
+    St: State,
+    T: FromRequest<St>,
+    <T as FromRequest<St>>::Error: WebResponseError<St, St::Error>,
 {
-    type Error = Err::Container;
+    type Error = Infallible;
 
     #[inline]
     async fn from_request(
+        st: &St,
         req: &HttpRequest,
         payload: &mut Payload,
     ) -> Result<Option<T>, Self::Error> {
-        match T::from_request(req, payload).await {
+        match T::from_request(st, req, payload).await {
             Ok(v) => Ok(Some(v)),
             Err(e) => {
-                log::debug!("Error for Option<T> extractor: {}", e.into());
+                log::debug!("Error for Option<T> extractor: {e}");
                 Ok(None)
             }
         }
@@ -93,7 +142,7 @@ where
 ///
 /// ```rust
 /// use ntex::http;
-/// use ntex::web::{self, error, App, HttpRequest, FromRequest};
+/// use ntex::web::{self, error, App, State, HttpRequest, FromRequest, InternalError};
 /// use rand;
 ///
 /// #[derive(Debug, serde::Deserialize)]
@@ -101,20 +150,20 @@ where
 ///     name: String
 /// }
 ///
-/// impl<Err> FromRequest<Err> for Thing {
-///     type Error = error::Error;
+/// impl<St: State> FromRequest<St> for Thing {
+///     type Error = InternalError<&'static str>;
 ///
-///     async fn from_request(req: &HttpRequest, payload: &mut http::Payload) -> Result<Thing, Self::Error> {
+///     async fn from_request(st: &St, req: &HttpRequest, payload: &mut http::Payload) -> Result<Thing, Self::Error> {
 ///         if rand::random() {
 ///             Ok(Thing { name: "thingy".into() })
 ///         } else {
-///             Err(error::ErrorBadRequest("no luck").into())
+///             Err(error::ErrorBadRequest("no luck"))
 ///         }
 ///     }
 /// }
 ///
 /// /// extract `Thing` from request
-/// async fn index(supplied_thing: Result<Thing, error::Error>) -> String {
+/// async fn index(supplied_thing: Result<Thing, InternalError<&'static str>>) -> String {
 ///     match supplied_thing {
 ///         Ok(thing) => format!("Got thing: {:?}", thing),
 ///         Err(e) => format!("Error extracting thing: {}", e)
@@ -122,24 +171,25 @@ where
 /// }
 ///
 /// fn main() {
-///     let app = App::new().service(
-///         web::resource("/users/:first").route(web::post().to(index))
+///     let app = App::default().service(
+///         web::resource("/users/{first}").route(web::post().to(index))
 ///     );
 /// }
 /// ```
-impl<T, E> FromRequest<E> for Result<T, T::Error>
+impl<St, T> FromRequest<St> for Result<T, T::Error>
 where
-    T: FromRequest<E>,
-    E: ErrorRenderer,
+    St: State,
+    T: FromRequest<St>,
 {
     type Error = T::Error;
 
     #[inline]
     async fn from_request(
+        st: &St,
         req: &HttpRequest,
         payload: &mut Payload,
     ) -> Result<Self, Self::Error> {
-        match T::from_request(req, payload).await {
+        match T::from_request(st, req, payload).await {
             Ok(v) => Ok(Ok(v)),
             Err(e) => Ok(Err(e)),
         }
@@ -147,11 +197,11 @@ where
 }
 
 #[doc(hidden)]
-impl<E: ErrorRenderer> FromRequest<E> for () {
-    type Error = E::Container;
+impl<St: State> FromRequest<St> for () {
+    type Error = Infallible;
 
     #[inline]
-    async fn from_request(_: &HttpRequest, _: &mut Payload) -> Result<(), E::Container> {
+    async fn from_request(_: &St, _: &HttpRequest, _: &mut Payload) -> Result<(), Self::Error> {
         Ok(())
     }
 }
@@ -159,16 +209,19 @@ impl<E: ErrorRenderer> FromRequest<E> for () {
 macro_rules! tuple_from_req {
     ($(#[$meta:meta])* $(($T:ident, $t:ident)),*) => {
         $(#[$meta])*
-        impl<$($T,)+ Err: ErrorRenderer> FromRequest<Err> for ($($T,)+)
+        impl<St, $($T,)+> FromRequest<St> for ($($T,)+)
         where
-            $($T: FromRequest<Err> + 'static,)+
-            $(<$T as $crate::web::FromRequest<Err>>::Error: Into<Err::Container>),+
+            St: State,
+            $($T: FromRequest<St> + 'static,)+
+            $(<$T as $crate::web::FromRequest<St>>::Error: WebResponseError<St, St::Error>),+
         {
-            type Error = Err::Container;
+            type Error = $crate::web::InternalError<&'static str>;
 
-            async fn from_request(req: &HttpRequest, payload: &mut Payload) -> Result<($($T,)+), Err::Container> {
+            async fn from_request(st: &St, req: &HttpRequest, payload: &mut Payload) -> Result<($($T,)+), Self::Error> {
                 Ok((
-                    $($T::from_request(req, payload).await.map_err(|e| e.into())?,)+
+                    $($T::from_request(st, req, payload).await.map_err(
+                        |e|
+                        $crate::web::InternalError::from_response("Error", e.error_response(st)))?,)+
                 ))
             }
         }
@@ -199,27 +252,23 @@ mod tests {
 
     #[crate::rt_test]
     async fn test_option() {
-        let (req, mut pl) = TestRequest::with_header(
-            header::CONTENT_TYPE,
-            "application/x-www-form-urlencoded",
-        )
-        .state(FormConfig::default().limit(4096))
-        .to_http_parts();
+        let (req, mut pl, ()) =
+            TestRequest::with_header(header::CONTENT_TYPE, "application/x-www-form-urlencoded")
+                .app_state(FormConfig::default().limit(4096))
+                .to_http_parts();
 
-        let r = from_request::<Option<Form<Info>>>(&req, &mut pl)
+        let r = from_request::<_, Option<Form<Info>>>(&(), &req, &mut pl)
             .await
             .unwrap();
         assert_eq!(r, None);
 
-        let (req, mut pl) = TestRequest::with_header(
-            header::CONTENT_TYPE,
-            "application/x-www-form-urlencoded",
-        )
-        .header(header::CONTENT_LENGTH, "9")
-        .set_payload(Bytes::from_static(b"hello=world"))
-        .to_http_parts();
+        let (req, mut pl, ()) =
+            TestRequest::with_header(header::CONTENT_TYPE, "application/x-www-form-urlencoded")
+                .header(header::CONTENT_LENGTH, "9")
+                .payload(Bytes::from_static(b"hello=world"))
+                .to_http_parts();
 
-        let r = from_request::<Option<Form<Info>>>(&req, &mut pl)
+        let r = from_request::<_, Option<Form<Info>>>(&(), &req, &mut pl)
             .await
             .unwrap();
         assert_eq!(
@@ -229,15 +278,13 @@ mod tests {
             }))
         );
 
-        let (req, mut pl) = TestRequest::with_header(
-            header::CONTENT_TYPE,
-            "application/x-www-form-urlencoded",
-        )
-        .header(header::CONTENT_LENGTH, "9")
-        .set_payload(Bytes::from_static(b"bye=world"))
-        .to_http_parts();
+        let (req, mut pl, ()) =
+            TestRequest::with_header(header::CONTENT_TYPE, "application/x-www-form-urlencoded")
+                .header(header::CONTENT_LENGTH, "9")
+                .payload(Bytes::from_static(b"bye=world"))
+                .to_http_parts();
 
-        let r = from_request::<Option<Form<Info>>>(&req, &mut pl)
+        let r = from_request::<_, Option<Form<Info>>>(&(), &req, &mut pl)
             .await
             .unwrap();
         assert_eq!(r, None);
@@ -245,15 +292,13 @@ mod tests {
 
     #[crate::rt_test]
     async fn test_result() {
-        let (req, mut pl) = TestRequest::with_header(
-            header::CONTENT_TYPE,
-            "application/x-www-form-urlencoded",
-        )
-        .header(header::CONTENT_LENGTH, "11")
-        .set_payload(Bytes::from_static(b"hello=world"))
-        .to_http_parts();
+        let (req, mut pl, ()) =
+            TestRequest::with_header(header::CONTENT_TYPE, "application/x-www-form-urlencoded")
+                .header(header::CONTENT_LENGTH, "11")
+                .payload(Bytes::from_static(b"hello=world"))
+                .to_http_parts();
 
-        let r = from_request::<Result<Form<Info>, UrlencodedError>>(&req, &mut pl)
+        let r = from_request::<_, Result<Form<Info>, UrlencodedError>>(&(), &req, &mut pl)
             .await
             .unwrap();
         assert_eq!(
@@ -263,15 +308,13 @@ mod tests {
             })
         );
 
-        let (req, mut pl) = TestRequest::with_header(
-            header::CONTENT_TYPE,
-            "application/x-www-form-urlencoded",
-        )
-        .header(header::CONTENT_LENGTH, "9")
-        .set_payload(Bytes::from_static(b"bye=world"))
-        .to_http_parts();
+        let (req, mut pl, ()) =
+            TestRequest::with_header(header::CONTENT_TYPE, "application/x-www-form-urlencoded")
+                .header(header::CONTENT_LENGTH, "9")
+                .payload(Bytes::from_static(b"bye=world"))
+                .to_http_parts();
 
-        let r = from_request::<Result<Form<Info>, UrlencodedError>>(&req, &mut pl)
+        let r = from_request::<_, Result<Form<Info>, UrlencodedError>>(&(), &req, &mut pl)
             .await
             .unwrap();
         assert!(r.is_err());

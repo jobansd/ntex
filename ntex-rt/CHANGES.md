@@ -1,5 +1,300 @@
 # Changes
 
+## [4.4.0] - Unreleased
+
+* Abort the process on a panic during shutdown while an earlier panic is unwinding or
+  held to be resumed, instead of suppressing it or replacing the original panic
+
+* Unregister an arbiter and run its `on_shutdown` callbacks when its event loop panic
+  unwinds through the runner, as for runners that return the panic as an error
+
+* Add `LocalWaker`, a thread-confined owned wake handle with native owner-thread
+  operations and a standard-waker fallback for other runtimes and wrapped
+  wakers.
+
+## [4.3.0] - 2026-10-21
+
+* Replace `async-task` with a custom task implementation
+
+* Separate the remote task queue's producer tail and consumer head onto
+  different cache lines to reduce contention without growing task allocations
+
+* Keep raw task stage and join-waker accesses inside Loom tracking scopes,
+  with coverage for reentrant callbacks and panic cleanup
+
+* Track scheduler closure and notification flags in Loom, with parked-driver
+  and concurrent-shutdown regression models
+
+* Coordinate remote task publication with shutdown so late spawns, wakes and
+  releases cannot leave tasks queued after the final drain
+
+* Retry interrupted scheduler notifications; log and abort on other notification
+  errors instead of silently leaving queued tasks stranded. Explicit
+  `Handle::notify()` calls continue to return errors to the caller
+
+* Abort if a scheduler notifier panics, like a notification error, instead of
+  leaving later remote submissions without a wakeup. Explicit `Handle::notify()`
+  calls continue to propagate panics to the caller
+
+* Finish runtime shutdown even if task cleanup panics, closing remote admission
+  and cancelling remaining tasks before resuming the first panic. Log and
+  suppress secondary cleanup panics, preserving any already-unwinding panic
+
+* Skip the thread-local owner lookup when spawning through `Runtime`,
+  while `Handle` spawning still selects the local or remote queue dynamically
+
+* Add `spawn_detached()` and `Handle::spawn_detached()`, spawn a task without
+  a join handle, the output is dropped on completion
+
+* Drop the output of a finished neon task when its `JoinHandle` is dropped or
+  cancelled, instead of when the last waker is dropped
+
+* Release the reserved join reference if a notifier panics during neon task
+  spawning, instead of leaking the task output and runtime queue
+
+* Do not wake the waiting waker of a dropped or cancelled neon `JoinHandle`,
+  the waker is dropped right away on the runtime thread, or when the task
+  completes or is freed if the handle is dropped on another thread
+
+* Drop the futures of pending neon tasks when the runtime is dropped, a task
+  waiting on a waker kept its future and the runtime queue alive
+
+* Cancel a neon task spawned after its runtime is dropped, the future is
+  dropped right away instead of being queued on the dropped runtime
+
+* Require `F::Output: Send` for neon `Handle::spawn()`, a remote task could
+  return a non-`Send` value to the spawning thread
+
+* Keep neon queue fields read or written by other threads on separate cache
+  lines from fields written by the runtime thread, speeds up remote waker
+  clone/drop and remote wakes
+
+* Use a zero-sized schedule function for neon tasks, avoids a waker
+  reference count increment and decrement on every wake
+
+* Fix compio `JoinHandle` never completing when it is polled on another thread
+  and the task finishes while the handle registers its waker
+
+* Add `Histogram::merge()`, sum of two histograms
+
+* Add `Arbiter::with_init()`, runs a callback on the arbiter's thread before
+  its runtime is created
+
+* Add `Runtime::now()`, cached start of the current runtime turn
+
+* Add `ntex_rt::now()`, start of the current runtime turn on neon and compio,
+  `Instant::now()` on tokio
+
+* Add `Runtime::busy_duration()` and `Handle::busy_duration()`, total time
+  the runtime spent running tasks and handling driver events, for measuring
+  utilization. `Handle::busy_duration()` returns `Option<Duration>` on all
+  backends; on tokio it reports `worker_total_busy_duration` and returns `None`
+  unless the arbiter runs on a current-thread runtime. On neon and compio it
+  includes the current busy period, so other threads see a runtime that is
+  stuck in a long task as busy
+
+* Add `Runtime::current_turn()` and `Handle::current_turn()`, how long the
+  current runtime turn has been running, for detecting stalled runtimes.
+  Always `None` on tokio
+
+* Add `Runtime::poll_count()`, `Runtime::poll_again_count()` and the
+  `Handle` counterparts, number of polls and polls that left scheduled tasks,
+  for detecting task backlog. The `Handle` methods return `None` on tokio
+
+* Add `Runtime::self_wake_count()` and `Handle::self_wake_count()`, number of
+  times a task woke itself while being polled. On neon, a task that keeps
+  waking itself for `RuntimeBuilder::self_wake_threshold()` wakes and duration,
+  10000 wakes over one second by default, is logged once as a possible busy
+  loop. `Handle::self_wake_count()` returns `None` on tokio and compio
+
+* Avoid a use-after-free when self-wake warning logging reenters the runtime,
+  and suppress duplicate warnings from nested task polls
+
+* Skip per-task self-wake streak and timestamp bookkeeping on neon when
+  warnings are disabled with `RuntimeBuilder::self_wake_threshold(0, ...)`,
+  while preserving the aggregate `self_wake_count()`
+
+* Add `Runtime::poll_histogram()` and `Handle::poll_histogram()`, log2
+  histogram of poll durations. The `Handle` method returns `None` on tokio
+
+* Add arbiter scheduling latency sampling, `Arbiter::latency()` and
+  `Builder::latency_interval()` (default 100ms, 0 disables)
+
+* Detect stalled arbiters on a dedicated watchdog thread, `LatencyMetrics`
+  reports `stalls`, `stall_duration` and `stalled`. The stall backtrace is
+  captured by the watchdog instead of the ping task, `ping_threshold` is the
+  stall threshold
+
+* Add `Handle::current_task()`, spawn location of the running task, the stall
+  log names the task that blocks the arbiter. `Runtime::spawn()`,
+  `Handle::spawn()` and `spawn()` record the caller location. Returns `None`
+  on tokio and compio
+
+* `System::set_latency_callback()` callback receives the spawn location of the
+  stalled task, the stall backtrace log names it
+
+* Capture stalled arbiter backtraces on Windows (x86_64 and aarch64), the
+  watchdog suspends the arbiter thread and walks its stack.
+  `System::set_latency_callback()` is available on all platforms
+
+* Start the latency sampler before `Arbiter::new()` returns, `Arbiter::latency()`
+  returned `None` for a new arbiter
+
+* Require tokio 1.45
+
+* Add `ThreadPool::metrics()` and `System::pool_metrics()`, blocking thread pool
+  threads, active and queued tasks, total queue wait and execution time
+
+* Neon `Runtime` is no longer `Send`, its tasks must stay on the thread that
+  created it. Use `Handle` to spawn tasks from other threads
+
+## [4.2.1] - 2026-10-11
+
+* Notify the driver once per poll for tasks scheduled from other threads
+
+## [4.2.0] - 2026-10-08
+
+* Spawn a single future type with or without task callbacks to reduce
+  generated code
+
+## [4.1.0] - 2026-10-01
+
+* Add `Runtime::awake()`, tasks woken on the runtime thread while the driver
+  is awake do not notify the driver
+
+* Fix local tasks scheduled by tasks from other threads not being polled until
+  the next driver event
+
+## [4.0.0] - 2026-10-01
+
+* Cache the thread id for task scheduling, `thread::current()` cloned the thread handle on every wake
+
+* Release signal handling if the system's future panics, other systems could not enable signals
+
+* Do not wake the signal handler task from the panic hook, compio aborted the process on panic
+
+* Remove the deprecated `neon` feature, it had no effect
+
+* Drop ping records of stopped arbiters, record late pongs in their own round
+
+* Fix blocking pool exceeding its thread limit, blocking the caller, panicking
+  when a thread cannot be started and stranding tasks when idle workers exit
+
+* Panic handling calls the previous panic hook, the hook is installed once and
+  delivers `Signal::Panic` only while signal handling is enabled
+
+* Dispatch unix signals from a dedicated thread instead of the signal handler,
+  fix data race and lost signals in the signal queue
+
+* Capture stalled arbiter backtraces without locking or allocating in the
+  SIGUSR2 handler
+
+* Make `System::set_latency_callback()` thread-safe, the callback must be
+  `Send + Sync`
+
+* Fix data race when signal handling is enabled or disabled by systems on
+  different threads
+
+* Release signal handling when a system stops, so a later system can handle
+  signals, `System::enable_signals()` has no effect while another system
+  handles signals
+
+* Fix `Arbiter::new()` name not matching the arbiter id
+
+* Fix `System::with_config()` ignoring the `name` argument
+
+* Fix endless loop after `SIGSEGV` when signal handling is enabled, the previous
+  handler is restored after the signal is reported
+
+* Fix panic when signal handling is enabled again on Windows
+
+* Fix data race when task callbacks are set on another thread
+
+* Fix `RuntimeBuilder::event_interval()` values 0 and 1, and run up to
+  `event_interval` tasks from the overflow queue of remote tasks
+
+* Fix undefined behavior when a task schedules another task while the task
+  queue is run or cleared, tasks woken during shutdown are dropped as well
+
+* compio: `spawn()` drops the future while the runtime shuts down, a task that
+  spawned from its destructor corrupted the task queue being cleared
+
+* Fix use-after-free in `with_item()` when the callback replaces or removes
+  the stored value
+
+* Fix panic when a value in arbiter storage accesses the storage from its
+  destructor while the storage is cleared
+
+* Add `Arbiter::on_shutdown()`, registers a callback that runs when the current
+  arbiter shuts down
+
+* Fix use-after-free in `with_item()` when the item was replaced or removed
+  while `f` was running. `with_item()` now requires `T: Clone` and passes a
+  clone of the item to `f`
+
+* Fix process abort when arbiter storage is accessed during thread-local destruction
+
+* Update compio to 0.19
+
+## [3.17.3] - 2026-09-18
+
+* Api docs improvements
+
+## [3.17.2] - 2026-08-27
+
+* Fix arbiter storage cleanup logic
+
+## [3.17.1] - 2026-08-10
+
+* Add panic handling support
+
+## [3.17.0] - 2026-08-09
+
+* Better handling for worker panics
+
+* Add Arbiter::on_close() callback
+
+## [3.16.1] - 2026-08-06
+
+* Fix panic in arbiters pings
+
+## [3.16.0] - 2026-08-03
+
+* Allow to detach spawn blocking future
+
+* Do not panic with BorrowMut in Arbiter::with_item()
+
+## [3.15.7] - 2026-07-21
+
+* Do not log tight loop stacktrace if signals handler is not installed
+
+## [3.15.6] - 2026-07-21
+
+* Fix System::list_arbiter_pings() api
+
+## [3.15.5] - 2026-07-14
+
+* `remove_all_items()` no longer holds refcell for duration of removal.
+
+## [3.15.4] - 2026-06-25
+
+* Disable arbiter pings is interval is set to 0
+
+* Add a separate ping `threshold` parameter, wait this amount of time before
+  checking the arbiter stack trace.
+
+## [3.15.3] - 2026-06-21
+
+* Add arbiter latency callback
+
+## [3.15.2] - 2026-06-19
+
+* Improve signals handling
+
+## [3.15.0] - 2026-06-15
+
+* Try to log stacktraces for arbiters in tight loop
+
 ## [3.14.0] - 2026-05-11
 
 * Add System::get_value() API for system-wide storage access.

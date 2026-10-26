@@ -1,5 +1,37 @@
 # Changes
 
+## [2.1.0] - 2026-10-09
+
+* Add `ContentEncoding::Zstd`
+
+* Map `x-gzip` to `ContentEncoding::Gzip`
+
+## [2.0.0] - 2026-10-04
+
+* `HeaderValue::to_str()` accepts any valid UTF-8 value, validated with simdutf8
+
+* Remove `uri` module and `Uri` re-export
+
+## [1.3.0] - 2026-10-01
+
+* Fix HeaderMap deserialization of non-borrowed keys (serde_json::from_value, from_reader, escaped keys)
+
+* HeaderMap deserialization merges values of duplicate (case-insensitive) keys instead of dropping them
+
+* Map InvalidUriParts wrapped in http::Error to the invalid uri error kind
+
+* HeaderValue hash ignores the sensitive flag, consistent with equality
+
+* Fix header `Value` iterator size_hint upper bound for a single value
+
+* `HeaderValue::from_static` panics with "invalid header value" message
+
+* Remove FromIterator for HeaderMap, it split string values on commas and dropped invalid values
+
+* Add TryFrom<Bytes> and TryFrom<BytesMut> for HeaderValue
+
+* InvalidHeaderValue derives Debug and ToStrError derives thiserror::Error, like the other error types
+
 ## [1.2.0] - 2026-05-02
 
 * Add BytePages support to Body

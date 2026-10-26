@@ -1,15 +1,15 @@
 use std::{any, future::poll_fn, task::Poll};
 
 use ntex_io::{Handle, IoContext, Readiness, types};
-use ntex_rt::spawn;
+use ntex_rt::spawn_detached;
 
-use super::stream::{StreamCtl, StreamItem, WeakStreamCtl};
+use super::stream::{StreamCtl, WeakStreamCtl};
 
 impl ntex_io::IoStream for super::TcpStream {
     fn start(self, ctx: IoContext) -> Box<dyn Handle> {
         let super::TcpStream(io, ops) = self;
-        let (ctl, weak) = ops.register(io, ctx.clone());
-        spawn(async move { run(ctl, ctx).await });
+        let (sctl, weak) = ops.register(io, ctx.clone());
+        spawn_detached(async move { run(sctl, ctx).await });
 
         Box::new(HandleWrapper(weak))
     }
@@ -18,8 +18,8 @@ impl ntex_io::IoStream for super::TcpStream {
 impl ntex_io::IoStream for super::UnixStream {
     fn start(self, ctx: IoContext) -> Box<dyn Handle> {
         let super::UnixStream(io, ops) = self;
-        let (ctl, weak) = ops.register(io, ctx.clone());
-        spawn(async move { run(ctl, ctx).await });
+        let (sctl, weak) = ops.register(io, ctx.clone());
+        spawn_detached(async move { run(sctl, ctx).await });
 
         Box::new(HandleWrapper(weak))
     }
@@ -39,44 +39,46 @@ impl Handle for HandleWrapper {
     }
 
     fn write(&self, _: &IoContext) {
-        self.0.with(StreamItem::write_direct);
+        self.0.write();
     }
 }
 
-#[derive(Copy, Clone, Debug, PartialEq, Eq)]
-enum Status {
-    Shutdown,
-    Terminate,
-}
-
-async fn run(ctl: StreamCtl, ctx: ntex_io::IoContext) {
+async fn run(ctl: StreamCtl, context: ntex_io::IoContext) {
     // Handle io read readiness
-    let st = poll_fn(|cx| {
+    let terminate = poll_fn(|cx| {
         let mut modify = false;
         let mut readable = false;
         let mut writable = false;
+        let mut terminate = false;
 
-        let read = match ctx.poll_read_ready(cx) {
+        let read = match context.poll_read_ready(cx) {
             Poll::Ready(Readiness::Ready) => {
                 modify = true;
                 readable = true;
                 Poll::Pending
             }
-            Poll::Ready(Readiness::Shutdown | Readiness::Terminate) => Poll::Ready(()),
+            Poll::Ready(Readiness::Close) => Poll::Ready(()),
+            Poll::Ready(Readiness::Terminate) => {
+                terminate = true;
+                Poll::Ready(())
+            }
             Poll::Pending => {
                 modify = true;
                 Poll::Pending
             }
         };
 
-        let write = match ctx.poll_write_ready(cx) {
+        let write = match context.poll_write_ready(cx) {
             Poll::Ready(Readiness::Ready) => {
                 modify = true;
                 writable = true;
                 Poll::Pending
             }
-            Poll::Ready(Readiness::Shutdown) => Poll::Ready(Status::Shutdown),
-            Poll::Ready(Readiness::Terminate) => Poll::Ready(Status::Terminate),
+            Poll::Ready(Readiness::Close) => Poll::Ready(()),
+            Poll::Ready(Readiness::Terminate) => {
+                terminate = true;
+                Poll::Ready(())
+            }
             Poll::Pending => {
                 modify = true;
                 Poll::Pending
@@ -89,27 +91,29 @@ async fn run(ctl: StreamCtl, ctx: ntex_io::IoContext) {
 
         if read.is_pending() && write.is_pending() {
             Poll::Pending
-        } else if write.is_ready() {
-            write
         } else {
-            Poll::Ready(Status::Terminate)
+            Poll::Ready(terminate)
         }
     })
     .await;
 
-    log::trace!("{}: Shuting down io", ctx.tag());
-    if !ctx.is_stopped() {
-        let flush = st == Status::Shutdown;
-        poll_fn(|cx| {
-            ctl.interest(true, true);
-            ctx.shutdown(flush, cx)
-        })
-        .await;
-    }
+    log::trace!("{}: Shuting down io", context.tag());
+    // The last armed interest stays in place, it is not dropped separately.
+    // Teardown runs inline and dropping the control handle detaches the socket
+    // before the reactor polls again, so no event is delivered for it.
 
-    let result = ctl.shutdown().await;
-    log::trace!("{}: Shutdown complete {result:?}", ctx.tag());
-    if !ctx.is_stopped() {
-        ctx.stop(result.err());
-    }
+    let result = if terminate {
+        // The connection was force-closed, so buffered output is discarded on
+        // purpose. The socket is aborted rather than drained and shut down, so
+        // that the peer sees an RST and cannot mistake a truncated stream for a
+        // complete one. Dropping the control handle detaches the socket from
+        // the reactor and closes the descriptor.
+        ctl.abort();
+        drop(ctl);
+        Ok(())
+    } else {
+        ctl.shutdown()
+    };
+    log::trace!("{}: Shutdown complete {result:?}", context.tag());
+    context.stopped(result.err());
 }

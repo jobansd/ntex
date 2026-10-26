@@ -1,31 +1,37 @@
-use std::cell::UnsafeCell;
+//! I/O buffer, timeout, and frame-rate configuration.
 
-use ntex_bytes::{BytePageSize, BytesMut, buf::BufMut};
+use std::sync::Arc;
+
+use ntex_bytes::BytePageSize;
+#[cfg(feature = "tracker")]
+use ntex_bytes::BytesTracker;
 use ntex_service::cfg::{CfgContext, Configuration};
 use ntex_util::{time::Millis, time::Seconds};
 
-const DEFAULT_CACHE_SIZE: usize = 128;
-const DEFAULT_HIGH: usize = 16 * 1024 - 24;
-const DEFAULT_LOW: usize = 512 + 24;
-const DEFAULT_HALF: usize = (16 * 1024 - 24) / 2;
-
-thread_local! {
-    static CACHE: LocalCache = LocalCache::new();
-}
+use crate::{IoMetrics, IoMetricsGroup};
 
 #[derive(Debug)]
-/// Base io configuration
+/// Shared configuration for an [`crate::Io`] stream.
 pub struct IoConfig {
     connect_timeout: Millis,
     keepalive_timeout: Seconds,
-    disconnect_timeout: Seconds,
+    shutdown_timeout: Seconds,
     frame_read_rate: Option<FrameReadRate>,
+    write_timeout: Seconds,
 
-    // io read/write cache and params
-    read_buf: BufConfig,
-    write_buf: BufConfig,
-    write_page_size: BytePageSize,
+    // read side configuration
+    read_size_min: BytePageSize,
+    read_size_max: BytePageSize,
+    read_backpressure: usize,
+    #[cfg(feature = "tracker")]
+    buf_tracker: BufTracker,
+
+    // write side configuration
+    write_size: BytePageSize,
+    write_backpressure: usize,
     write_buf_threshold: usize,
+
+    metrics: bool,
 
     // shared config
     pub(crate) config: CfgContext,
@@ -45,162 +51,319 @@ impl Configuration for IoConfig {
     }
 
     fn set_ctx(&mut self, ctx: CfgContext) {
-        self.read_buf.idx = ctx.id();
-        self.write_buf.idx = ctx.id();
         self.config = ctx;
     }
 }
 
+/// Minimum read rate required while decoding one frame.
 #[derive(Copy, Clone, Debug)]
 pub struct FrameReadRate {
+    /// Initial read timeout.
     pub timeout: Seconds,
+    /// Maximum cumulative timeout for the frame.
     pub max_timeout: Seconds,
+    /// Byte-progress threshold that must be exceeded to extend the deadline.
+    ///
+    /// Progress must be strictly greater than this value for another `timeout`
+    /// period to be granted.
     pub rate: u32,
 }
 
-#[derive(Copy, Clone, Debug)]
-pub struct BufConfig {
-    pub high: usize,
-    pub low: usize,
-    pub half: usize,
-    idx: usize,
-    first: bool,
-    cache_size: usize,
+/// Memory attribution of read buffers, see
+/// [`IoConfig::set_buf_tracker`].
+#[cfg(feature = "tracker")]
+#[cfg_attr(docsrs, doc(cfg(feature = "tracker")))]
+#[derive(Clone, Debug, Default)]
+#[non_exhaustive]
+pub enum BufTracker {
+    /// Read buffers are not attributed.
+    #[default]
+    Disabled,
+    /// Each connection charges its read buffers to its own tracker.
+    PerConnection,
+    /// All connections of the configuration charge their read buffers to
+    /// the same tracker.
+    Shared(BytesTracker),
 }
 
 impl IoConfig {
+    /// Returns the metrics connections created with this configuration on
+    /// the current thread report to.
+    ///
+    /// These are the configuration's own metrics if it has metrics enabled or
+    /// is registered in the thread's group, and the group's shared `other`
+    /// metrics otherwise, see [`IoMetricsGroup`].
+    pub fn metrics(&self) -> Arc<IoMetrics> {
+        IoMetricsGroup::current_metrics(self)
+    }
+
+    #[inline]
+    /// Returns `true` if the configuration has its own metrics, see
+    /// [`set_metrics`](Self::set_metrics).
+    pub fn metrics_enabled(&self) -> bool {
+        self.metrics
+    }
+
+    #[must_use]
+    /// Gives connections of this configuration their own metrics.
+    ///
+    /// By default connections report to the shared `other` metrics of the
+    /// thread's [`IoMetricsGroup`], unless the configuration is registered
+    /// with [`IoMetricsGroup::register`], as server listener configurations
+    /// are. Each enabled configuration keeps its metrics on every thread it is
+    /// used on, do not enable metrics for short-lived configurations.
+    ///
+    /// I/O metrics are always collected. Disabling only removes the
+    /// configuration's own metrics, its connections then report to the shared
+    /// `other` metrics, or to the registered metrics of a server listener
+    /// configuration.
+    pub fn set_metrics(mut self, enabled: bool) -> Self {
+        self.metrics = enabled;
+        self
+    }
+
     #[inline]
     #[must_use]
-    /// Create new config object
+    /// Creates an I/O configuration with default settings.
     pub fn new() -> IoConfig {
-        let config = CfgContext::default();
-        let idx = config.id();
-
         IoConfig {
-            config,
+            config: CfgContext::default(),
             connect_timeout: Millis::ZERO,
             keepalive_timeout: Seconds(0),
-            disconnect_timeout: Seconds(1),
+            shutdown_timeout: Seconds(1),
             frame_read_rate: None,
 
-            read_buf: BufConfig {
-                idx,
-                high: DEFAULT_HIGH,
-                low: DEFAULT_LOW,
-                half: DEFAULT_HALF,
-                first: true,
-                cache_size: DEFAULT_CACHE_SIZE,
-            },
-            write_buf: BufConfig {
-                idx,
-                high: DEFAULT_HIGH,
-                low: DEFAULT_LOW,
-                half: DEFAULT_HALF,
-                first: false,
-                cache_size: DEFAULT_CACHE_SIZE,
-            },
-            write_page_size: BytePageSize::Size16,
+            read_size_min: BytePageSize::Size4,
+            read_size_max: BytePageSize::Size64,
+            read_backpressure: BytePageSize::Size32.capacity(),
+            #[cfg(feature = "tracker")]
+            buf_tracker: BufTracker::Disabled,
+
+            write_timeout: Seconds(0),
+            write_size: BytePageSize::Size16,
+            write_backpressure: BytePageSize::Size16.capacity(),
             write_buf_threshold: BytePageSize::Size16.half_capacity(),
+            metrics: false,
         }
     }
 
     #[inline]
-    /// Get tag
+    /// Returns the shared configuration tag.
     pub fn tag(&self) -> &str {
         self.config.tag()
     }
 
     #[inline]
-    /// Get connect timeout
+    /// Returns the connection timeout.
     pub fn connect_timeout(&self) -> Millis {
         self.connect_timeout
     }
 
     #[inline]
-    /// Get keep-alive timeout
+    /// Returns the keep-alive timeout.
     pub fn keepalive_timeout(&self) -> Seconds {
         self.keepalive_timeout
     }
 
     #[inline]
-    /// Get disconnect timeout
-    pub fn disconnect_timeout(&self) -> Seconds {
-        self.disconnect_timeout
+    /// Returns the graceful shutdown timeout.
+    pub fn shutdown_timeout(&self) -> Seconds {
+        self.shutdown_timeout
     }
 
     #[inline]
-    /// Get frame read params
+    /// Returns the frame read-rate configuration.
     pub fn frame_read_rate(&self) -> Option<&FrameReadRate> {
         self.frame_read_rate.as_ref()
     }
 
     #[inline]
-    /// Get read buffer parameters
-    pub fn read_buf(&self) -> &BufConfig {
-        &self.read_buf
+    /// Returns the smallest page size of read buffers.
+    ///
+    /// Connections start reading into pages of this size, see
+    /// [`set_read_size`](Self::set_read_size).
+    pub fn read_size_min(&self) -> BytePageSize {
+        self.read_size_min
     }
 
     #[inline]
-    /// Get write buffer parameters
-    pub fn write_buf(&self) -> &BufConfig {
-        &self.write_buf
+    /// Returns the largest page size of read buffers.
+    ///
+    /// The read page size of a connection adapts to its input up to this
+    /// size, see [`set_read_size`](Self::set_read_size).
+    pub fn read_size_max(&self) -> BytePageSize {
+        self.read_size_max
     }
 
     #[inline]
-    /// Get write page size
-    pub fn write_page_size(&self) -> BytePageSize {
-        self.write_page_size
+    /// Returns the read backpressure high watermark.
+    ///
+    /// Read backpressure is enabled once buffered input reaches it and
+    /// released once it falls to half of it, see
+    /// [`set_read_backpressure`](Self::set_read_backpressure).
+    pub fn read_backpressure(&self) -> usize {
+        self.read_backpressure
     }
 
     #[inline]
-    /// The write buffer threshold that triggers earlier sending.
+    #[cfg(feature = "tracker")]
+    #[cfg_attr(docsrs, doc(cfg(feature = "tracker")))]
+    /// Returns the read buffer attribution, see
+    /// [`set_buf_tracker`](Self::set_buf_tracker).
+    pub fn buf_tracker(&self) -> &BufTracker {
+        &self.buf_tracker
+    }
+
+    #[inline]
+    /// Returns the write backpressure timeout.
+    ///
+    /// A zero value means the timeout is disabled.
+    pub fn write_timeout(&self) -> Seconds {
+        self.write_timeout
+    }
+
+    #[inline]
+    /// Returns the write backpressure high watermark.
+    ///
+    /// Write backpressure is released once outstanding output falls to half of
+    /// it, see [`set_write_backpressure`](Self::set_write_backpressure).
+    pub fn write_backpressure(&self) -> usize {
+        self.write_backpressure
+    }
+
+    #[inline]
+    /// Buffered input size that releases read backpressure.
+    pub(crate) fn read_half(&self) -> usize {
+        self.read_backpressure >> 1
+    }
+
+    #[inline]
+    /// Outstanding output size that releases write backpressure.
+    pub(crate) fn write_half(&self) -> usize {
+        self.write_backpressure >> 1
+    }
+
+    #[inline]
+    /// Returns the write-buffer page size.
+    pub fn write_size(&self) -> BytePageSize {
+        self.write_size
+    }
+
+    #[inline]
+    /// Returns the buffered write size that triggers an earlier send.
     pub fn write_buf_threshold(&self) -> usize {
         self.write_buf_threshold
     }
 
-    /// Set connect timeout in seconds.
+    /// Sets the connection timeout.
     ///
-    /// To disable timeout set value to 0.
-    ///
-    /// By default connect timeout is disabled.
+    /// A zero duration disables the timeout. It is disabled by default.
     #[must_use]
     pub fn set_connect_timeout<T: Into<Millis>>(mut self, timeout: T) -> Self {
         self.connect_timeout = timeout.into();
         self
     }
 
-    /// Set keep-alive timeout in seconds.
+    /// Sets the keep-alive timeout.
     ///
-    /// To disable timeout set value to 0.
+    /// The dispatcher runs the timer only while the connection is idle: no
+    /// input is buffered, no partial frame is being read, and no decoded
+    /// frames are being handled. It starts when the dispatcher enters this
+    /// idle state, including after all decoded frames have been handled.
+    /// Partial frames are bounded by
+    /// [frame read-rate](Self::set_frame_read_rate) limits instead, and write
+    /// backpressure by the [write timeout](Self::set_write_timeout).
     ///
-    /// By default keep-alive timeout is disabled.
+    /// A zero duration disables the timeout. It is disabled by default.
     #[must_use]
     pub fn set_keepalive_timeout<T: Into<Seconds>>(mut self, timeout: T) -> Self {
         self.keepalive_timeout = timeout.into();
         self
     }
 
-    /// Set connection disconnect timeout.
+    /// Sets the graceful shutdown timeout.
     ///
-    /// Defines a timeout for disconnect connection. If a disconnect procedure does not complete
-    /// within this time, the connection get dropped.
+    /// A graceful shutdown runs in two phases, and this single timeout bounds
+    /// them together rather than applying to each one:
     ///
-    /// To disable timeout set value to 0.
+    /// 1. **Filter shutdown.** Both directions stay open, so a filter can emit
+    ///    its closing data and still read the peer's. A TLS filter sends its
+    ///    `close_notify` here, and a WebSocket filter its close frame.
+    /// 2. **Transport shutdown.** The remaining output is drained to the peer.
+    ///    The read side is paused, and whatever the peer still sent is
+    ///    discarded, then the connection is closed.
     ///
-    /// By default disconnect timeout is set to 1 seconds.
+    /// The deadline is armed when the first phase begins and is not restarted
+    /// for the second, so a filter that shuts down slowly leaves less time to
+    /// drain. Expiry in the first phase moves on to the second rather than
+    /// giving up; only expiry in the second terminates the connection, and
+    /// output that has not reached the transport is then lost. Either way
+    /// [`crate::Io::shutdown`] reports a timed-out error once the transport
+    /// has stopped.
+    ///
+    /// The timeout also applies when no application output is pending: a
+    /// filter may still be waiting for the peer to complete its shutdown
+    /// exchange. If both phases can finish immediately, the deadline has no
+    /// observable effect.
+    ///
+    /// The default is one second.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `timeout` is zero. Without a deadline, a peer that never
+    /// completes the exchange, or never reads the remaining output, could
+    /// hold the connection open forever.
     #[must_use]
-    pub fn set_disconnect_timeout<T: Into<Seconds>>(mut self, timeout: T) -> Self {
-        self.disconnect_timeout = timeout.into();
+    pub fn set_shutdown_timeout<T: Into<Seconds>>(mut self, timeout: T) -> Self {
+        let timeout = timeout.into();
+        assert!(
+            timeout.non_zero(),
+            "shutdown timeout must be greater than zero"
+        );
+        self.shutdown_timeout = timeout;
         self
     }
 
-    /// Set read rate parameters for single frame.
+    /// Sets read-rate parameters for a single decoded frame.
     ///
-    /// Set read timeout, max timeout and rate for reading payload. If the client
-    /// sends `rate` amount of data within `timeout` period of time, extend timeout by `timeout` seconds.
-    /// But no more than `max_timeout` timeout.
+    /// Rate tracking starts when a new connection arrives, for its first
+    /// frame, and later whenever a decoder returns no complete item after
+    /// receiving partial frame data, whether the data is left in the read
+    /// buffer or consumed into the decoder's own state. The dispatcher then
+    /// allows one `timeout` period for additional data to arrive.
     ///
-    /// By default frame read rate is disabled.
+    /// When that period expires, the dispatcher compares the bytes received
+    /// for the frame since the previous check with `rate`:
+    ///
+    /// - If the progress is greater than `rate`, the deadline is extended by
+    ///   another `timeout` period.
+    /// - If the progress is at most `rate`, frame decoding fails with a read
+    ///   timeout.
+    /// - Completing the frame clears the timer and resets rate tracking for the
+    ///   next frame.
+    ///
+    /// `max_timeout` limits the cumulative time allowed for one frame. A zero
+    /// value permits an unlimited number of extensions while the required rate
+    /// is maintained. A non-zero value is enforced in whole `timeout` periods,
+    /// so the effective limit is rounded up to a multiple of `timeout` and is
+    /// never shorter than the initial period.
+    ///
+    /// A zero `timeout` disables frame read-rate enforcement and ignores
+    /// `max_timeout` and `rate`. With a non-zero timeout and `rate` set to zero,
+    /// any positive byte progress permits another period.
+    ///
+    /// A new connection must therefore deliver its first frame within these
+    /// limits. After a frame has been decoded, idle connections with no
+    /// partial frame are governed separately by
+    /// [`set_keepalive_timeout`](Self::set_keepalive_timeout).
+    ///
+    /// The timer is stopped while write backpressure is active, when frames
+    /// are not decoded, and a new period starts once decoding resumes. While
+    /// the service is not ready the timer is stopped as well, and tracking
+    /// restarts with a fresh period and `max_timeout` budget once the service
+    /// is ready.
+    ///
+    /// Frame read-rate enforcement is disabled by default.
     #[must_use]
     pub fn set_frame_read_rate(
         mut self,
@@ -208,159 +371,425 @@ impl IoConfig {
         max_timeout: Seconds,
         rate: u32,
     ) -> Self {
-        self.frame_read_rate = Some(FrameReadRate {
-            timeout,
-            max_timeout,
-            rate,
-        });
+        self.frame_read_rate = if timeout.is_zero() {
+            None
+        } else {
+            Some(FrameReadRate {
+                timeout,
+                max_timeout,
+                rate,
+            })
+        };
         self
     }
 
-    /// Set read buffer parameters.
+    /// Sets the write backpressure timeout.
     ///
-    /// By default high watermark is set to 16Kb, low watermark 1kb.
+    /// Write backpressure is enabled when outstanding output reaches the
+    /// [write buffer](Self::set_write_backpressure) high watermark and disabled once the
+    /// peer has accepted enough of it. The timeout covers that whole period:
+    /// if backpressure is still enabled when it expires, the dispatcher stops
+    /// with a write timeout. Each backpressure period starts a fresh timeout,
+    /// however much the peer read during the previous one. Without a write
+    /// timeout, a peer that stops reading during backpressure can hold the
+    /// connection open indefinitely.
+    ///
+    /// The timeout does not apply once backpressure is disabled, even though
+    /// output is still outstanding. A peer that stops reading at that point
+    /// can leave up to half of the high watermark unwritten; only the
+    /// [keep-alive timeout](Self::set_keepalive_timeout), when enabled, bounds
+    /// such a connection until it is shut down.
+    ///
+    /// Reads paused because output produced by reading, for example replies
+    /// to peer pings, has not drained are not covered either. While the
+    /// dispatcher is idle, the keep-alive timeout bounds them. Application
+    /// output written during such a pause enables write backpressure.
+    ///
+    /// Outside the dispatcher, the timeout also bounds each wait for output in
+    /// [`Io::send`](crate::Io::send), [`Io::flush`](crate::Io::flush) and
+    /// [`IoRef::write_ready`](crate::IoRef::write_ready). A wait that does not
+    /// complete in time fails with [`io::ErrorKind::TimedOut`](std::io::ErrorKind::TimedOut),
+    /// and the connection is left open for the caller to close. The polling
+    /// methods, such as [`Io::poll_flush`](crate::Io::poll_flush), are not
+    /// bounded.
+    ///
+    /// A zero duration disables the timeout. It is disabled by default, so
+    /// a peer that does not read can pin the connection and its buffered
+    /// output. Servers that accept untrusted peers should set it.
     #[must_use]
-    pub fn set_read_buf(
-        mut self,
-        high_watermark: usize,
-        low_watermark: usize,
-        cache_size: usize,
-    ) -> Self {
-        self.read_buf.cache_size = cache_size;
-        self.read_buf.high = high_watermark;
-        self.read_buf.low = low_watermark;
-        self.read_buf.half = high_watermark >> 1;
+    pub fn set_write_timeout(mut self, timeout: Seconds) -> Self {
+        self.write_timeout = timeout;
         self
     }
 
-    /// Set write buffer page size.
+    /// Sets the range of read-buffer page sizes.
     ///
-    /// By default page size is set to 16kb.
+    /// Each connection reads into pages of its own page size, which starts at
+    /// `min` and adapts to the connection's input between `min` and `max`.
+    /// Input that arrives in batches larger than the page capacity, such as
+    /// streamed bodies or large frames, grows the page size of the next read
+    /// buffers to fit a batch, so it is read with fewer and larger transport
+    /// reads. After several batches in a row that would fit in half of the
+    /// next smaller page size, the page size shrinks by one step. Connections
+    /// with small messages keep small pages, which also bounds the memory a
+    /// partial frame or a split-off frame holds.
+    ///
+    /// Within a batch a buffer grows with [`BytesMut::reserve_more`](ntex_bytes::BytesMut::reserve_more) once less
+    /// than [`BytePageSize::low`] of its page size remains: the data is
+    /// compacted within its page when that leaves room for half a page,
+    /// otherwise the buffer moves to the next page size.
+    ///
+    /// The page size does not depend on the read backpressure watermark, see
+    /// [`set_read_backpressure`](Self::set_read_backpressure). A single read
+    /// can fill a page larger than the watermark, reads are paused only after
+    /// the buffered input reaches it.
+    ///
+    /// Read buffers come from the per-thread page cache of `ntex-bytes`,
+    /// shared with write buffers and all configurations, see
+    /// [`ntex_bytes::set_page_cache_size`]. A buffer returns to the cache of
+    /// the thread that drops its last reference. Buffers grown beyond the
+    /// largest page size are freed. A connection holding
+    /// unconsumed input, such as the start of a frame that has not fully
+    /// arrived, keeps its whole read buffer, so each such connection uses at
+    /// least one page until the rest arrives. Read-rate timeouts,
+    /// see [`set_frame_read_rate`](Self::set_frame_read_rate), bound how long
+    /// a slow peer can hold it.
+    ///
+    /// Frames that a codec splits off the read buffer, such as `Bytes`
+    /// payloads, share its allocation. A frame kept alive keeps the whole
+    /// read buffer allocated, it returns to the cache only once the last such
+    /// frame is dropped, so retaining many small frames can use far more
+    /// memory than their size.
+    /// Copy long-lived frames or call [`Bytes::trimdown`](ntex_bytes::Bytes::trimdown)
+    /// on them to release the rest of the buffer.
+    ///
+    /// Set `min` and `max` to the same size to read into pages of a fixed
+    /// size. The default range is 4 KiB to 64 KiB.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `min` or `max` is [`BytePageSize::Unset`], or `min` is
+    /// larger than `max`.
     #[must_use]
-    pub fn set_write_page_size(mut self, size: BytePageSize) -> Self {
-        self.write_page_size = size;
+    pub fn set_read_size(mut self, min: BytePageSize, max: BytePageSize) -> Self {
+        assert!(
+            min != BytePageSize::Unset && max != BytePageSize::Unset,
+            "read buffer page size must be set"
+        );
+        assert!(
+            min.capacity() <= max.capacity(),
+            "read buffer min page size must not be larger than max"
+        );
+        self.read_size_min = min;
+        self.read_size_max = max;
+        self
+    }
+
+    /// Sets the read backpressure watermark.
+    ///
+    /// Read backpressure is enabled when the application-facing read buffer
+    /// reaches `size` bytes and released once it falls to half of it. It does
+    /// not affect the read page size, see [`set_read_size`](Self::set_read_size).
+    ///
+    /// The default watermark is the capacity of a 32 KiB page.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `size` is zero.
+    #[must_use]
+    pub fn set_read_backpressure(mut self, size: usize) -> Self {
+        assert!(size > 0, "read backpressure must be greater than zero");
+        self.read_backpressure = size;
+        self
+    }
+
+    /// Sets the memory attribution of read buffers.
+    ///
+    /// Read buffers of connections are charged to a
+    /// [`BytesTracker`], which reports the live allocations and bytes.
+    /// [`BufTracker::PerConnection`] gives each connection its own
+    /// tracker, [`BufTracker::Shared`] charges all connections of the
+    /// configuration to one tracker. Write buffers are not attributed.
+    ///
+    /// A read buffer stays charged until its last handle is dropped,
+    /// including `Bytes` frames split off it, on any thread and after the
+    /// connection is closed. The charge is the allocation size, header
+    /// included. Buffers in the page cache are not charged, io-uring
+    /// provided-buffer pages are charged once data is received into them.
+    /// Data copied out of a read buffer is not charged, such as small frames
+    /// stored inline or the result of
+    /// [`Bytes::trimdown`](ntex_bytes::Bytes::trimdown). A tracker does not
+    /// keep the connection alive.
+    ///
+    /// A shared tracker is an atomic counter updated by every connection on
+    /// every worker thread, it is contended under load.
+    ///
+    /// The default is [`BufTracker::Disabled`].
+    #[must_use]
+    #[cfg(feature = "tracker")]
+    #[cfg_attr(docsrs, doc(cfg(feature = "tracker")))]
+    pub fn set_buf_tracker(mut self, tracker: BufTracker) -> Self {
+        self.buf_tracker = tracker;
+        self
+    }
+
+    /// Sets the write-buffer page size.
+    ///
+    /// Write buffers are represented as a sequence of reusable byte pages.
+    /// `size` selects the capacity category used when those buffers allocate
+    /// new internal pages, including the intermediate write buffers created
+    /// between filter layers. [`BytePages`](ntex_bytes::BytePages) may also
+    /// contain externally supplied [`BytePage`](ntex_bytes::BytePage),
+    /// [`Bytes`](ntex_bytes::Bytes), or `Vec<u8>` segments; this setting does
+    /// not resize or copy those segments.
+    ///
+    /// Smaller pages reduce unused capacity for connections that usually
+    /// produce small writes. Larger pages can reduce allocation and page-list
+    /// overhead for connections that regularly buffer larger writes. This
+    /// setting does not limit the total amount of buffered data or determine
+    /// the size of individual transport write operations.
+    ///
+    /// Changing the page size on an active connection through
+    /// [`Io::set_config`](crate::Io::set_config) updates the allocation
+    /// category for future pages in every existing write buffer. Pages that
+    /// have already been allocated retain their current capacity. Filter
+    /// layers added later use the new page size.
+    ///
+    /// The page size is independent of the eager-write threshold and write
+    /// backpressure watermarks. Changing it does not update values configured
+    /// by [`set_write_buf_threshold`](Self::set_write_buf_threshold) or
+    /// [`set_write_backpressure`](Self::set_write_backpressure).
+    ///
+    /// The default page size is 16 KiB.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `size` is [`BytePageSize::Unset`].
+    #[must_use]
+    pub fn set_write_size(mut self, size: BytePageSize) -> Self {
+        assert!(
+            size != BytePageSize::Unset,
+            "write buffer page size must be set"
+        );
+        self.write_size = size;
         self
     }
 
     /// Sets the write buffer threshold.
     ///
-    /// The app encodes data in response to incoming data,
-    /// continuing to fill the write buffer until all data
-    /// has been processed. Only then can the runtime wake
-    /// the write task to send the buffered data.
+    /// Application code can encode multiple items during one dispatcher turn.
+    /// Normally, the transport write task is scheduled to run after that work
+    /// yields, so all items produced during the turn may accumulate in the
+    /// write buffer and be sent as one large burst.
     ///
-    /// By that time, the buffer may have accumulated a large
-    /// amount of data, causing it to be sent in large bursts,
-    /// which introduces latency. To prevent this behavior and
-    /// flatten data delivery to the peer, ntex's io can initiate
-    /// out-of-order writes based on a configured threshold.
+    /// When the buffered size reaches `size` while the transport write task is
+    /// paused, `Io` asks the transport handle to start writing immediately.
+    /// This eager write attempt occurs synchronously with buffer consolidation,
+    /// before the current application or dispatcher turn necessarily
+    /// completes. If bytes remain afterward, the normal write task is
+    /// scheduled to continue delivery. Data below the threshold is delivered
+    /// through that normal scheduled path.
     ///
-    /// Set `0` to disable send-buf.
+    /// The threshold is a latency and write-burst tuning parameter. It does not
+    /// limit write-buffer growth, provide a flush guarantee, or control write
+    /// backpressure; use [`set_write_backpressure`](Self::set_write_backpressure) for
+    /// backpressure watermarks and [`Io::flush`](crate::Io::flush) when a
+    /// caller must wait for buffered data to be written.
+    ///
+    /// Set `size` to zero to disable eager writes when this configuration is
+    /// used to construct an [`Io`](crate::Io). The default is 8 KiB, derived
+    /// from the default 16 KiB page size when [`IoConfig::new`] is called.
+    /// Changing the page size later does not recalculate this threshold.
+    ///
+    /// Replacing an active connection's configuration with
+    /// [`Io::set_config`](crate::Io::set_config) enables or disables eager
+    /// writes according to the replacement threshold.
+    ///
+    /// Eager writes depend on the transport. The io-uring transport ignores
+    /// the threshold: it delivers buffered output through the scheduled write
+    /// operation, and the sends of all connections are submitted together
+    /// once per runtime turn.
+    ///
+    /// [`IoMetricsSnapshot`](crate::IoMetricsSnapshot) counts eager, partial
+    /// eager and scheduled writes for tuning the threshold.
     #[must_use]
     pub fn set_write_buf_threshold(mut self, size: usize) -> Self {
         self.write_buf_threshold = size;
         self
     }
 
-    /// Set write buffer parameters.
+    /// Sets the write-buffer backpressure watermark.
     ///
-    /// By default high watermark is set to 16Kb, low watermark 1kb.
+    /// Write backpressure is enabled at `size` bytes of outstanding output and
+    /// must be greater than zero. Backpressure is released after the
+    /// outstanding size falls to half of this value. Outstanding output is the
+    /// buffered output plus any output a transport has taken ownership of but
+    /// not yet written to the peer.
+    ///
+    /// Output is held in [`BytePages`](ntex_bytes::BytePages), which are sized
+    /// by [`set_write_size`](Self::set_write_size).
+    ///
+    /// By default, the high watermark is approximately 16 KiB.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `size` is zero.
     #[must_use]
-    pub fn set_write_buf(
-        mut self,
-        high_watermark: usize,
-        low_watermark: usize,
-        cache_size: usize,
-    ) -> Self {
-        self.write_buf.cache_size = cache_size;
-        self.write_buf.high = high_watermark;
-        self.write_buf.low = low_watermark;
-        self.write_buf.half = high_watermark >> 1;
+    pub fn set_write_backpressure(mut self, size: usize) -> Self {
+        assert!(size > 0, "write backpressure must be greater than zero");
+        self.write_backpressure = size;
         self
     }
 }
 
-impl BufConfig {
-    #[inline]
-    /// Get buffer
-    pub fn get(&self) -> BytesMut {
-        if let Some(buf) =
-            CACHE.with(|c| c.with(self.idx, self.first, |c: &mut Vec<_>| c.pop()))
-        {
-            buf
-        } else {
-            BytesMut::with_capacity(self.high)
-        }
+#[cfg(test)]
+mod tests {
+    use ntex_service::cfg::SharedCfg;
+
+    use super::*;
+
+    #[test]
+    fn buffer_configuration() {
+        let cfg = IoConfig::new()
+            .set_read_backpressure(4096)
+            .set_write_backpressure(2048);
+
+        assert_eq!(cfg.read_backpressure(), 4096);
+        assert_eq!(cfg.read_half(), 2048);
+        assert_eq!(cfg.write_backpressure(), 2048);
+        assert_eq!(cfg.write_half(), 1024);
     }
 
-    /// Get buffer with capacity
-    pub fn buf_with_capacity(&self, cap: usize) -> BytesMut {
-        BytesMut::with_capacity(cap)
+    #[test]
+    fn read_size_configuration() {
+        let default = BytePageSize::Size32.capacity();
+        let cfg = IoConfig::new();
+        assert_eq!(cfg.read_size_min(), BytePageSize::Size4);
+        assert_eq!(cfg.read_size_max(), BytePageSize::Size64);
+        assert_eq!(cfg.read_backpressure(), default);
+        assert_eq!(cfg.read_half(), default / 2);
+        assert_eq!(cfg.write_backpressure(), BytePageSize::Size16.capacity());
+
+        // the read size does not change the backpressure watermark
+        let cfg = cfg
+            .set_read_size(BytePageSize::Size8, BytePageSize::Size8)
+            .set_write_backpressure(2048);
+        assert_eq!(cfg.read_size_min(), BytePageSize::Size8);
+        assert_eq!(cfg.read_size_max(), BytePageSize::Size8);
+        assert_eq!(cfg.read_backpressure(), default);
+        assert_eq!(cfg.write_backpressure(), 2048);
+        assert_eq!(cfg.write_half(), 1024);
+
+        let cfg = cfg.set_read_size(BytePageSize::Size16, BytePageSize::Size256);
+        assert_eq!(cfg.read_size_min(), BytePageSize::Size16);
+        assert_eq!(cfg.read_size_max(), BytePageSize::Size256);
+        assert_eq!(cfg.read_backpressure(), default);
     }
 
-    #[inline]
-    /// Resize buffer
-    pub fn resize(&self, buf: &mut BytesMut) {
-        if buf.remaining_mut() < self.low {
-            self.resize_min(buf, self.high);
-        }
+    #[test]
+    fn read_backpressure_configuration() {
+        let cfg = IoConfig::new()
+            .set_read_backpressure(64 * 1024)
+            .set_read_size(BytePageSize::Size4, BytePageSize::Size4);
+        assert_eq!(cfg.read_size_min(), BytePageSize::Size4);
+        assert_eq!(cfg.read_backpressure(), 64 * 1024);
+        assert_eq!(cfg.read_half(), 32 * 1024);
     }
 
-    #[inline]
-    /// Resize buffer
-    pub fn resize_min(&self, buf: &mut BytesMut, size: usize) {
-        let mut avail = buf.remaining_mut();
-        if avail < size {
-            let mut new_cap = buf.capacity();
-            while avail < size {
-                avail += self.high;
-                new_cap += self.high;
-            }
-            buf.reserve_capacity(new_cap);
-        }
+    #[test]
+    #[should_panic(expected = "read buffer page size must be set")]
+    fn unset_read_size() {
+        let _ = IoConfig::new().set_read_size(BytePageSize::Size4, BytePageSize::Unset);
     }
 
-    #[inline]
-    /// Release buffer, buf must be allocated from this pool
-    pub fn release(&self, mut buf: BytesMut) {
-        let cap = buf.capacity();
-        if cap > self.low && cap <= self.high {
-            CACHE.with(|c| {
-                c.with(self.idx, self.first, |v: &mut Vec<_>| {
-                    if v.len() < self.cache_size {
-                        buf.clear();
-                        v.push(buf);
-                    }
-                });
-            });
-        }
+    #[test]
+    #[should_panic(expected = "read buffer min page size must not be larger than max")]
+    fn inverted_read_size() {
+        let _ = IoConfig::new().set_read_size(BytePageSize::Size16, BytePageSize::Size8);
     }
-}
-
-struct LocalCache {
-    cache: UnsafeCell<Vec<(Vec<BytesMut>, Vec<BytesMut>)>>,
-}
-
-impl LocalCache {
-    fn new() -> Self {
-        Self {
-            cache: UnsafeCell::new(Vec::with_capacity(16)),
-        }
+    #[test]
+    #[should_panic(expected = "write buffer page size must be set")]
+    fn unset_write_size() {
+        let _ = IoConfig::new().set_write_size(BytePageSize::Unset);
     }
 
-    fn with<F, R>(&self, idx: usize, first: bool, f: F) -> R
-    where
-        F: FnOnce(&mut Vec<BytesMut>) -> R,
-    {
-        let cache = unsafe { &mut *self.cache.get() };
+    #[test]
+    #[should_panic(expected = "read backpressure must be greater than zero")]
+    fn zero_read_backpressure() {
+        let _ = IoConfig::new().set_read_backpressure(0);
+    }
 
-        while cache.len() <= idx {
-            cache.push((Vec::new(), Vec::new()));
-        }
-        if first {
-            f(&mut cache[idx].0)
-        } else {
-            f(&mut cache[idx].1)
-        }
+    #[test]
+    fn frame_read_rate_configuration() {
+        let cfg = IoConfig::new().set_frame_read_rate(Seconds(1), Seconds(3), 128);
+        let rate = cfg.frame_read_rate().unwrap();
+        assert_eq!(rate.timeout, Seconds(1));
+        assert_eq!(rate.max_timeout, Seconds(3));
+        assert_eq!(rate.rate, 128);
+
+        let cfg = cfg.set_frame_read_rate(Seconds::ZERO, Seconds(10), 1024);
+        assert!(cfg.frame_read_rate().is_none());
+    }
+
+    #[test]
+    fn config_accessors() {
+        let cfg = IoConfig::new();
+        assert_eq!(cfg.connect_timeout(), Millis::ZERO);
+        assert_eq!(cfg.keepalive_timeout(), Seconds(0));
+        assert_eq!(cfg.write_size(), BytePageSize::Size16);
+
+        let cfg = cfg
+            .set_connect_timeout(Millis(500))
+            .set_keepalive_timeout(Seconds(7))
+            .set_write_size(BytePageSize::Size4);
+        assert_eq!(cfg.connect_timeout(), Millis(500));
+        assert_eq!(cfg.keepalive_timeout(), Seconds(7));
+        assert_eq!(cfg.write_size(), BytePageSize::Size4);
+
+        let shared = SharedCfg::new("CFG-TAG").add(cfg).build();
+        let cfg = shared.get::<IoConfig>();
+        assert_eq!(cfg.tag(), "CFG-TAG");
+        assert_eq!(cfg.keepalive_timeout(), Seconds(7));
+    }
+
+    #[test]
+    fn write_timeout_configuration() {
+        let cfg = IoConfig::new();
+        assert!(cfg.write_timeout().is_zero());
+
+        let cfg = cfg.set_write_timeout(Seconds(3));
+        assert_eq!(cfg.write_timeout(), Seconds(3));
+
+        let cfg = cfg.set_write_timeout(Seconds::ZERO);
+        assert!(cfg.write_timeout().is_zero());
+    }
+
+    #[test]
+    #[should_panic(expected = "write backpressure must be greater than zero")]
+    fn zero_write_backpressure() {
+        let _ = IoConfig::new().set_write_backpressure(0);
+    }
+
+    #[test]
+    #[should_panic(expected = "shutdown timeout must be greater than zero")]
+    fn zero_shutdown_timeout_is_rejected() {
+        let _ = IoConfig::new().set_shutdown_timeout(Seconds::ZERO);
+    }
+
+    #[cfg(feature = "tracker")]
+    #[test]
+    fn buf_tracker() {
+        let cfg = IoConfig::new();
+        assert!(matches!(cfg.buf_tracker(), BufTracker::Disabled));
+
+        let cfg = cfg.set_buf_tracker(BufTracker::PerConnection);
+        assert!(matches!(cfg.buf_tracker(), BufTracker::PerConnection));
+
+        let tracker = BytesTracker::new();
+        let cfg = cfg.set_buf_tracker(BufTracker::Shared(tracker.clone()));
+        let BufTracker::Shared(t) = cfg.buf_tracker() else {
+            panic!("expected a shared tracker");
+        };
+        assert!(t.ptr_eq(&tracker));
     }
 }

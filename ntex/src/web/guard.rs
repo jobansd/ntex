@@ -6,30 +6,33 @@
 //! It is possible to add guards to *scopes*, *resources*
 //! and *routes*. ntex provide several guards by default, like various
 //! http methods, header, etc. To become a guard, type must implement `Guard`
-//! trait. Simple functions coulds guards as well.
+//! trait. Simple functions can be used as guards as well, see [`fn_guard`].
+//!
+//! Multiple guards on the same route, resource, or scope must all match.
 //!
 //! Guards can not modify the request object. But it is possible
 //! to store extra attributes on a request by using the `Extensions` container.
 //! Extensions containers are available via the `RequestHead::extensions()` method.
 //!
 //! ```rust
-//! use ntex::http::Method;
 //! use ntex::web::{self, guard, App, HttpResponse};
 //!
 //! fn main() {
-//!     App::new().service(web::resource("/index.html").route(
+//!     App::default().service(web::resource("/index.html").route(
 //!         web::route()
 //!              .guard(guard::Post())
-//!              .guard(guard::fn_guard(|head| head.method == Method::GET))
-//!              .to(|| async { HttpResponse::MethodNotAllowed() }))
+//!              .guard(guard::fn_guard(|head| head.headers.contains_key("x-api-key")))
+//!              .to(async || { HttpResponse::Ok() }))
 //!     );
 //! }
 //! ```
 #![allow(non_snake_case)]
 
-use std::fmt;
+use std::{borrow::Cow, fmt};
 
-use crate::http::{Method, RequestHead, Uri, header};
+use urly::Url;
+
+use crate::http::{Method, RequestHead, header};
 
 /// Trait defines resource guards. Guards are used for route selection.
 ///
@@ -52,13 +55,13 @@ pub trait Guard {
 /// use ntex::web::{self, guard, App, HttpResponse};
 ///
 /// fn main() {
-///     App::new().service(web::resource("/index.html").route(
+///     App::default().service(web::resource("/index.html").route(
 ///         web::route()
 ///             .guard(
 ///                 guard::fn_guard(
 ///                     |req| req.headers()
 ///                              .contains_key("content-type")))
-///             .to(|| async { HttpResponse::MethodNotAllowed() }))
+///             .to(async || { HttpResponse::MethodNotAllowed() }))
 ///     );
 /// }
 /// ```
@@ -111,10 +114,10 @@ where
 /// use ntex::web::{self, guard, App, HttpResponse};
 ///
 /// fn main() {
-///     App::new().service(web::resource("/index.html").route(
+///     App::default().service(web::resource("/index.html").route(
 ///         web::route()
 ///              .guard(guard::Any(guard::Get()).or(guard::Post()))
-///              .to(|| async { HttpResponse::MethodNotAllowed() }))
+///              .to(async || { HttpResponse::MethodNotAllowed() }))
 ///     );
 /// }
 /// ```
@@ -167,11 +170,11 @@ impl fmt::Debug for AnyGuard {
 /// use ntex::web::{self, guard, App, HttpResponse};
 ///
 /// fn main() {
-///     App::new().service(web::resource("/index.html").route(
+///     App::default().service(web::resource("/index.html").route(
 ///         web::route()
 ///             .guard(
 ///                 guard::All(guard::Get()).and(guard::Header("content-type", "text/plain")))
-///             .to(|| async { HttpResponse::MethodNotAllowed() }))
+///             .to(async || { HttpResponse::MethodNotAllowed() }))
 ///     );
 /// }
 /// ```
@@ -311,6 +314,11 @@ pub fn Trace() -> MethodGuard {
     MethodGuard(Method::TRACE)
 }
 
+/// Predicate to match *QUERY* http method
+pub fn Query() -> MethodGuard {
+    MethodGuard(Method::QUERY)
+}
+
 /// Predicate to match specified http method
 pub fn Method(method: Method) -> MethodGuard {
     MethodGuard(method)
@@ -349,10 +357,10 @@ impl Guard for HeaderGuard {
 /// use ntex::web::{self, guard::Host, App, HttpResponse};
 ///
 /// fn main() {
-///     App::new().service(
+///     App::default().service(
 ///         web::resource("/index.html")
 ///             .guard(Host("www.rust-lang.org"))
-///             .to(|| async { HttpResponse::MethodNotAllowed() })
+///             .to(async || { HttpResponse::MethodNotAllowed() })
 ///     );
 /// }
 /// ```
@@ -360,14 +368,18 @@ pub fn Host<H: AsRef<str>>(host: H) -> HostGuard {
     HostGuard(host.as_ref().to_string(), None)
 }
 
-fn get_host_uri(req: &RequestHead) -> Option<Uri> {
-    use core::str::FromStr;
-    req.headers
-        .get(header::HOST)
-        .and_then(|host_value| host_value.to_str().ok())
-        .or_else(|| req.uri.host())
-        .map(|host: &str| Uri::from_str(host).ok())
-        .and_then(|host_success| host_success)
+fn get_host_uri(req: &RequestHead) -> Option<Cow<'_, Url>> {
+    // the authority of an absolute-form target takes precedence over `Host`,
+    // see RFC 9112 section 3.2.2
+    if req.uri.authority().is_some() {
+        return Some(Cow::Borrowed(&req.uri));
+    }
+    let host = req.headers.get(header::HOST)?.to_str().ok()?;
+    if host.contains("://") {
+        Url::try_from(host).ok().map(Cow::Owned)
+    } else {
+        Url::parse(host).ok().map(Cow::Owned)
+    }
 }
 
 #[doc(hidden)]
@@ -377,6 +389,11 @@ pub struct HostGuard(String, Option<String>);
 impl HostGuard {
     #[must_use]
     /// Set request scheme to match.
+    ///
+    /// The scheme is taken from the request uri if it is in absolute-form, or
+    /// from the `Host` header value otherwise. A `Host` header normally contains no
+    /// scheme; in that case the scheme is not checked and the guard matches on
+    /// the host name alone. Do not rely on this check for security decisions.
     pub fn scheme<H: AsRef<str>>(mut self, scheme: H) -> HostGuard {
         self.1 = Some(scheme.as_ref().to_string());
         self
@@ -390,7 +407,7 @@ impl Guard for HostGuard {
         };
 
         if let Some(uri_host) = req_host_uri.host() {
-            if self.0 != uri_host {
+            if !self.0.eq_ignore_ascii_case(uri_host) {
                 return false;
             }
         } else {
@@ -400,7 +417,7 @@ impl Guard for HostGuard {
         if let Some(ref scheme) = self.1
             && let Some(req_host_uri_scheme) = req_host_uri.scheme_str()
         {
-            return scheme == req_host_uri_scheme;
+            return scheme.eq_ignore_ascii_case(req_host_uri_scheme);
         }
 
         true
@@ -419,8 +436,7 @@ mod tests {
 
     #[test]
     fn test_header() {
-        let req = TestRequest::with_header(header::TRANSFER_ENCODING, "chunked")
-            .to_http_request();
+        let req = TestRequest::with_header(header::TRANSFER_ENCODING, "chunked").to_http_request();
 
         let pred = Header("transfer-encoding", "chunked");
         assert!(pred.check(req.head()));
@@ -498,7 +514,7 @@ mod tests {
     #[test]
     fn test_host_without_header() {
         let req = TestRequest::default()
-            .uri("www.rust-lang.org")
+            .uri("//www.rust-lang.org")
             .to_http_request();
 
         let pred = Host("www.rust-lang.org");
@@ -518,6 +534,27 @@ mod tests {
 
         let pred = Host("localhost");
         assert!(!pred.check(req.head()));
+    }
+
+    #[test]
+    fn test_host_absolute_form() {
+        // the target authority takes precedence over `Host`
+        let req = TestRequest::with_uri("http://www.rust-lang.org/p")
+            .header(header::HOST, "crates.io")
+            .to_http_request();
+        assert!(Host("www.rust-lang.org").scheme("http").check(req.head()));
+        assert!(!Host("www.rust-lang.org").scheme("https").check(req.head()));
+        assert!(!Host("crates.io").check(req.head()));
+
+        let req = TestRequest::default()
+            .header(header::HOST, "www.rust-lang.org:8080")
+            .to_http_request();
+        assert!(Host("www.rust-lang.org").check(req.head()));
+
+        let req = TestRequest::default()
+            .header(header::HOST, "www.rust-lang.org/p")
+            .to_http_request();
+        assert!(!Host("www.rust-lang.org").check(req.head()));
     }
 
     #[test]
@@ -572,6 +609,12 @@ mod tests {
         assert!(Trace().check(r.head()));
         assert!(!Trace().check(req.head()));
         assert!(format!("{:?}", Trace()).contains("MethodGuard(TRACE)"));
+
+        let r = TestRequest::default()
+            .method(Method::QUERY)
+            .to_http_request();
+        assert!(Query().check(r.head()));
+        assert!(!Query().check(req.head()));
     }
 
     #[test]
@@ -595,8 +638,7 @@ mod tests {
 
     #[test]
     fn test_fn_guard() {
-        let req =
-            TestRequest::with_header(header::CONTENT_TYPE, "text/plain").to_http_request();
+        let req = TestRequest::with_header(header::CONTENT_TYPE, "text/plain").to_http_request();
 
         let g = fn_guard(|req| req.headers().contains_key("content-type"));
         assert!(g.check(req.head()));
@@ -605,5 +647,37 @@ mod tests {
 
         let g = |req: &RequestHead| req.headers().contains_key("content-type");
         assert!(g.check(req.head()));
+    }
+
+    #[test]
+    fn test_guard_debug() {
+        struct Custom;
+
+        impl Guard for Custom {
+            fn check(&self, _: &RequestHead) -> bool {
+                true
+            }
+        }
+
+        let guard = Any(Header("content-type", "text/plain"))
+            .or(Host("localhost"))
+            .or(Custom);
+        let s = format!("{guard:?}");
+        assert!(s.contains("HeaderGuard"), "{s}");
+        assert!(s.contains("HostGuard"), "{s}");
+        assert!(s.contains("Guard"), "{s}");
+    }
+
+    #[test]
+    fn test_host_without_host_name() {
+        let req = TestRequest::default()
+            .header(header::HOST, header::HeaderValue::from_static("bad host"))
+            .to_http_request();
+        assert!(!Host("localhost").check(req.head()));
+
+        let req = TestRequest::default()
+            .header(header::HOST, header::HeaderValue::from_static("/path"))
+            .to_http_request();
+        assert!(!Host("localhost").check(req.head()));
     }
 }

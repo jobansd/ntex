@@ -1,6 +1,6 @@
 [package]
 name = "ntex-server"
-version = "3.9.0"
+version = "4.3.0"
 authors = ["ntex contributors <team@ntex.rs>"]
 description = "Server for ntex framework"
 keywords = ["network", "framework", "async", "futures"]
@@ -10,7 +10,7 @@ documentation = "https://docs.rs/ntex-server/"
 categories = ["network-programming", "asynchronous"]
 license = "MIT OR Apache-2.0"
 edition = "2024"
-rust-version = "1.88"
+rust-version = "1.97"
 
 [lib]
 name = "ntex_server"
@@ -20,6 +20,7 @@ path = "src/lib.rs"
 workspace = true
 
 [dependencies]
+ntex-bytes = { workspace = true }
 ntex-io = { workspace = true }
 ntex-net = { workspace = true }
 ntex-service = { workspace = true }
@@ -28,18 +29,23 @@ ntex-util = { workspace = true }
 ntex-polling = { workspace = true }
 
 async-channel = { workspace = true }
-atomic-waker = { workspace = true }
-core_affinity = { workspace = true }
+event-listener = { workspace = true }
 oneshot = { workspace = true }
+libc = { workspace = true }
 log = { workspace = true }
 socket2 = { workspace = true }
 uuid = { workspace = true }
 
+[target.'cfg(windows)'.dependencies]
+windows-sys = { workspace = true, features = [
+    "Win32_Foundation",
+    "Win32_Networking_WinSock",
+    "Win32_System_IO",
+    "Win32_System_JobObjects",
+    "Win32_System_Kernel",
+    "Win32_System_SystemInformation",
+    "Win32_System_Threading",
+] }
+
 [dev-dependencies]
 ntex = { workspace = true }
-
-[target.'cfg(target_family = "unix")'.dependencies]
-signal-hook = { workspace = true, features=["iterator"] }
-
-[target.'cfg(target_family = "windows")'.dependencies]
-ctrlc = { workspace = true }

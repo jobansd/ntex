@@ -5,15 +5,23 @@ use futures_core::Stream;
 use ntex_bytes::{BytePages, Bytes, BytesMut};
 
 #[derive(Debug, PartialEq, Eq, Copy, Clone)]
-/// Body size hint
+/// Size information used when encoding an HTTP message body.
 pub enum BodySize {
+    /// No body is present and no `Content-Length` header should be emitted.
+    ///
+    /// An HTTP/1 response that may carry a body is still sent with
+    /// `Content-Length: 0`, otherwise its end could not be determined.
     None,
+    /// An empty body with a `Content-Length: 0` header.
     Empty,
+    /// A body with a known byte length.
     Sized(u64),
+    /// A streaming body with an unknown final length.
     Stream,
 }
 
 impl BodySize {
+    /// Returns `true` if this size represents no payload bytes.
     pub fn is_eof(&self) -> bool {
         matches!(self, BodySize::None | BodySize::Empty | BodySize::Sized(0))
     }
@@ -21,9 +29,10 @@ impl BodySize {
 
 /// Interface for types that can be streamed to a peer.
 pub trait MessageBody: 'static {
-    /// Message body size hind
+    /// Returns the body size hint.
     fn size(&self) -> BodySize;
 
+    /// Polls the next body chunk.
     fn poll_next_chunk(
         &mut self,
         cx: &mut Context<'_>,
@@ -61,13 +70,16 @@ impl<T: MessageBody> MessageBody for Box<T> {
 }
 
 #[derive(Debug)]
-/// Represents http response body
+/// Response body preserving either a concrete body type or a type-erased body.
 pub enum ResponseBody<B> {
+    /// The original concrete body.
     Body(B),
+    /// A type-erased body.
     Other(Body),
 }
 
 impl ResponseBody<Body> {
+    /// Converts a type-erased response body to another concrete response type.
     pub fn into_body<B>(self) -> ResponseBody<B> {
         match self {
             ResponseBody::Body(b) | ResponseBody::Other(b) => ResponseBody::Other(b),
@@ -91,18 +103,21 @@ impl<B> From<Body> for ResponseBody<B> {
 
 impl<B> ResponseBody<B> {
     #[inline]
+    /// Creates a response body from a concrete body value.
     pub fn new(body: B) -> Self {
         ResponseBody::Body(body)
     }
 
     #[inline]
     #[must_use]
+    /// Replaces this response body with [`Body::None`] and returns the original.
     pub fn take_body(&mut self) -> ResponseBody<B> {
         std::mem::replace(self, ResponseBody::Other(Body::None))
     }
 }
 
 impl<B: MessageBody> ResponseBody<B> {
+    /// Returns the concrete body, if this is [`ResponseBody::Body`].
     pub fn as_ref(&self) -> Option<&B> {
         if let ResponseBody::Body(b) = self {
             Some(b)
@@ -144,9 +159,11 @@ impl<B: MessageBody + Unpin> Stream for ResponseBody<B> {
     }
 }
 
-/// Represents various types of http message body.
+/// Type-erased HTTP message body.
 pub enum Body {
     /// Empty response. `Content-Length` header is not set.
+    ///
+    /// See [`BodySize::None`].
     None,
     /// Zero sized response body. `Content-Length` header is set to `0`.
     Empty,
@@ -157,12 +174,12 @@ pub enum Body {
 }
 
 impl Body {
-    /// Create body from slice (copy)
+    /// Creates a body by copying a byte slice.
     pub fn from_slice(s: &[u8]) -> Body {
         Body::Bytes(Bytes::copy_from_slice(s))
     }
 
-    /// Create body from generic message body.
+    /// Creates a body from a streaming message body.
     pub fn from_message<B: MessageBody>(body: B) -> Body {
         Body::Message(Box::new(body))
     }
@@ -581,10 +598,10 @@ where
 
 #[cfg(test)]
 mod tests {
-    use std::{future::poll_fn, io};
+    use std::{future::poll_fn, future::ready, io};
 
     use futures_util::stream;
-    use ntex::util::Ready;
+    use ntex::util::BufMut;
 
     use super::*;
 
@@ -622,7 +639,7 @@ mod tests {
     #[ntex::test]
     async fn test_pages() {
         let mut pages = BytePages::default();
-        pages.append(Bytes::from("1111"));
+        pages.put_slice(b"1111");
         pages.append(Bytes::from("2222"));
         pages.append(Bytes::from("3333"));
 
@@ -751,14 +768,15 @@ mod tests {
     #[ntex::test]
     #[allow(clippy::eq_op)]
     async fn test_body_eq() {
-        assert!(Body::None == Body::None);
-        assert!(Body::None != Body::Empty);
-        assert!(Body::Empty == Body::Empty);
-        assert!(Body::Empty != Body::None);
-        assert!(
-            Body::Bytes(Bytes::from_static(b"1")) == Body::Bytes(Bytes::from_static(b"1"))
+        assert_eq!(Body::None, Body::None);
+        assert_ne!(Body::None, Body::Empty);
+        assert_eq!(Body::Empty, Body::Empty);
+        assert_ne!(Body::Empty, Body::None);
+        assert_eq!(
+            Body::Bytes(Bytes::from_static(b"1")),
+            Body::Bytes(Bytes::from_static(b"1"))
         );
-        assert!(Body::Bytes(Bytes::from_static(b"1")) != Body::None);
+        assert_ne!(Body::Bytes(Bytes::from_static(b"1")), Body::None);
     }
 
     #[ntex::test]
@@ -770,11 +788,11 @@ mod tests {
 
     #[ntex::test]
     async fn body_stream() {
-        let st = BodyStream::new(stream::once(Ready::<_, io::Error>::Ok(Bytes::from("1"))));
+        let st = BodyStream::new(stream::once(ready(Ok::<_, io::Error>(Bytes::from("1")))));
         assert!(format!("{st:?}").contains("BodyStream"));
         let body: Body = st.into();
         assert!(format!("{body:?}").contains("Body::Message(_)"));
-        assert!(body != Body::None);
+        assert_ne!(body, Body::None);
 
         let res = ResponseBody::new(body);
         assert!(res.as_ref().is_some());
@@ -782,13 +800,13 @@ mod tests {
 
     #[ntex::test]
     async fn boxed_body_stream() {
-        let st = BoxedBodyStream::new(stream::once(Ready::<_, Rc<dyn Error>>::Ok(
-            Bytes::from("1"),
-        )));
+        let st = BoxedBodyStream::new(stream::once(ready(Ok::<_, Rc<dyn Error>>(Bytes::from(
+            "1",
+        )))));
         assert!(format!("{st:?}").contains("BoxedBodyStream"));
         let body: Body = st.into();
         assert!(format!("{body:?}").contains("Body::Message(_)"));
-        assert!(body != Body::None);
+        assert_ne!(body, Body::None);
 
         let res = ResponseBody::new(body);
         assert!(res.as_ref().is_some());
@@ -826,5 +844,23 @@ mod tests {
             poll_fn(|cx| body.poll_next_chunk(cx)).await.unwrap().ok(),
             Some(Bytes::from("2")),
         );
+    }
+
+    #[ntex::test]
+    async fn boxed_body_skips_empty_chunks() {
+        let mut body = BoxedBodyStream::new(stream::iter(
+            ["1", "", "2"]
+                .iter()
+                .map(|&v| Ok(Bytes::from(v)) as Result<Bytes, Rc<dyn Error>>),
+        ));
+        assert_eq!(
+            poll_fn(|cx| body.poll_next_chunk(cx)).await.unwrap().ok(),
+            Some(Bytes::from("1")),
+        );
+        assert_eq!(
+            poll_fn(|cx| body.poll_next_chunk(cx)).await.unwrap().ok(),
+            Some(Bytes::from("2")),
+        );
+        assert!(poll_fn(|cx| body.poll_next_chunk(cx)).await.is_none());
     }
 }

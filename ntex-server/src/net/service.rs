@@ -1,42 +1,41 @@
-use std::{fmt, sync::Arc, task::Context};
+use std::{fmt, io, sync::Arc};
 
-use ntex_io::Io;
-use ntex_service::{Service, ServiceCtx, ServiceFactory, boxed, cfg::SharedCfg};
-use ntex_util::{HashMap, future::join_all, services::Counter};
+use ntex_io::{IoConfig, IoMetricsGroup};
+use ntex_service::{BindCtx, Ctx, Service, cfg::SharedCfg};
+use ntex_util::{HashMap, future::join_all, services::Counter, services::counter::CounterGuard};
 
-use crate::ServerConfiguration;
+use crate::{ServerAppConfig, ServerConfiguration, affinity, metrics::WorkerSlot};
 
 use super::accept::{AcceptNotify, AcceptorCommand};
-use super::factory::{FactoryServiceType, NetService, OnAccept, OnWorkerStart};
-use super::{MAX_CONNS_COUNTER, Token, socket::Connection};
+use super::factory::{FactoryServiceType, NetService};
+use super::{MAX_CONNS_COUNTER, Token, socket::Connection, socket::Stream};
 
-pub(super) type BoxService = boxed::BoxService<Io, (), ()>;
-
-/// Net streaming server
-pub struct StreamServer {
-    notify: AcceptNotify,
-    services: Vec<FactoryServiceType>,
-    on_worker_start: Vec<Box<dyn OnWorkerStart + Send>>,
-    on_accept: Option<Box<dyn OnAccept + Send>>,
+/// Worker configuration for network servers.
+///
+/// Created by [`ServerBuilder::run`](super::ServerBuilder::run). Each worker
+/// creates its application state and the services for all registered
+/// listeners.
+pub struct StreamServer<Cfg> {
+    accept: AcceptNotify,
+    state: Arc<Cfg>,
+    services: Vec<FactoryServiceType<Cfg>>,
 }
 
-impl StreamServer {
+impl<Cfg: ServerAppConfig> StreamServer<Cfg> {
     pub(crate) fn new(
-        notify: AcceptNotify,
-        services: Vec<FactoryServiceType>,
-        on_worker_start: Vec<Box<dyn OnWorkerStart + Send>>,
-        on_accept: Option<Box<dyn OnAccept + Send>>,
+        accept: AcceptNotify,
+        state: Arc<Cfg>,
+        services: Vec<FactoryServiceType<Cfg>>,
     ) -> Self {
         Self {
-            notify,
+            accept,
+            state,
             services,
-            on_worker_start,
-            on_accept,
         }
     }
 }
 
-impl fmt::Debug for StreamServer {
+impl<Cfg> fmt::Debug for StreamServer<Cfg> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("StreamServer")
             .field("services", &self.services.len())
@@ -45,137 +44,142 @@ impl fmt::Debug for StreamServer {
 }
 
 /// Worker service factory.
-impl ServerConfiguration for StreamServer {
+impl<Cfg: ServerAppConfig> ServerConfiguration for StreamServer<Cfg> {
     type Item = Connection;
-    type Factory = StreamService;
+    type Service = StreamService;
 
-    /// Create service factory for handling `WorkerMessage<T>` messages.
-    async fn create(&self) -> Result<Self::Factory, ()> {
-        // on worker start callbacks
-        for cb in &self.on_worker_start {
-            cb.run().await?;
-        }
+    /// Create service for handling connections
+    async fn create(&self) -> io::Result<Self::Service> {
+        // construct configuration
+        let cfg = self.state.create().await?;
 
         // construct services
+        let mut tokens = HashMap::default();
         let mut services = Vec::new();
-        for svc in &self.services {
-            services.extend(svc.create().await?);
+        let group = IoMetricsGroup::current();
+
+        for info in &self.services {
+            for (svc, _, svc_tokens) in info.create(cfg.clone()).await.map_err(io::Error::other)? {
+                services.push(svc);
+                let idx = services.len() - 1;
+                for (token, cfg) in &svc_tokens {
+                    // listener connections have their own metrics
+                    group.register(&cfg.get::<IoConfig>());
+                    tokens.insert(*token, (idx, cfg.clone()));
+                }
+            }
         }
 
         Ok(StreamService {
             services,
-            on_accept: self.on_accept.as_ref().map(|f| f.clone_fn()),
+            tokens,
+            conns: MAX_CONNS_COUNTER.with(Clone::clone),
+            metrics: WorkerSlot::current(),
         })
     }
 
-    /// Server is paused
-    fn paused(&self) {
-        self.notify.send(AcceptorCommand::Pause);
+    /// Pause the server.
+    fn pause(&self) {
+        self.accept.send(AcceptorCommand::Pause);
     }
 
-    /// Server is resumed
-    fn resumed(&self) {
-        self.notify.send(AcceptorCommand::Resume);
+    /// Resume the server.
+    fn resume(&self) {
+        self.accept.send(AcceptorCommand::Resume);
     }
 
-    /// Server is stopped
+    /// Terminate the server.
     fn terminate(&self) {
-        self.notify.send(AcceptorCommand::Terminate);
+        self.accept.send(AcceptorCommand::Terminate);
     }
 
-    /// Server is stopped
+    /// Stop the server.
     async fn stop(&self) {
         let (tx, rx) = oneshot::channel();
-        self.notify.send(AcceptorCommand::Stop(tx));
+        self.accept.send(AcceptorCommand::Stop(tx));
         let _ = rx.await;
     }
-}
 
-impl Clone for StreamServer {
-    fn clone(&self) -> Self {
-        Self {
-            notify: self.notify.clone(),
-            services: self.services.iter().map(|s| s.clone_factory()).collect(),
-            on_accept: self.on_accept.as_ref().map(|f| f.clone_fn()),
-            on_worker_start: self.on_worker_start.iter().map(|f| f.clone_fn()).collect(),
+    fn incoming_cpu(&self, con: &Connection) -> Option<usize> {
+        match con.io {
+            Stream::Tcp(ref stream) => affinity::incoming_cpu(stream),
+            #[cfg(unix)]
+            Stream::Uds(_) => None,
         }
     }
 }
 
+impl<Cfg: ServerAppConfig> Clone for StreamServer<Cfg> {
+    fn clone(&self) -> Self {
+        Self {
+            state: self.state.clone(),
+            accept: self.accept.clone(),
+            services: self.services.iter().map(|s| s.clo()).collect(),
+        }
+    }
+}
+
+/// Per-worker service that dispatches connections to listener services.
 pub struct StreamService {
-    services: Vec<NetService>,
-    on_accept: Option<Box<dyn OnAccept + Send>>,
+    tokens: HashMap<Token, (usize, SharedCfg)>,
+    services: Vec<Box<dyn NetService>>,
+    conns: Counter,
+    metrics: Option<Arc<WorkerSlot>>,
+}
+
+/// Open connection, released on drop.
+pub(crate) struct ConnGuard {
+    _guard: CounterGuard,
+    metrics: Option<Arc<WorkerSlot>>,
+}
+
+impl ConnGuard {
+    fn new(guard: CounterGuard, metrics: Option<Arc<WorkerSlot>>) -> Self {
+        if let Some(ref m) = metrics {
+            m.conn_opened();
+        }
+        Self {
+            _guard: guard,
+            metrics,
+        }
+    }
+}
+
+impl Drop for ConnGuard {
+    fn drop(&mut self) {
+        if let Some(ref m) = self.metrics {
+            m.conn_closed();
+        }
+    }
 }
 
 impl fmt::Debug for StreamService {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("StreamService")
-            .field("services", &self.services)
-            .finish()
-    }
-}
-
-impl ServiceFactory<Connection> for StreamService {
-    type Response = ();
-    type Error = ();
-    type Service = StreamServiceImpl;
-    type InitError = ();
-
-    async fn create(&self, _r: ()) -> Result<Self::Service, Self::InitError> {
-        let mut tokens = HashMap::default();
-        let mut services = Vec::new();
-
-        for info in &self.services {
-            if let Ok(svc) = info.factory.create(info.config.clone()).await {
-                log::trace!("Constructed server service for {:?}", info.tokens);
-                services.push(svc);
-                let idx = services.len() - 1;
-                for (token, cfg) in &info.tokens {
-                    tokens.insert(*token, (idx, info.name.clone(), cfg.clone()));
-                }
-            } else {
-                log::error!("Cannot construct service: {:?}", info.tokens);
-                return Err(());
-            }
-        }
-
-        Ok(StreamServiceImpl {
-            tokens,
-            services,
-            conns: MAX_CONNS_COUNTER.with(Clone::clone),
-            on_accept: self.on_accept.as_ref().map(|f| f.clone_fn()),
-        })
-    }
-}
-
-pub struct StreamServiceImpl {
-    tokens: HashMap<Token, (usize, Arc<str>, SharedCfg)>,
-    services: Vec<BoxService>,
-    conns: Counter,
-    on_accept: Option<Box<dyn OnAccept + Send>>,
-}
-
-impl fmt::Debug for StreamServiceImpl {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("StreamServiceImpl")
             .field("tokens", &self.tokens)
-            .field("services", &self.services)
             .field("conns", &self.conns)
             .finish()
     }
 }
 
-impl Service<Connection> for StreamServiceImpl {
-    type Response = ();
+impl Service<(), Connection> for StreamService {
+    type Res = ();
     type Error = ();
 
-    async fn ready(&self, ctx: ServiceCtx<'_, Self>) -> Result<(), Self::Error> {
+    fn bind(&self, ctx: BindCtx<'_>) {
+        self.conns.bind(&ctx);
+        for service in &self.services {
+            service.bind(&ctx);
+        }
+    }
+
+    async fn ready(&self, _: Ctx<'_, Self, ()>) -> Result<(), Self::Error> {
         if !self.conns.is_available() {
             self.conns.available().await;
         }
         for (idx, svc) in self.services.iter().enumerate() {
-            if ctx.ready(svc).await.is_err() {
-                for (idx_, _, cfg) in self.tokens.values() {
+            if svc.ready().await.is_err() {
+                for (idx_, cfg) in self.tokens.values() {
                     if idx == *idx_ {
                         log::error!("{}: Service readiness has failed", cfg.tag());
                         break;
@@ -188,39 +192,23 @@ impl Service<Connection> for StreamServiceImpl {
         Ok(())
     }
 
-    #[inline]
-    fn poll(&self, cx: &mut Context<'_>) -> Result<(), Self::Error> {
-        for svc in &self.services {
-            svc.poll(cx)?;
-        }
-        Ok(())
-    }
-
-    async fn shutdown(&self) {
-        let _ = join_all(self.services.iter().map(Service::shutdown)).await;
+    async fn shutdown(&self, _: Ctx<'_, Self, ()>) {
+        let _ = join_all(self.services.iter().map(|s| s.shutdown())).await;
         log::info!(
             "Worker service shutdown, {} connections",
             super::num_connections()
         );
     }
 
-    async fn call(&self, con: Connection, ctx: ServiceCtx<'_, Self>) -> Result<(), ()> {
-        if let Some((idx, name, cfg)) = self.tokens.get(&con.token) {
-            let mut io = con.io;
-            if let Some(ref f) = self.on_accept {
-                match f.run(name.clone(), io).await {
-                    Ok(st) => io = st,
-                    Err(()) => return Err(()),
-                }
-            }
-
-            let stream = io.convert(cfg.clone()).map_err(|e| {
+    #[allow(clippy::unused_async_trait_impl)]
+    async fn call(&self, con: Connection, _: Ctx<'_, Self, ()>) -> Result<(), ()> {
+        if let Some((idx, cfg)) = self.tokens.get(&con.token) {
+            let stream = con.io.convert(cfg.clone()).map_err(|e| {
                 log::error!("Cannot convert to an async io stream: {e}");
             })?;
 
-            let guard = self.conns.get();
-            let _ = ctx.call(&self.services[*idx], stream).await;
-            drop(guard);
+            let guard = ConnGuard::new(self.conns.get(), self.metrics.clone());
+            self.services[*idx].call(stream, guard);
             Ok(())
         } else {
             log::error!("Cannot get handler service for connection: {con:?}");

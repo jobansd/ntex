@@ -1,5 +1,782 @@
 # Changes
 
+## [4.4.0] - 2026-10-21
+
+* Expose `service::ReadyCallback` and `on_notify` registration on `BindCtx`,
+  pipelines, and bindings for observing explicit readiness notifications.
+  Delivery reuses registered storage and coalesces nested callbacks on active
+  scopes without skipping readiness invalidation.
+
+* Deprecate `Ctx::call_nowait` in favor of cache-aware `Ctx::call`. The legacy
+  method retains its readiness bypass during compatibility.
+
+* Forward initialization-time readiness binding through service adapters.
+  Lazy web routes and default services use `Ctx::create` to bind their
+  dependencies to the current scope before first use.
+
+* Add `tracker` feature, memory attribution of read buffers with
+  `IoConfig::set_buf_tracker()`. Re-export `BytesTracker` and
+  `BytesTrackerSnapshot` in `ntex::util`
+
+* Add `HttpServer::load_balancing()`. New connections go to the worker on the
+  CPU that receives their packets (the RSS CPU on Windows, `SO_INCOMING_CPU`
+  on Linux) unless it is busier, and to the least loaded worker otherwise
+  (`LoadBalancing::IncomingCpu`, the default). Use `LoadBalancing::RoundRobin`
+  for the previous behavior
+
+* Add `HttpServer::affinity()`, `enable_affinity()` is deprecated and does
+  nothing. Workers are
+  placed on physical cores first. Affinity is now enabled by default:
+  `Affinity::Soft` (preferred CPU, no pinning) on Windows, `Affinity::Core` on
+  other platforms
+
+* http: The HTTP/1 dispatcher reports the connection close reason to
+  `IoRef::set_close_reason()`
+
+* The default number of workers counts the CPUs of all processor groups on
+  Windows, it was limited to 64 before
+
+* Replace `nanorand` with `fastrand` for WebSocket keys and frame masks, and
+  update to ntex-h2 4.3.0, which does the same. `nanorand` does not link
+  `advapi32` on Windows (unresolved `SystemFunction036`), it was only linked
+  through `core_affinity` before
+
+* http/1: Use `IoRef::is_filter_paused()`, a filter chain that is not ready pauses reads only
+
+## [4.3.0] - 2026-10-15
+
+* ws: Add `permessage-deflate` extension support (RFC 7692) to the client and
+  the codec, enabled with `WsClientConfig::set_deflate()` and the `compress`
+  feature #1062
+
+## [4.2.0] - 2026-10-10
+
+* http: Reduce the `zstd` encoder of a streaming response from 2MiB to 1.5MiB,
+  text compresses about 1% larger. Document encoder memory usage
+
+* http: Use the `zlib-rs` backend for `gzip` and `deflate`. Decoding is
+  1.4-2.8 times faster and encoding 20-35% faster than with `miniz_oxide`.
+  Text compresses about 7% larger, incompressible data grows by up to 5.5%
+
+* http: Encode `zstd` chunks of 128KiB and larger on the blocking thread pool,
+  up to 384KiB per task. A 512KiB chunk took about 1.5ms on the I/O thread
+
+* http: Limit the `zstd` encoder window to 512KiB. A response body of unknown
+  size no longer allocates 3.6MiB of encoder state
+
+* http: Release the encoder state once a compressed body ends, not after all
+  of its output is sent
+
+* web: Document that `web::types::Payload` yields the request body without
+  decompressing it
+
+* web: Bodies read by the `Json`, `Form` and `Bytes` extractors, and client
+  response bodies, no longer keep unused buffer space alive
+
+## [4.1.0] - 2026-10-09
+
+* Fix build of `rustls` feature without `openssl`, restore `webpki-roots` dependency
+
+* http/2: Avoid two redundant authority splits when building request URLs
+
+* web: Type-erase the app factory in `test::server_with()` to reduce test
+  compile time
+
+* http: Add `zstd` content encoding and decoding to the `compress` feature
+
+* client: Send `zstd` in the default `Accept-Encoding` header
+
+* http: Encode chunks on the current thread below 16KiB for gzip and deflate
+  and 512KiB for zstd, and decode below 128KiB and 512KiB respectively. Larger
+  chunks go to the blocking thread pool
+
+* web: Honour `q` values in `Accept-Encoding` in the `Compress` middleware.
+  Encodings with `q=0` are no longer used, `*` covers unlisted encodings,
+  repeated headers are combined, and `x-gzip` is treated as `gzip`
+
+* http: Limit the memory of all `zstd` decoders to 512MiB. Windows up to 512KiB
+  are not counted, a frame that needs more memory than is left fails to decode
+
+* http: Pass a known body size to the `zstd` encoder, which then uses a smaller
+  window and stores the size in the frame
+
+* http: Send response bodies with a known size below 1KiB uncompressed
+
+* http: Encode large response chunks on the blocking thread pool in parts of
+  256KiB for gzip and deflate and 1MiB for zstd, and send the output of each
+  part before encoding the next, instead of buffering the whole output
+
+* http: Decode up to 256KiB of output per blocking task instead of a single
+  32KiB chunk, so a large payload needs about 8 times fewer pool tasks
+
+* http: Compress and decompress directly into the output buffer. The `flate2`
+  and `zstd` writers kept a 32KiB buffer per stream and copied it again into
+  the output. Encoded and decoded chunks are now at most 32KiB each
+
+* http: A truncated or empty `deflate` body now fails to decode, as `gzip` and
+  `zstd` bodies already did
+
+* Require `flate2` 1.1.3 or newer
+
+* http: Flush the compressed output when a streamed response body has no
+  data ready, so the client gets what was sent so far, for example server-sent
+  events. Bodies that are always ready are not flushed
+
+* http: Refactor the content encoder and decoder to share one compression
+  loop for all encodings, no behavior change
+
+## [4.0.0] - 2026-10-08
+
+* web: Percent-encode values substituted by `HttpRequest::url_for()` so they
+  cannot change the generated URL structure
+
+## [4.0.0-beta.18] - 2026-10-06
+
+* http: h1 dispatcher calls services with readiness check, `call_nowait()` is removed
+
+## [4.0.0-beta.17] - 2026-10-05
+
+* web: The authority of an absolute-form request target takes precedence over the `Host`
+  header in `ConnectionInfo::host()` and the `Host` guard, RFC 9112 section 3.2.2
+
+* web: `ConnectionInfo::host()` skips `Forwarded`, `X-Forwarded-Host` and `Host` values that
+  are not a valid `host[:port]`, and omits userinfo of the request target
+
+* http: Reject userinfo in an absolute-form request target and in the http/2 `:authority`,
+  and an empty http/2 `:authority` host
+
+* client: The http/2 `:authority` omits the scheme's default port, like the `Host` header
+
+* http/1: Suspend keep-alive, request-head and payload read timers while the filter chain
+  pauses reads, and the write timeout while it pauses writes, the peer is not charged for
+  the pause
+
+## [4.0.0-beta.16] - 2026-10-05
+
+* http/2: Pooled request header maps are handed back to the h2 decoder, one allocation less
+  per request
+
+* Use `urly::Url` instead of `http::Uri` for `RequestHead::uri`, `HttpRequest::uri()`,
+  the HTTP client and the WebSocket client. Client connectors use `Connect<Url>`
+
+* HTTP client and WebSocket client report an invalid url as `InvalidUrl::Parse` and
+  `WsConfigError::Parse`, replaces `InvalidUrl::Http` and `WsConfigError::Http`
+
+* http/1, http/2: Request-target is normalized, dot segments are removed and a fragment
+  is dropped. An origin-form path starting with `//` is a path, not an authority
+
+* http/1: Validate `Host` header with `urly`, out of range ports, invalid IPv4/IPv6
+  addresses and IPv6 zone ids are rejected
+
+* http/2: The last chunk of a sized response body ends the stream, no empty `DATA` frame
+  is sent
+
+* http/2: Build request uri, `content-length` and `date` response headers without
+  per-request formatting allocations
+
+* http/2: Response headers are sent from the pooled response head, the header map is
+  not reallocated per response
+
+* http/2: Build absolute-form and CONNECT request urls without an intermediate `String`
+
+* Pooled request heads and web requests release the request uri and headers, so they
+  do not keep the connection read buffer alive
+
+* http/1: Request heads are not decoded during write back-pressure, request payload is
+  still read
+
+* http/1: Fix headers read rate undercounting bytes consumed by a partial request head
+  decode
+
+* http/1: Check for buffered input with `IoRef::read_dst_size()` in the server and client,
+  the check no longer changes the read state
+
+* http/1: A response with a declared length is complete once its last byte is encoded, the
+  body is not polled for its end. A response without body bytes, for example to a `HEAD`
+  request, does not poll its body
+
+* http/1: Response output is flushed only during write back-pressure
+
+* Check for buffered input with `IoRef::read_dst_size()` in the http/1 server and client,
+  the check no longer changes the read state
+
+* http/1: A response with a declared length is complete once its last byte is encoded, the
+  body is not polled for its end. A response without body bytes, for example to a `HEAD`
+  request, does not poll its body
+
+* http/1: Response output is flushed only during write back-pressure
+
+## [4.0.0-beta.14] - 2026-10-01
+
+* Use `urly` for URL generation and cookie encoding, `HttpRequest::url_for()`
+  returns `urly::Url`. Remove the `url` feature, `urly` is re-exported as
+  `ntex::url`
+
+* Migrate to `ntex-service` 5 and its typed service state model. Service
+  factories and middleware now receive state instead of a configuration
+  parameter, `Service::poll()` is removed, and services use asynchronous
+  `ready()` and `shutdown()` lifecycle methods
+
+* Refactor `Pipeline` and middleware APIs around state binding and lifecycle
+  management
+
+* Redesign web application state. Add the `State` trait, `AppState<T>`,
+  `WebAppConfig`, request-local state, and support for constructing web
+  applications with server-created state
+
+* Refactor web error handling around state-aware `WebResponseError` and
+  `WebError` types. Error rendering no longer receives an `HttpRequest`, and
+  service initialization errors use `Failure` and `IntoFailure`
+
+* Redesign the HTTP client, including its builder, configuration, connectors,
+  connection pool, request sender, and HTTP/2 integration
+
+* Refactor HTTP server service construction, control handling, shutdown, and
+  application-state creation
+
+* `web::ResourceMap::url_for()` on a nested scope map resolves names of parent and sibling
+  scopes, parent names were prefixed with the nested scope path and sibling names were not found
+
+* `web::test::TestServerConfig::listener()` does not bind the configured port, the web test
+  server bound it anyway and panicked if the port was in use
+
+* Add `Payload::trailers()`, HTTP/1 chunked and HTTP/2 request trailers and HTTP/2 client
+  response trailers are available after the payload is complete, they were dropped;
+  `h1::Payload` is a struct that dereferences to `bstream::Receiver`, new
+  `PayloadItem::Trailers` item, chunked trailer fields must be `name: value` lines
+
+* HTTP/2 payload read that returns a chunk does not register the reader waker, new data woke
+  a reader that was not waiting
+
+* HTTP/2 payload read does not wake the client payload task when no data is available,
+  the task was polled for nothing on every pending read
+
+* HTTP/2 `304 Not Modified` response has no body, it was sent with `content-length: 0` or
+  with the body `DATA` frames
+
+* `CustomResponder` returns `500` for an invalid `with_header()` name or value, it was
+  silently ignored; repeated `with_header()` calls for the same name keep all values, only
+  the last one was kept
+
+* HTTP/2 response body error resets only its stream with `INTERNAL_ERROR`, it closed the whole
+  connection with `GOAWAY`, a failed send on a closed stream no longer fails the connection
+
+* Remove unused `H2Error::Stream`, `H2Error::Operation`, `H2Error::MissingPseudo` and
+  `H2Error::Uri`, stream-level failures are not connection errors
+
+* HTTP/2 request with a malformed uri is answered with `400 Bad Request`, it closed the whole
+  connection with `GOAWAY`, see RFC 9113 section 8.1.1
+
+* HTTP/2 payload keeps the first error, a stream reset was reported as
+  `PayloadError::Incomplete` when the sender was dropped
+
+* HTTP/2 payload ends after an error, the next read returned `Pending` forever instead of `None`
+
+* HTTP/2 request payload ignores empty non-final `DATA` frames, they are not flow controlled
+  and each one was queued as an empty body chunk without bound
+
+* HTTP/2 connection is closed with `GOAWAY` `ENHANCE_YOUR_CALM` after 10 consecutive empty non-final `DATA` frames,
+  new `H2Error::EmptyDataFrames` error
+
+* Remove the deprecated `neon` feature, it had no effect
+
+* Remove the `neon-iocp` feature, it had no effect, Windows always uses IOCP
+
+* `Client::request_from` copies every value of multi-value headers, only the first value
+  was copied
+
+* HTTP/1 dispatcher closes the connection when a response body stream fails, an error
+  response was written into the incomplete response body
+
+* `Json` extractor rejects a request with an invalid `Content-Length` header with
+  `JsonPayloadError::Payload(PayloadError::UnknownLength)`, the header was ignored and the body
+  was read up to the limit
+
+* Reduce per-request allocations in `Logger`, `Compress`, `ConnectionInfo` and `Form`
+  content-type check, `Logger` no longer clones its format for every request
+
+* HTTP/1 dispatcher stops polling a response body once the connection is closed or failed,
+  an always ready body was polled without bound and its chunks discarded
+
+* HTTP/1 dispatcher stops polling a response body once its declared length is sent or the
+  response has no body, such as a `HEAD` response, the rest of the body was polled and discarded
+
+* Response body encoder stops after the end of the body stream, an empty final chunk left it
+  unfused and the next poll went back to the finished body
+
+* `Compress::default()` negotiates only encodings the encoder supports, a browser
+  `Accept-Encoding` listing `br` selected brotli and the response was sent uncompressed
+
+* `Bytes`, `String`, `Json` and `Form` extractors return a single-chunk body without copying
+  and size the buffer from `Content-Length` instead of a fixed 8 KiB allocation
+
+* HTTP/1 server keeps reading the request payload after the response is sent until the payload
+  completes, a payload that was still held by the application was decoded as the next request
+  once its first part was received
+
+* HTTP/1 response carries `connection: close` if the request payload was dropped unread while
+  the service was running, the connection was closed without announcing it
+
+* HTTP/1 server rejects an asterisk-form request target for methods other than `OPTIONS`
+
+* HTTP/1 server accepts an authority-form request target only for `CONNECT`, and requires it for `CONNECT`
+
+* HTTP/1 dispatcher drops an idle streaming response body and closes the connection when the client
+  half-closes it and has no pipelined requests; `HttpServiceConfig::set_half_close(true)` keeps
+  the previous behavior
+
+* `h1::Codec::upgrade()` is removed, use `Request::upgrade()` of the decoded request
+
+* HTTP/1 dispatcher observes a connection failure while the response body is pending, a streaming
+  response kept the connection and its body until the body produced the next chunk
+
+* HTTP/1 `101 Switching Protocols` response body is sent without framing, a body of a response to
+  a request without upgrade was chunk encoded or cut at its length
+
+* HTTP/2 client stops sending the request body when the stream is reset or the connection closes,
+  a streaming body that waited for data kept the upload task and the connection busy
+
+* HTTP/2 server passes `Expect: 100-continue` requests to the control service as
+  `h2::Control::Expect`, the default ack sends `100 Continue`, the client waited for the expect timeout
+
+* HTTP/2 server replaces an informational (`1xx`) application response with `500`, the response
+  ended the stream with an interim status
+
+* HTTP/2 payload releases the flow-control capacity of the final DATA frame when the data is read
+
+* `ws::WsSink::on_disconnect()` returns `io::Waiter<'static>`, `io::OnDisconnect` is removed
+
+* WebSocket client handshake errors carry the client's service name, before it was only set on
+  configuration errors
+
+* `ws::WsSink::send()` waits while write back-pressure is enabled before queueing a data message,
+  a fast sender grew the write buffer without bound
+
+* HTTP/1 encoder writes the status line and each header line with one copy and skips the
+  extra headers lookup when there are none
+
+* HTTP/1 decoder splits header names and values off the read buffer directly, without splitting
+  each header line first
+
+* WebSocket client sends every value of a multi-valued handshake header, before only the first
+  one was sent
+
+* HTTP client `JsonBody` returns `PayloadError::UnknownLength` for an invalid `Content-Length`
+  header, as `MessageBody` does
+
+* HTTP client `ClientRequest::timeout(Millis::ZERO)` disables the response timeout for the request,
+  as `ClientConfig::set_response_timeout(Millis::ZERO)` does, it used the client-wide timeout
+
+* Web renders HTTP client `ClientError::Timeout` as `504 Gateway Timeout`
+
+* HTTP client reports an invalid request URI as `ClientError::Url(InvalidUrl::Http)`
+
+* Remove unused HTTP client error variants `ClientError::TunnelNotSupported`,
+  `ConnectError::Timeout`, `ConnectError::SslError` and `ConnectError::SslHandshakeError`
+
+* WebSocket handshake accepts only version 13, a rejected version is answered with
+  `Sec-WebSocket-Version: 13`
+
+* `web::ws::start()` sends the handshake error response and closes the connection when the
+  handshake of an upgrade request fails, before the handler's response was sent
+
+* HTTP client `TestResponse` adds a separate `Set-Cookie` header per cookie, including cookie
+  attributes
+
+* HTTP client `basic_auth()`, `bearer_auth()` and `content_length()` replace an existing header,
+  `ClientConfig::set_basic_auth()` and `set_bearer_auth()` replace a configured `Authorization` header
+
+* HTTP client removes `Content-Encoding` and `Content-Length` headers of a decompressed response
+
+* HTTP/1 validates a partially received chunk-size line incrementally, the line was parsed
+  from the start on every read
+
+* HTTP/1 writes the chunk size line without `fmt` formatting
+
+* Remove unused `EncodeError::Fmt`
+
+* HTTP/1 applies the default control actions without calling a control service, unless one
+  is provided with `H1Service::control()` or `HttpService::h1_control()`
+
+* HTTP/1 does not restart the keep-alive timer for every request of a persistent connection
+
+* HTTP/1 client does not add a `Date` header to requests
+
+* HTTP/1 client does not use chunked coding for HTTP/1.0 requests, a streaming request body
+  without chunked coding and `Content-Length` header fails with new `EncodeError::UnknownLength`,
+  the body was sent without framing
+
+* HTTP/1 client sends `content-length: 0` for `POST`, `PUT` and `PATCH` requests without a body
+
+* HTTP/1 client treats a `2xx` response to `CONNECT` as a tunnel, framing headers are ignored,
+  the payload is read until connection close and the connection is not reused, the connection
+  was returned to the pool
+
+* HTTP/2 client does not send connection-specific headers `Upgrade`, `Keep-Alive`, `Proxy-Connection`
+  and `TE` other than `trailers`, extra headers are filtered too, a `Host` header is not sent,
+  `:authority` of the connection is used
+
+* HTTP/2 client omits the userinfo from `:authority`, credentials of the request uri were sent
+
+* HTTP/2 client skips interim `1xx` responses, an interim response was returned as the
+  final response
+
+* HTTP/1 client sends `CONNECT` requests in authority-form (`host:port`), the path
+  was sent instead
+
+* HTTP/1 parses `Transfer-Encoding` as a list of codings. A request with codings other than
+  final `chunked` is rejected with `501 Not Implemented` (new `DecodeError::UnsupportedTransferCoding`),
+  a response with final `chunked` is framed by chunked coding and a response without final
+  `chunked` is delimited by connection close, such messages were rejected
+
+* HTTP/1 parses an incomplete start line incrementally, an invalid start line is
+  rejected as soon as the bad byte arrives instead of after the line end
+
+* HTTP/1 treats every '101 Switching Protocols' response as an upgrade, a response without
+  `.upgrade()` kept the connection reading HTTP/1 requests
+
+* `ResponseHead::reason()` returns an empty reason phrase for a status code without a
+  canonical reason, HTTP/1 sent `<unknown status code>` as the reason phrase
+
+* HTTP/1 matches `Expect: 100-continue` case-insensitively, any value starting with `100-`
+  was taken as `100-continue`
+
+* HTTP/1 merges small chunks of a chunked payload into payload chunks of up to 16KiB, a
+  payload of tiny chunks was buffered as a separate item per chunk
+
+* HTTP/1 sends `content-length: 0` for responses without a body size, such responses
+  were sent without framing headers
+
+* HTTP/1 does not send `transfer-encoding: chunked` in `101 Switching Protocols` responses
+
+* HTTP/1 sends responses to HTTP/1.0 requests with the `HTTP/1.1` status line, as
+  RFC 9110 section 2.5 recommends, and a non-persistent response includes `connection: close`.
+  Chunked coding is still not used for HTTP/1.0 clients
+
+* HTTP/1 replaces informational (1xx) service responses, except `101 Switching Protocols`,
+  with `500 Internal Server Error`, an interim response was sent as the final response
+
+* HTTP/1 limits the trailer section of chunked payloads to 4KiB, trailer fields were
+  skipped without limit
+
+* HTTP/1 rejects requests with `Transfer-Encoding: identity`, the obsolete coding was
+  accepted and a request with `Content-Length` was framed by its length
+
+* HTTP/1 upgrades the connection only if the request contains both `Upgrade` and
+  `Connection: upgrade`, otherwise the upgrade is ignored
+
+* HTTP/1 rejects chunk extensions that contain control characters other than HTAB, a bare
+  LF in a chunk extension was accepted
+
+* HTTP/1 rejects requests with `400 Bad Request` if they contain multiple or invalid `Host`
+  headers, and HTTP/1.1 requests without `Host`, use `HttpServiceConfig::set_host_validation()`
+  to disable
+
+* Payload decoder limits decompressed chunks to less than 96KiB, before a single compressed
+  chunk was decompressed at once and a small gzip or deflate body could allocate
+  gigabytes before payload size limits applied, the decoder ends the stream after
+  a decoding error
+
+* `Response::take()` copies the response head without extensions, before both responses
+  shared the head and modifying either of them panicked
+
+* HTTP/1 limits the request or status line to 16KiB, configurable with
+  `HttpServiceConfig::set_max_start_line_size()`, a longer request line is rejected with
+  `414 URI Too Long`, add `DecodeError::StartLineTooLong`
+
+* HTTP/1 parses an incomplete request or status line again only when new data contains
+  a line end, and drops leading empty lines, before a start line sent in small pieces was
+  re-parsed on every read
+
+* Response body encoder ends the stream after an encoding error, before polling it again
+  sent the remaining body uncompressed
+
+* HTTP/2 resets the request stream when a request body held by the application is
+  dropped after the response is complete, before the stream was kept until the next
+  data frame or the connection closed
+
+* Dropping a request or response that holds another request or response in its
+  extensions, or dropping one during thread-local teardown, no longer panics
+
+* HTTP services unregister an in-flight connection even if creating the control
+  service fails or the connection future is dropped, before graceful shutdown waited
+  for the leaked connection until the shutdown timeout
+
+* HTTP/1 fails an unfinished request payload with `PayloadError::Incomplete` when the
+  dispatcher stops, before a detached payload reader could wait forever or see a truncated
+  payload as complete
+
+* HTTP/1 ignores `Expect` and `Upgrade` in HTTP/1.0 requests, no `100 Continue` is
+  sent to HTTP/1.0 clients
+
+* HTTP/1 closes the connection after a non-persistent response, pipelined requests
+  that follow it are not processed
+
+* HTTP/1 limits chunk extensions to 16KiB per payload, an endless chunk-size line
+  was buffered without limit
+
+* HTTP/2 server resets the stream with `NO_ERROR` if the response is complete and the request
+  payload is dropped unread, or is dropped later and more request data arrives, the stream
+  does not keep the stream slot
+
+* HTTP/2 server accepts `CONNECT` requests without `:path`, the request uri is the authority
+
+* JSON bodies of `web::types::Json`, `ResponseBuilder::json()` and client JSON requests are
+  serialized directly into the body buffer instead of being copied from a `String`
+
+* HTTP client cookies are appended to a `Cookie` header set on the request or client, instead of
+  replacing it
+
+* `web::ws::start()` sends a protocol error close frame (1002) on invalid input
+
+* `ws::WsSink` implements `Encoder` and `Decoder`, WebSocket dispatchers use the sink as codec, so
+  sinks cannot send messages after the service returned a close message. `web::ws::start_with()`
+  service handles `DispatchItem<WsSink>` instead of `DispatchItem<ws::Codec>`
+
+* `ws::WsConnection::start()` sends a protocol error close frame (1002) on invalid input. The
+  dispatcher and the connection's sinks share codec state
+
+* `ws::Codec` discards input received after the peer's close frame
+
+* WebSocket client and `web::ws::start()` treat a clean disconnect as the end of the connection,
+  instead of `WsError::Disconnected(None)`
+
+* WebSocket client cookies are appended to a `Cookie` header set in `ws::WsClientConfig`, instead
+  of replacing it
+
+* WebSocket client `Host` header no longer includes the URI's userinfo, and omits the scheme's
+  default port, like the HTTP client
+
+* `ws::WsConnection::receiver()` answers the peer's close frame, echoing its close code, unless
+  a close frame was already sent; sinks returned by `ws::WsConnection::sink()` share state
+
+* `ws::WsTransport` echoes the peer's close code when it answers a close frame, and rejects text
+  frames with close code 1003 (`Unsupported`) instead of 1002
+
+* Dropping the receiver returned by `ws::WsConnection::receiver()` sends a close frame and
+  closes the connection, instead of keeping it open until the peer sends another frame
+
+* `ws::WsTransport` sends a protocol error close frame (1002) before closing the connection on
+  invalid input, output written after the close frame is discarded
+
+* `ws::WsTransport` shutdown waits for the peer's close frame, until read EOF or the shutdown
+  timeout, instead of closing the connection right after sending its own
+
+* WebSocket client codec accepts a received close code 1010 (`Extension`), servers still cannot
+  send it
+
+* Fix HTTP client pool keeping an HTTP/2 connection that cannot open new streams, for example
+  after the peer sends GOAWAY; requests waited or failed until the peer closed the connection
+
+* Fix `ws::Codec::encode_page()` writing a final binary frame in the middle of a fragmented
+  message, it now returns `ProtocolError::ContinuationStarted`
+
+* WebSocket client frame masks and handshake keys use nanorand's thread-local generator instead
+  of seeding a new one from system entropy every time
+
+* Fix HTTP/1 `max_headers` limit counting distinct header names, repeated header names
+  are counted separately
+
+* Fix HTTP client requests failing when their HTTP/2 connection reaches `h2_lifetime` after
+  the connection is acquired but before the request is sent
+
+* Fix HTTP client requests waiting for HTTP/2 stream capacity not being woken when the
+  connection releases a stream after the request completes, the peer raises its stream
+  limit, or the connection closes
+
+* `ClientConfig::set_h1_keepalive(Seconds::ZERO)` and `set_h1_lifetime(Seconds::ZERO)` disable
+  the idle and lifetime checks, as for the HTTP/2 settings; previously pooled connections were
+  never reused
+
+* `web::test::server()` client uses the default `ClientConfig`, as `http::test::server()` does
+
+* Fix HTTP client pool shutdown leaving requests waiting for a connection pending forever,
+  keeping idle connections open and accepting new requests
+
+* Rename `ClientConfig::set_keepalive()`, `set_lifetime()`, `set_connection_limit()` and
+  `connection_limit()` to `set_h1_keepalive()`, `set_h1_lifetime()`,
+  `set_h1_connection_limit()` and `h1_connection_limit()`
+
+* Add separate HTTP/2 settings to the HTTP client pool: `ClientConfig::set_h2_keepalive()`,
+  `set_h2_lifetime()`, `set_h2_connection_limit()` and `set_h2_max_streams()`.
+  The pool can open several HTTP/2 connections per host when existing ones are saturated,
+  HTTP/2 idle time is measured from completion of the last request, and HTTP/2 requests
+  no longer count against `set_h1_connection_limit()`
+
+* Fix HTTP client pool not closing expired HTTP/2 connections
+
+* Fix HTTP client pool keeping connections released after the pool is stopped
+
+* Fix HTTP client pool with connection limit `0` never waking requests
+  waiting for a connection
+
+* Fix HTTP/1 client losing an early response, such as `413`, when the server
+  closes the connection before the request body is sent
+
+* Fix HTTP/1 client returning interim `1xx` responses instead of the final
+  response
+
+* Fix HTTP/1 client reusing connections after HTTP/1.0 responses without
+  `Connection: keep-alive`
+
+* Fix HTTP/1 client omitting non-default ports 80 and 443 from the `Host` header
+
+* Fix HTTP/1 client response payload panic when polled after completion
+
+* Fix HTTP/1 client dropping the body of HTTP/1.1 responses delimited by
+  connection close, and accepting truncated HTTP/1.0 response bodies
+
+* Fix HTTP/1 client waiting for a body of `1xx`, `204`, or `304` responses
+  with `Content-Length` or `Transfer-Encoding` headers
+
+* Fix HTTP/1 websocket upgrade requests depending on header order to ignore
+  `Content-Length: 0`, and dropping a non-zero `Content-Length`
+
+* Accept and discard HTTP/1 chunked request and response trailer fields
+  instead of rejecting the payload
+
+* Fix HTTP/1 `Connection` header parsing ignoring tokens after the first
+  5 bytes, matching tokens by prefix, and letting a later header override
+  an earlier one
+
+* Fix an empty HTTP/1 chunked response body chunk terminating the body and
+  dropping the remaining chunks
+
+* Fix HTTP/1 streaming responses using chunked transfer coding for HTTP/1.0
+  requests, and keeping the connection alive for responses delimited by
+  connection close
+
+* Fix HTTP/1 responses with `1xx` (except `101`), `204`, or `304` status
+  writing body bytes and `304` responses writing a length header
+
+* Fix undefined behavior in the HTTP/1 encoder number formatting, which
+  created an uninitialized buffer
+
+* Fix HTTP/1 decoder panic on header names longer than 65535 bytes, the
+  request is rejected with a header decode error
+
+* Continue the interrupted HTTP/1 payload read-rate interval when payload
+  timing resumes after backpressure, instead of starting a new interval, and
+  check an interval that expired before the pause
+
+* Add WsError::WriteTimeout for WebSocket dispatchers stopped by the write
+  backpressure timeout
+
+* Fix pooled web requests keeping the resource map of another application,
+  which made `HttpRequest::url_for()` resolve against the wrong routes
+
+* Render `serde_json` and `serde_urlencoded` serialization errors as
+  `500 Internal Server Error` instead of `400 Bad Request` in the default web
+  error domain
+
+* Apply `web::test::TestRequest::peer_addr()` to generated requests
+
+* Resolve relative paths in `web::test::TestServer::request()` against the test
+  server url
+
+* Use `timeout + 15s` as the cumulative request-head limit when
+  `HttpServiceConfig::set_client_timeout()` re-enables header-read timing
+
+* Rename API methods for consistency; the old names are deprecated:
+  * `ClientConfig::timeout()`, `payload_limit()`, `payload_timeout()` to
+    `response_timeout()`, `response_payload_limit()`, `response_payload_timeout()`
+  * `ClientConfig::set_limit()` to `set_connection_limit()`, and add
+    `connection_limit()`
+  * `ClientConfig::set_keep_alive()` to `set_keepalive()`
+  * `WsClientConfig::set_header_if_unset()` to `set_header_if_none()`
+  * `HttpServiceConfig::set_enable_headers_vec()` to `set_headers_vec(bool)`
+  * `HttpServer::maxconn()` to `max_connections()`, and `maxconnrate()` to
+    `max_tls_handshakes()`
+
+* Add `PayloadConfig::content_type()` predicate, matching `JsonConfig::content_type()`
+
+* Add `HttpServiceConfig::set_write_timeout()` to bound HTTP/1 write
+  backpressure, a client that stops reading responses could hold a connection
+  open indefinitely. An unfinished request payload fails with a timed-out
+  `PayloadError::Io`
+
+* Decode already received HTTP/1 request payload before failing a paused
+  payload read-rate timer without budget left
+
+* Start the HTTP/1 payload read-rate timer for `Expect: 100-continue` requests
+  only after `100 Continue` is sent, so slow expectation handling no longer
+  causes a `408 Request Timeout`
+
+* Start the HTTP/1 request-head read-rate timer of the first request with its
+  first byte, a new connection waits for that byte for the client timeout only
+
+* Keep the HTTP/1 keep-alive timer running for a partially received request
+  head when request-head timing is disabled, previously the first byte of the
+  next request stopped it and the connection could stay open forever
+
+* Stop test servers when all server handles are dropped
+
+* Fix a keep-alive readiness deadlock when less than one millisecond remains
+
+* Fix a rate limiting handling for http1 codec
+
+* Update the minimum supported Rust version to 1.97
+
+* Improve crate and public API documentation
+
+## [3.13.0] - 2026-08-09
+
+* Stop server when one of worker panics (stop_on_panic)
+
+* Allow to enable graceful shutdown for signals
+
+## [3.12.3] - 2026-08-06
+
+* Remove sha1 dependency
+
+## [3.12.2] - 2026-08-06
+
+* Allow to get raw headers items
+
+## [3.12.1] - 2026-08-05
+
+* Allow storing the original header name strings.
+
+## [3.12.0] - 2026-07-30
+
+* Add support for *QUERY* http method #943
+
+* Enforce `max_buf_size` for complete message heads; previously the limit was only
+  checked while a message head was still partial, so a head that fit in a single
+  read could exceed it
+
+* Respond with "431 Request Header Fields Too Large" instead of "400 Bad Request"
+  when a message head exceeds `max_buf_size`
+
+## [3.11.0] - 2026-07-24
+
+* Replace httparse with ntex-httparse
+
+* Use transfer-encoding size parsing from ntex-httparse #944
+
+* Trasfer-encoding is not supported by HTTP/1.0 #945
+
+## [3.10.1] - 2026-07-04
+
+* Fix keep-alive handling if headers timeout is enabled
+
+## [3.10.0] - 2026-06-22
+
+* Allow to override `SharedCfg` test server and client configs #910
+
+## [3.9.8] - 2026-06-11
+
+* Reset method of pooled `RequestHead` on release; ws client could send a recycled
+  non-GET method (e.g. POST) in the handshake request after the worker thread served
+  an HTTP request with that method
+
+* Include the received status code in `WsClientError::InvalidResponseStatus` display
+  message
+
+## [3.9.7] - 2026-06-11
+
+* HTTP/1 client silently truncates the auto-generated Host header #894
+
 ## [3.9.6] - 2026-05-19
 
 * Revert changes related to headers parsing #889

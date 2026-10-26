@@ -1,6 +1,6 @@
 [package]
 name = "ntex-io"
-version = "3.12.2"
+version = "4.6.0"
 authors = ["ntex contributors <team@ntex.rs>"]
 description = "Utilities for abstracting io streams"
 keywords = ["network", "framework", "async", "futures"]
@@ -10,7 +10,11 @@ documentation = "https://docs.rs/ntex-io/"
 categories = ["network-programming", "asynchronous"]
 license = "MIT OR Apache-2.0"
 edition = "2024"
-rust-version = "1.88"
+rust-version = "1.97"
+
+[package.metadata.docs.rs]
+features = ["tracker"]
+rustdoc-args = ["--cfg", "docsrs"]
 
 [lib]
 name = "ntex_io"
@@ -22,6 +26,9 @@ workspace = true
 [features]
 default = []
 trace = []
+
+# read buffer memory attribution
+tracker = ["ntex-bytes/tracker"]
 
 [dependencies]
 ntex-codec = { workspace = true }

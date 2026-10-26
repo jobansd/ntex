@@ -1,5 +1,101 @@
 # Changes
 
+## [4.4.0] - 2026-10-21
+
+* Release in-flight call counts on cancellation, and cancel the dispatcher-held
+  response when Stop is handed off to background shutdown, so a stale count
+  cannot retain the service after Stop completes
+
+## [4.4.0] - 2026-10-19
+
+* Report the stop reason to `IoRef::set_close_reason()`
+
+* Use `IoRef::is_filter_paused()`, a filter chain that is not ready pauses reads only
+
+## [4.3.0] - 2026-10-06
+
+* Service calls, including stop and control items, wait for service readiness
+
+* A stop item that waits for service readiness longer than the shutdown timeout is
+  delivered in the background and io is closed
+
+## [4.2.1] - 2026-10-05
+
+* Suspend the write timeout while the filter chain pauses writes, it starts over once writes
+  resume
+
+* Suspend keep-alive and frame read timers while the filter chain pauses reads, the peer is
+  not charged for the pause
+
+## [4.2.0] - 2026-10-04
+
+* Keep the keep-alive timer armed while a frame is read or handled instead of
+  registering it again for every frame
+
+* Decode input received together with a read timer expiry before handling the timeout, the
+  frame is dispatched and frame read progress is counted
+
+* Check for buffered input with `IoRef::read_dst_size()`, the check no longer cancels a read
+  pause
+
+## [4.1.0] - 2026-10-01
+
+* Add `Dispatcher::max_inflight()`, limits concurrent service calls
+
+* Dispatch frames already in the read buffer when the connection fails while the service
+  is not ready, they were dropped
+
+* Return the service error from the `DispatchItem::Stop` call, it was dropped and the dispatcher
+  resolved to `Ok(())`
+
+* Rename `Reason::KeepAliveTimeout` to `Reason::KeepAlive`
+
+* Internal cleanup, drop `bitflags` and `pin-project-lite` dependencies
+
+* Report `Reason::Io(Some(UnexpectedEof))` when the peer closes cleanly while
+  undecodable bytes remain in the read buffer, instead of a clean disconnect
+
+* Simplify internal state
+
+* Enforce the IoConfig write timeout from the moment write backpressure is
+  enabled until it is disabled; a peer that does not release backpressure in
+  time is stopped with the new Reason::WriteTimeout. Backpressure released while
+  the service is not ready also ends the timeout
+
+* Stop the frame read timer when a frame completes
+
+* Stop keep-alive and frame read timers during write backpressure when no write
+  timeout is configured, as frames are not decoded then
+
+* Count bytes consumed by the codec as frame read progress
+
+* Restart frame read-rate tracking with a fresh period and `max_timeout` budget
+  when the service is not ready
+
+* Start frame read-rate tracking for the first frame when the connection arrives
+
+* Run the keep-alive timer only while the connection is idle; it is stopped
+  while a frame is read or handled and starts once the last response is done
+
+* Handle external timeouts (`IoRef::notify_timeout()`) the same way while the
+  service is paused: an idle dispatcher, with no frames in flight, is stopped
+  with Reason::KeepAlive, otherwise the timeout is ignored. Pausing no
+  longer discards a pending external timeout
+
+* Transport failures and force-closes cancel the dispatcher-held pending response future
+
+## [4.0.1] - 2026-09-18
+
+* Api docs improvements
+
+## [4.0.0] - 2026-09-14
+
+* Migrate to ntex-service 5
+
+## [3.2.1] - 2026-06-15
+
+* Send `Control::WBackPressureEnabled` control message only once per back-pressure
+
 ## [3.2.0] - 2026-05-08
 
 * Do not use deprecated methods

@@ -1,16 +1,14 @@
-use std::{cell::Ref, cell::RefMut, fmt, net, rc::Rc};
+use std::{cell::Ref, cell::RefMut, convert::Infallible, fmt, net, rc::Rc};
 
-use crate::http::{
-    HeaderMap, HttpMessage, Message, Method, Payload, RequestHead, Uri, Version,
-};
-use crate::{io::IoRef, io::types, router::Path, util::Extensions};
+use urly::Url;
+
+use crate::http::{HeaderMap, HttpMessage, Message, Method, Payload, RequestHead, Version};
+use crate::{Cfg, io::IoRef, io::types, router::Path, util::Extensions};
 
 use super::config::WebAppConfig;
-use super::error::ErrorRenderer;
-use super::extract::FromRequest;
 use super::info::ConnectionInfo;
 use super::rmap::ResourceMap;
-use super::service::AppState;
+use super::{FromRequest, State};
 
 #[derive(Clone)]
 /// An HTTP Request
@@ -18,26 +16,23 @@ pub struct HttpRequest(pub(crate) Rc<HttpRequestInner>);
 
 pub(crate) struct HttpRequestInner {
     pub(crate) head: Message<RequestHead>,
-    pub(crate) path: Path<Uri>,
-    pub(crate) payload: Payload,
-    pub(crate) app_state: AppState,
-    rmap: Rc<ResourceMap>,
+    pub(crate) path: Path<Url>,
+    pub(crate) config: Cfg<WebAppConfig>,
+    pub(crate) rmap: Rc<ResourceMap>,
 }
 
 impl HttpRequest {
     #[inline]
     pub(crate) fn new(
-        path: Path<Uri>,
+        path: Path<Url>,
         head: Message<RequestHead>,
-        payload: Payload,
         rmap: Rc<ResourceMap>,
-        app_state: AppState,
+        config: Cfg<WebAppConfig>,
     ) -> HttpRequest {
         HttpRequest(Rc::new(HttpRequestInner {
             head,
             path,
-            payload,
-            app_state,
+            config,
             rmap,
         }))
     }
@@ -50,8 +45,8 @@ impl HttpRequest {
         &self.0.head
     }
 
-    /// This method returns muttable reference to the request head.
-    /// panics if multiple references of http request exists.
+    /// This method returns mutable reference to the request head.
+    /// Panics if multiple references of http request exists.
     #[inline]
     pub(crate) fn head_mut(&mut self) -> &mut RequestHead {
         &mut Rc::get_mut(&mut self.0).unwrap().head
@@ -59,7 +54,7 @@ impl HttpRequest {
 
     /// Request's uri.
     #[inline]
-    pub fn uri(&self) -> &Uri {
+    pub fn uri(&self) -> &Url {
         &self.head().uri
     }
 
@@ -84,7 +79,7 @@ impl HttpRequest {
     /// The target path of this Request.
     #[inline]
     pub fn path(&self) -> &str {
-        self.head().uri.path()
+        self.head().uri.path().as_str()
     }
 
     /// The query string in the URL.
@@ -92,7 +87,7 @@ impl HttpRequest {
     /// E.g., id=10
     #[inline]
     pub fn query_string(&self) -> &str {
-        self.uri().query().unwrap_or_default()
+        self.uri().query().map_or("", urly::Query::as_str)
     }
 
     /// Io reference for current connection
@@ -118,12 +113,12 @@ impl HttpRequest {
     /// where the identifier can be used later in a request handler to
     /// access the matched value for that segment.
     #[inline]
-    pub fn match_info(&self) -> &Path<Uri> {
+    pub fn match_info(&self) -> &Path<Url> {
         &self.0.path
     }
 
     #[inline]
-    pub(crate) fn match_info_mut(&mut self) -> &mut Path<Uri> {
+    pub(crate) fn match_info_mut(&mut self) -> &mut Path<Url> {
         &mut Rc::get_mut(&mut self.0).unwrap().path
     }
 
@@ -139,8 +134,10 @@ impl HttpRequest {
         self.head().extensions_mut()
     }
 
-    #[cfg(feature = "url")]
-    /// Generate url for named resource
+    /// Generate url for named resource.
+    ///
+    /// Each element is percent-encoded as one literal URL component before it
+    /// replaces a dynamic segment.
     ///
     /// ```rust
     /// # use ntex::web::{self, App, HttpRequest, HttpResponse};
@@ -151,7 +148,7 @@ impl HttpRequest {
     /// }
     ///
     /// fn main() {
-    ///     let app = App::new()
+    ///     let app = App::default()
     ///         .service(web::resource("/test/{one}/{two}/{three}")
     ///              .name("foo")  // <- set resource name, then it could be used in `url_for`
     ///              .route(web::get().to(index))
@@ -162,7 +159,7 @@ impl HttpRequest {
         &self,
         name: &str,
         elements: U,
-    ) -> Result<url_pkg::Url, super::error::UrlGenerationError>
+    ) -> Result<urly::Url, super::error::UrlGenerationError>
     where
         U: IntoIterator<Item = I>,
         I: AsRef<str>,
@@ -170,7 +167,6 @@ impl HttpRequest {
         self.0.rmap.url_for(self, name, elements)
     }
 
-    #[cfg(feature = "url")]
     /// Generate url for named resource
     ///
     /// This method is similar to `HttpRequest::url_for()` but it can be used
@@ -178,7 +174,7 @@ impl HttpRequest {
     pub fn url_for_static(
         &self,
         name: &str,
-    ) -> Result<url_pkg::Url, super::error::UrlGenerationError> {
+    ) -> Result<urly::Url, super::error::UrlGenerationError> {
         const NO_PARAMS: [&str; 0] = [];
         self.url_for(name, NO_PARAMS)
     }
@@ -195,25 +191,19 @@ impl HttpRequest {
     /// borrowed.
     #[inline]
     pub fn connection_info(&self) -> Ref<'_, ConnectionInfo> {
-        ConnectionInfo::get(self.head(), self.app_config())
+        ConnectionInfo::get(self.head(), &self.0.config)
     }
 
     /// App config
     #[inline]
     pub fn app_config(&self) -> &WebAppConfig {
-        self.0.app_state.config()
+        &self.0.config
     }
 
-    /// Get an application state object stored with `App::state()` or `App::app_state()`
-    /// methods during application configuration.
-    ///
-    /// If `App::state()` was used to store object, use `State<T>`:
-    ///
-    /// ```rust,ignore
-    /// let opt_t = req.app_data::<State<T>>();
-    /// ```
+    #[inline]
+    /// Get an application state object stored with `WebAppConfig`.
     pub fn app_state<T: 'static>(&self) -> Option<&T> {
-        self.0.app_state.get::<T>()
+        self.0.config.state::<T>()
     }
 }
 
@@ -239,8 +229,8 @@ impl HttpMessage for HttpRequest {
 
 impl Drop for HttpRequest {
     fn drop(&mut self) {
-        let id = self.0.app_state.id();
-        let pool_size = self.0.app_state.config().pool_size;
+        let id = self.0.config.id();
+        let pool_size = self.0.config.pool_size;
         super::config::put_request(id, pool_size, &mut self.0);
     }
 }
@@ -258,17 +248,17 @@ impl Drop for HttpRequest {
 /// }
 ///
 /// fn main() {
-///     let app = App::new().service(
+///     let app = App::default().service(
 ///         web::resource("/users/{first}").route(
 ///             web::get().to(index))
 ///     );
 /// }
 /// ```
-impl<Err: ErrorRenderer> FromRequest<Err> for HttpRequest {
-    type Error = Err::Container;
+impl<St: State> FromRequest<St> for HttpRequest {
+    type Error = Infallible;
 
     #[inline]
-    async fn from_request(req: &HttpRequest, _: &mut Payload) -> Result<Self, Self::Error> {
+    async fn from_request(_: &St, req: &HttpRequest, _: &mut Payload) -> Result<Self, Self::Error> {
         Ok(req.clone())
     }
 }
@@ -298,14 +288,10 @@ impl fmt::Debug for HttpRequest {
 
 #[cfg(test)]
 mod tests {
-    use std::cell::RefCell;
-
     use super::*;
-    use crate::http::{StatusCode, header};
+    use crate::http::header;
     use crate::router::ResourceDef;
-
-    use crate::web::test::{TestRequest, call_service, init_service};
-    use crate::web::{self, App, HttpResponse};
+    use crate::web::test::TestRequest;
 
     #[test]
     fn test_debug() {
@@ -359,11 +345,10 @@ mod tests {
         assert_eq!(req.query_string(), "id=test");
     }
 
-    #[cfg(feature = "url")]
     #[test]
     fn test_url_for() {
         let mut res = ResourceDef::new("/user/{name}.{ext}");
-        *res.name_mut() = "index".to_string();
+        res.set_name("index");
 
         let mut rmap = ResourceMap::new(ResourceDef::new(""));
         rmap.add(&mut res, None);
@@ -389,11 +374,10 @@ mod tests {
         );
     }
 
-    #[cfg(feature = "url")]
     #[test]
     fn test_url_for_static() {
         let mut rdef = ResourceDef::new("/index.html");
-        *rdef.name_mut() = "index".to_string();
+        rdef.set_name("index");
 
         let mut rmap = ResourceMap::new(ResourceDef::new(""));
         rmap.add(&mut rdef, None);
@@ -411,12 +395,11 @@ mod tests {
         );
     }
 
-    #[cfg(feature = "url")]
     #[test]
     fn test_url_for_external() {
         let mut rdef = ResourceDef::new("https://youtube.com/watch/{video_id}");
 
-        *rdef.name_mut() = "youtube".to_string();
+        rdef.set_name("youtube");
 
         let mut rmap = ResourceMap::new(ResourceDef::new(""));
         rmap.add(&mut rdef, None);
@@ -428,73 +411,5 @@ mod tests {
             url.ok().unwrap().as_str(),
             "https://youtube.com/watch/oHg5SJYRHA0"
         );
-    }
-
-    #[crate::rt_test]
-    async fn test_state() {
-        let srv = init_service(App::new().state(10usize).service(web::resource("/").to(
-            |req: HttpRequest| async move {
-                if req.app_state::<usize>().is_some() {
-                    HttpResponse::Ok()
-                } else {
-                    HttpResponse::BadRequest()
-                }
-            },
-        )))
-        .await;
-
-        let req = TestRequest::default().to_request();
-        let resp = call_service(&srv, req).await;
-        assert_eq!(resp.status(), StatusCode::OK);
-
-        let srv = init_service(App::new().state(10u32).service(web::resource("/").to(
-            |req: HttpRequest| async move {
-                if req.app_state::<usize>().is_some() {
-                    HttpResponse::Ok()
-                } else {
-                    HttpResponse::BadRequest()
-                }
-            },
-        )))
-        .await;
-
-        let req = TestRequest::default().to_request();
-        let resp = call_service(&srv, req).await;
-        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
-    }
-
-    #[crate::rt_test]
-    async fn test_extensions_dropped() {
-        struct Tracker {
-            dropped: bool,
-        }
-        struct Foo {
-            tracker: Rc<RefCell<Tracker>>,
-        }
-        impl Drop for Foo {
-            fn drop(&mut self) {
-                self.tracker.borrow_mut().dropped = true;
-            }
-        }
-
-        let tracker = Rc::new(RefCell::new(Tracker { dropped: false }));
-        {
-            let tracker2 = Rc::clone(&tracker);
-            let srv = init_service(App::new().state(10u32).service(web::resource("/").to(
-                move |req: HttpRequest| {
-                    req.extensions_mut().insert(Foo {
-                        tracker: Rc::clone(&tracker2),
-                    });
-                    async { HttpResponse::Ok() }
-                },
-            )))
-            .await;
-
-            let req = TestRequest::default().to_request();
-            let resp = call_service(&srv, req).await;
-            assert_eq!(resp.status(), StatusCode::OK);
-        }
-
-        assert!(tracker.borrow().dropped);
     }
 }

@@ -14,13 +14,15 @@ pub(super) struct Segments {
 
 /// `ResourceDef` describes an entry in resources table
 ///
-/// Resource definition can contain only 16 dynamic segments
+/// A resource definition can have several path patterns, a path matches the
+/// resource if it matches any of them. The first pattern is the primary one,
+/// it is used by [`pattern()`](Self::pattern) and for building resource paths.
 #[derive(Clone, Debug)]
 pub struct ResourceDef {
     id: u16,
     pub(super) tp: Vec<Segments>, // set of matching paths
     name: String,
-    pattern: String,
+    patterns: Vec<String>,
     elements: Vec<PathElement>,
     pub(super) prefix: bool,
 }
@@ -87,49 +89,31 @@ impl PartialEq for Segment {
 }
 
 impl ResourceDef {
-    /// Parse path pattern and create new `ResourceDef` instance.
+    /// Parse path patterns and create new `ResourceDef` instance.
     ///
-    /// Path segments are separatted by `/`. Pattern must start
-    /// with segment separator. Static segments could be
-    /// case insensitive.
+    /// Path segments are separated by `/`, a leading `/` is optional. Static
+    /// segments could be case insensitive.
     ///
     /// Panics if path pattern is malformed.
     pub fn new<T: IntoPattern>(path: T) -> Self {
-        let set = path.patterns();
-        let mut p = String::new();
-        let mut tp = Vec::new();
-        let mut elements = Vec::new();
-
-        for path in set {
-            p.clone_from(&path);
-            let (pelems, elems) = ResourceDef::parse(&path);
-            tp.push(pelems);
-            elements = elems;
-        }
-
-        ResourceDef {
-            tp,
-            elements,
-            id: 0,
-            name: String::new(),
-            pattern: p,
-            prefix: false,
-        }
+        ResourceDef::create(path, false)
     }
 
-    /// Parse path pattern and create new `ResourceDef` instance.
+    /// Parse path patterns and create new prefix `ResourceDef` instance.
     ///
-    /// Use `prefix` type instead of `static`.
+    /// A prefix resource matches paths that start with one of its patterns.
     ///
-    /// Panics if path regex pattern is malformed.
+    /// Panics if path pattern is malformed.
     pub fn prefix<T: IntoPattern>(path: T) -> Self {
-        ResourceDef::with_prefix(path)
+        ResourceDef::create(path, true)
     }
 
-    /// Parse path pattern and create new `ResourceDef` instance.
-    /// Inserts `/` to the start of the pattern.
+    /// Parse path patterns and create new prefix `ResourceDef` instance.
     ///
-    /// Panics if path regex pattern is malformed.
+    /// Same as [`prefix()`](Self::prefix), but inserts `/` to the start of
+    /// the patterns that do not have it.
+    ///
+    /// Panics if path pattern is malformed.
     pub fn root_prefix<T: IntoPattern>(path: T) -> Self {
         let mut patterns = path.patterns();
         for path in &mut patterns {
@@ -137,10 +121,13 @@ impl ResourceDef {
             *path = p;
         }
 
-        ResourceDef::with_prefix(patterns)
+        ResourceDef::create(patterns, true)
     }
 
-    /// Resource id
+    /// Resource id, `0` by default
+    ///
+    /// A matched resource is reported with this id, see
+    /// [`ResourceId`](crate::ResourceId).
     pub fn id(&self) -> u16 {
         self.id
     }
@@ -150,85 +137,95 @@ impl ResourceDef {
         self.id = id;
     }
 
-    /// Parse path pattern and create new `Pattern` instance with custom prefix
-    fn with_prefix<T: IntoPattern>(path: T) -> Self {
+    /// Check if the resource is a prefix resource, see [`prefix()`](Self::prefix)
+    pub fn is_prefix(&self) -> bool {
+        self.prefix
+    }
+
+    fn create<T: IntoPattern>(path: T, prefix: bool) -> Self {
         let patterns = path.patterns();
+        let mut tp = Vec::with_capacity(patterns.len());
+        let mut elements = None;
 
-        let mut p = String::new();
-        let mut tp = Vec::new();
-        let mut elements = Vec::new();
-
-        for path in patterns {
-            p.clone_from(&path);
-            let (pelems, elems) = ResourceDef::parse(&path);
+        for path in &patterns {
+            let (pelems, elems) = ResourceDef::parse(path);
             tp.push(pelems);
-            elements = elems;
+            // resource paths are built from the primary pattern
+            elements.get_or_insert(elems);
         }
 
         ResourceDef {
             tp,
-            elements,
+            patterns,
+            prefix,
             id: 0,
             name: String::new(),
-            pattern: p,
-            prefix: true,
+            elements: elements.unwrap_or_default(),
         }
     }
 
-    /// Resource pattern name
+    /// Resource name, empty by default
     pub fn name(&self) -> &str {
         &self.name
     }
 
-    /// Mutable reference to a name of a resource definition.
-    pub fn name_mut(&mut self) -> &mut String {
-        &mut self.name
+    /// Set resource name
+    pub fn set_name<N: Into<String>>(&mut self, name: N) {
+        self.name = name.into();
     }
 
-    /// Path pattern of the resource
+    /// Primary path pattern of the resource, the first one
     pub fn pattern(&self) -> &str {
-        &self.pattern
+        self.patterns.first().map_or("", String::as_str)
     }
 
-    /// Build resource path from elements. Returns `true` on success.
-    pub fn resource_path<U, I>(&self, path: &mut String, elements: &mut U) -> bool
+    /// All path patterns of the resource
+    pub fn patterns(&self) -> &[String] {
+        &self.patterns
+    }
+
+    /// Build resource path from elements, using the primary pattern.
+    ///
+    /// Elements are used for dynamic segments in pattern order, an iterator
+    /// can be passed by `&mut` to continue using it afterwards. The path is
+    /// appended to `path`. Returns `false` if there are not enough elements,
+    /// `path` is left unchanged then.
+    pub fn build_path<U, I>(&self, path: &mut String, elements: U) -> bool
     where
-        U: Iterator<Item = I>,
+        U: IntoIterator<Item = I>,
         I: AsRef<str>,
     {
-        for el in &self.elements {
-            match *el {
-                PathElement::Str(ref s) => path.push_str(s),
-                PathElement::Var(_) => {
-                    if let Some(val) = elements.next() {
-                        path.push_str(val.as_ref());
-                    } else {
-                        return false;
-                    }
-                }
-            }
-        }
-        true
+        let mut elements = elements.into_iter();
+        self.build_path_with(path, |_| elements.next())
     }
 
-    /// Build resource path from elements. Returns `true` on success.
-    pub fn resource_path_named<K, V, S>(
-        &self,
-        path: &mut String,
-        elements: &HashMap<K, V, S>,
-    ) -> bool
+    /// Build resource path from named elements, using the primary pattern.
+    ///
+    /// The path is appended to `path`. Returns `false` if an element is
+    /// missing, `path` is left unchanged then.
+    pub fn build_path_named<K, V, S>(&self, path: &mut String, elements: &HashMap<K, V, S>) -> bool
     where
         K: std::borrow::Borrow<str> + Eq + Hash,
         V: AsRef<str>,
         S: std::hash::BuildHasher,
     {
+        self.build_path_with(path, |name| elements.get(name))
+    }
+
+    fn build_path_with<F, I>(&self, path: &mut String, mut element: F) -> bool
+    where
+        F: FnMut(&str) -> Option<I>,
+        I: AsRef<str>,
+    {
+        let len = path.len();
         for el in &self.elements {
             match *el {
                 PathElement::Str(ref s) => path.push_str(s),
                 PathElement::Var(ref name) => {
-                    if let Some(val) = elements.get(name) {
+                    if let Some(val) = element(name) {
                         path.push_str(val.as_ref());
                     } else {
+                        path.truncate(len);
                         return false;
                     }
                 }
@@ -301,7 +298,7 @@ impl ResourceDef {
                 ),
             };
 
-            re = format!(r"{}(?P<{}>{})", re, &escape(name), pat);
+            re = format!(r"{}(?P<{}>{})", re, escape(name), pat);
 
             elems.push(PathElement::Var(name.to_string()));
 
@@ -309,7 +306,7 @@ impl ResourceDef {
                 end = Some(idx);
                 pattern = rem;
             } else {
-                re += rem;
+                re.push_str(&escape(rem));
                 rem = "";
                 break;
             }
@@ -363,9 +360,7 @@ impl ResourceDef {
             let re = Regex::new(&re_part).unwrap();
             let names: Vec<_> = re
                 .capture_names()
-                .filter_map(|name| {
-                    name.map(|name| Box::leak(Box::new(name.to_owned())).as_str())
-                })
+                .filter_map(|name| name.map(|name| Box::leak(Box::new(name.to_owned())).as_str()))
                 .collect();
             pelems.push(Segment::Dynamic {
                 names,
@@ -391,7 +386,7 @@ impl ResourceDef {
         if !pattern.is_empty() {
             // handle tail expression for static segment
             if let Some(stripped) = pattern.strip_suffix('*') {
-                let pattern = Regex::new(&format!("^{stripped}(.+)")).unwrap();
+                let pattern = Regex::new(&format!("^{}(.+)", escape(stripped))).unwrap();
                 pelems.push(Segment::Dynamic {
                     pattern,
                     names: Vec::new(),
@@ -432,13 +427,13 @@ impl Eq for ResourceDef {}
 
 impl PartialEq for ResourceDef {
     fn eq(&self, other: &ResourceDef) -> bool {
-        self.pattern == other.pattern
+        self.patterns == other.patterns
     }
 }
 
 impl Hash for ResourceDef {
     fn hash<H: Hasher>(&self, state: &mut H) {
-        self.pattern.hash(state);
+        self.patterns.hash(state);
     }
 }
 
@@ -451,6 +446,24 @@ impl<'a> From<&'a str> for ResourceDef {
 impl From<String> for ResourceDef {
     fn from(path: String) -> ResourceDef {
         ResourceDef::new(path)
+    }
+}
+
+impl From<&String> for ResourceDef {
+    fn from(path: &String) -> ResourceDef {
+        ResourceDef::new(path)
+    }
+}
+
+impl<T: AsRef<str>> From<Vec<T>> for ResourceDef {
+    fn from(paths: Vec<T>) -> ResourceDef {
+        ResourceDef::new(paths)
+    }
+}
+
+impl<T: AsRef<str>, const N: usize> From<[T; N]> for ResourceDef {
+    fn from(paths: [T; N]) -> ResourceDef {
+        ResourceDef::new(paths)
     }
 }
 
@@ -632,36 +645,34 @@ mod tests {
         assert_eq!(tree.find(&mut Path::new("/user/2345/sdg")), None);
     }
 
-    #[cfg(feature = "http")]
     #[test]
     fn test_parse_urlencoded() {
-        use http::Uri;
+        use urly::Url;
 
         let tree = Tree::new(&ResourceDef::new("/user/{id}/test"), 1);
-        let uri = Uri::try_from("/user/2345/test").unwrap();
+        let uri = Url::try_from("/user/2345/test").unwrap();
         let mut resource = Path::new(uri);
         assert_eq!(tree.find(&mut resource), Some(1));
         assert_eq!(resource.get("id").unwrap(), "2345");
 
-        let uri = Uri::try_from("/user/qwe%25/test").unwrap();
+        let uri = Url::try_from("/user/qwe%25/test").unwrap();
         let mut resource = Path::new(uri);
         assert_eq!(tree.find(&mut resource), Some(1));
         assert_eq!(resource.get("id").unwrap(), "qwe%");
 
-        let uri = Uri::try_from("/user/qwe%25rty/test").unwrap();
+        let uri = Url::try_from("/user/qwe%25rty/test").unwrap();
         let mut resource = Path::new(uri);
         assert_eq!(tree.find(&mut resource), Some(1));
         assert_eq!(resource.get("id").unwrap(), "qwe%rty");
 
-        let uri = Uri::try_from("/user/foo-%2f-%252f-bar/test").unwrap();
+        let uri = Url::try_from("/user/foo-%2f-%252f-bar/test").unwrap();
         let mut resource = Path::new(uri);
         assert_eq!(tree.find(&mut resource), Some(1));
         assert_eq!(resource.get("id").unwrap(), "foo-/-%2f-bar");
 
-        let uri = Uri::try_from(
-            "/user/http%3A%2F%2Flocalhost%3A80%2Ffile%2F%2Fvar%2Flog%2Fsyslog/test",
-        )
-        .unwrap();
+        let uri =
+            Url::try_from("/user/http%3A%2F%2Flocalhost%3A80%2Ffile%2F%2Fvar%2Flog%2Fsyslog/test")
+                .unwrap();
         let mut resource = Path::new(uri);
         assert_eq!(tree.find(&mut resource), Some(1));
         assert_eq!(
@@ -670,16 +681,15 @@ mod tests {
         );
     }
 
-    #[cfg(feature = "http")]
     #[test]
     fn test_extract_path_decode() {
-        use http::Uri;
+        use urly::Url;
 
         let tree = Tree::new(&ResourceDef::new("/{id}/"), 1);
 
         macro_rules! test_single_value {
             ($value:expr, $expected:expr) => {{
-                let uri = Uri::try_from($value).unwrap();
+                let uri = Url::try_from($value).unwrap();
                 let mut resource = Path::new(uri);
                 assert_eq!(tree.find(&mut resource), Some(1));
                 assert_eq!(resource.get("id").unwrap(), $expected);
@@ -695,6 +705,14 @@ mod tests {
         test_single_value!("/%252F/", "%2F");
         test_single_value!("/%m/", "%m");
         test_single_value!("/%mm/", "%mm");
+        // decoded bytes that are not valid utf-8 are kept percent-encoded
+        test_single_value!("/%C3%A9/", "\u{e9}");
+        test_single_value!("/%FF%FE/", "%FF%FE");
+        test_single_value!("/test%C3/", "test%C3");
+        test_single_value!("/%C3%A9%FF/", "\u{e9}%FF");
+        test_single_value!("/%41%4/", "A%4");
+        test_single_value!("/%61b%62%/", "abb%");
+        test_single_value!("/a+b/", "a+b");
         test_single_value!("/test%mm/", "test%mm");
         test_single_value!(
             "/http%3A%2F%2Flocalhost%3A80%2Ffoo/",
@@ -726,8 +744,72 @@ mod tests {
             names: Vec::new(),
             tail: false,
         };
-        assert!(seg != seg2);
+        assert_ne!(seg, seg2);
         assert_eq!(seg2, seg2);
+    }
+
+    #[test]
+    #[allow(clippy::mutable_key_type)]
+    fn test_multiple_patterns() {
+        let re = ResourceDef::new(["/a/{x}", "/b/{x}"]);
+        assert_eq!(re.pattern(), "/a/{x}");
+        assert_eq!(re.patterns(), ["/a/{x}", "/b/{x}"]);
+
+        let tree = Tree::new(&re, 1);
+        assert_eq!(tree.find(&mut Path::new("/a/1")), Some(1));
+        assert_eq!(tree.find(&mut Path::new("/b/1")), Some(1));
+
+        // resource paths are built from the first pattern
+        let mut s = String::new();
+        assert!(re.build_path(&mut s, ["1"]));
+        assert_eq!(s, "/a/1");
+        let mut s = String::new();
+        let names: HashMap<_, _> = [("x", "2")].into_iter().collect();
+        assert!(re.build_path_named(&mut s, &names));
+        assert_eq!(s, "/a/2");
+
+        // all patterns are compared
+        assert_ne!(re, ResourceDef::new(["/c/{x}", "/b/{x}"]));
+        assert_ne!(re, ResourceDef::new("/a/{x}"));
+        assert_eq!(re, ResourceDef::new(["/a/{x}", "/b/{x}"]));
+        let mut h = HashMap::new();
+        h.insert(re.clone(), 1);
+        assert!(h.contains_key(&ResourceDef::new(["/a/{x}", "/b/{x}"])));
+        assert!(!h.contains_key(&ResourceDef::new("/b/{x}")));
+
+        let re = ResourceDef::new(Vec::<String>::new());
+        assert_eq!(re.pattern(), "");
+        assert_eq!(re.patterns(), Vec::<String>::new());
+    }
+
+    #[test]
+    fn test_leading_slash_is_optional() {
+        let tree = Tree::new(&ResourceDef::new("name/{id}"), 1);
+        let mut resource = Path::new("name/1");
+        assert_eq!(tree.find(&mut resource), Some(1));
+        assert_eq!(resource.get("id").unwrap(), "1");
+    }
+
+    #[test]
+    fn test_parse_escapes_literals() {
+        // literal after a dynamic segment
+        let mut resource = Path::new("/foo.json");
+        let tree = Tree::new(&ResourceDef::new("/{source}.json"), 1);
+        assert_eq!(tree.find(&mut resource), Some(1));
+        assert_eq!(resource.get("source").unwrap(), "foo");
+        assert_eq!(tree.find(&mut Path::new("/fooXjson")), None);
+
+        let tree = Tree::new(&ResourceDef::new("/{name}.[x]"), 1);
+        assert_eq!(tree.find(&mut Path::new("/a.[x]")), Some(1));
+        assert_eq!(tree.find(&mut Path::new("/a.x")), None);
+
+        // static tail
+        let tree = Tree::new(&ResourceDef::new("/files.v*"), 1);
+        assert_eq!(tree.find(&mut Path::new("/files.v1")), Some(1));
+        assert_eq!(tree.find(&mut Path::new("/filesXv1")), None);
+
+        let tree = Tree::new(&ResourceDef::new("/files(*"), 1);
+        assert_eq!(tree.find(&mut Path::new("/files(1")), Some(1));
     }
 
     #[test]
@@ -955,45 +1037,60 @@ mod tests {
     fn test_resource_path() {
         let mut s = String::new();
         let resource = ResourceDef::new("/user/{item1}/test");
-        assert!(resource.resource_path(&mut s, &mut ["user1"].iter()));
+        assert!(resource.build_path(&mut s, ["user1"]));
         assert_eq!(s, "/user/user1/test");
 
         let mut s = String::new();
         let resource = ResourceDef::new("/user/{item1}/{item2}/test");
-        assert!(resource.resource_path(&mut s, &mut ["item", "item2"].iter()));
+        assert!(resource.build_path(&mut s, ["item", "item2"]));
         assert_eq!(s, "/user/item/item2/test");
 
         let mut s = String::new();
         let resource = ResourceDef::new("/user/{item1}/{item2}");
-        assert!(resource.resource_path(&mut s, &mut ["item", "item2"].iter()));
+        assert!(resource.build_path(&mut s, ["item", "item2"]));
         assert_eq!(s, "/user/item/item2");
 
         let mut s = String::new();
         let resource = ResourceDef::new("/user/{item1}/{item2}/");
-        assert!(resource.resource_path(&mut s, &mut ["item", "item2"].iter()));
+        assert!(resource.build_path(&mut s, ["item", "item2"]));
         assert_eq!(s, "/user/item/item2/");
 
         let mut s = String::new();
-        assert!(!resource.resource_path(&mut s, &mut ["item"].iter()));
+        assert!(!resource.build_path(&mut s, ["item"]));
+        assert_eq!(s, "");
 
         let mut s = String::new();
-        assert!(resource.resource_path(&mut s, &mut ["item", "item2"].iter()));
+        assert!(resource.build_path(&mut s, ["item", "item2"]));
         assert_eq!(s, "/user/item/item2/");
-        assert!(!resource.resource_path(&mut s, &mut ["item"].iter()));
+        assert!(!resource.build_path(&mut s, ["item"]));
+        assert_eq!(s, "/user/item/item2/");
 
         let mut s = String::new();
-        assert!(resource.resource_path(&mut s, &mut vec!["item", "item2"].into_iter()));
+        assert!(resource.build_path(&mut s, vec!["item", "item2"]));
         assert_eq!(s, "/user/item/item2/");
+
+        let mut s = String::new();
+        assert!(resource.build_path(&mut s, ["item".to_string(), "item2".to_string()]));
+        assert_eq!(s, "/user/item/item2/");
+
+        // the iterator can be shared between several builders
+        let mut s = String::new();
+        let mut elements = ["a", "b", "c"].into_iter();
+        assert!(ResourceDef::new("/{x}").build_path(&mut s, &mut elements));
+        assert!(resource.build_path(&mut s, &mut elements));
+        assert_eq!(s, "/a/user/b/c/");
+        assert_eq!(elements.next(), None);
 
         let mut map = HashMap::new();
         map.insert("item1", "item");
 
-        let mut s = String::new();
-        assert!(!resource.resource_path_named(&mut s, &map));
+        let mut s = "/prefix".to_string();
+        assert!(!resource.build_path_named(&mut s, &map));
+        assert_eq!(s, "/prefix");
 
         let mut s = String::new();
         map.insert("item2", "item2");
-        assert!(resource.resource_path_named(&mut s, &map));
+        assert!(resource.build_path_named(&mut s, &map));
         assert_eq!(s, "/user/item/item2/");
     }
 
@@ -1091,5 +1188,19 @@ mod tests {
         assert_eq!(p.get("r"), Some("5bddc58f"));
         assert_eq!(p.get("s"), Some("srv"));
         assert_eq!(p.len(), 4);
+    }
+
+    #[test]
+    fn test_array_patterns() {
+        let pats: Vec<String> = (0..20).map(|i| format!("/p{i}")).collect();
+        let arr: [&str; 20] = std::array::from_fn(|i| pats[i].as_str());
+        let re = ResourceDef::new(arr);
+        assert_eq!(re.patterns().len(), 20);
+        assert_eq!(re.patterns()[19], "/p19");
+
+        let a = String::from("/a");
+        let b = String::from("/b");
+        let re = ResourceDef::new([&a, &b]);
+        assert_eq!(re.patterns(), ["/a", "/b"]);
     }
 }

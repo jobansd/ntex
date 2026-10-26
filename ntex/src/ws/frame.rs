@@ -1,5 +1,3 @@
-use nanorand::{Rng, WyRand};
-
 use super::proto::{CloseCode, CloseReason, OpCode};
 use super::{error::ProtocolError, mask::apply_mask};
 use crate::util::{BufMut, BytePage, BytePages, Bytes, BytesMut};
@@ -9,11 +7,13 @@ use crate::util::{BufMut, BytePage, BytePages, Bytes, BytesMut};
 pub struct Parser;
 
 impl Parser {
+    #[inline]
     fn parse_metadata(
         src: &[u8],
         server: bool,
         max_size: usize,
-    ) -> Result<Option<(usize, bool, OpCode, usize, Option<u32>)>, ProtocolError> {
+        allow_rsv1: bool,
+    ) -> Result<Option<(usize, bool, bool, OpCode, usize, Option<u32>)>, ProtocolError> {
         let chunk_len = src.len();
 
         let mut idx = 2;
@@ -24,6 +24,11 @@ impl Parser {
         let first = src[0];
         let second = src[1];
         let finished = first & 0x80 != 0;
+        let rsv1 = allow_rsv1 && first & 0x40 != 0;
+        let reserved = first & if allow_rsv1 { 0x30 } else { 0x70 };
+        if reserved != 0 {
+            return Err(ProtocolError::ReservedBits(reserved >> 4));
+        }
 
         // check masking
         let masked = second & 0x80 != 0;
@@ -34,10 +39,11 @@ impl Parser {
         }
 
         // Op code
-        let opcode = OpCode::from(first & 0x0F);
-
-        if let OpCode::Bad = opcode {
-            return Err(ProtocolError::InvalidOpcode(first & 0x0F));
+        let raw_opcode = first & 0x0F;
+        let opcode =
+            OpCode::try_from(raw_opcode).map_err(|()| ProtocolError::InvalidOpcode(raw_opcode))?;
+        if opcode.is_control() && !finished {
+            return Err(ProtocolError::FragmentedControlFrame(opcode));
         }
 
         let len = second & 0x7F;
@@ -48,13 +54,22 @@ impl Parser {
             let len = usize::from(u16::from_be_bytes(
                 TryFrom::try_from(&src[idx..idx + 2]).unwrap(),
             ));
+            if len < 126 {
+                return Err(ProtocolError::InvalidLengthEncoding);
+            }
             idx += 2;
             len
         } else if len == 127 {
             if chunk_len < 10 {
                 return Ok(None);
             }
+            if src[idx] & 0x80 != 0 {
+                return Err(ProtocolError::InvalidLengthEncoding);
+            }
             let len = u64::from_be_bytes(TryFrom::try_from(&src[idx..idx + 8]).unwrap());
+            if len < 65_536 {
+                return Err(ProtocolError::InvalidLengthEncoding);
+            }
             if len > max_size as u64 {
                 return Err(ProtocolError::Overflow);
             }
@@ -63,6 +78,10 @@ impl Parser {
         } else {
             len as usize
         };
+
+        if opcode.is_control() && length > 125 {
+            return Err(ProtocolError::InvalidLength(length));
+        }
 
         // check for max allowed size
         if length > max_size {
@@ -74,25 +93,50 @@ impl Parser {
                 return Ok(None);
             }
 
-            let mask = u32::from_le_bytes(TryFrom::try_from(&src[idx..idx + 4]).unwrap());
+            let mask = u32::from_ne_bytes(TryFrom::try_from(&src[idx..idx + 4]).unwrap());
             idx += 4;
             Some(mask)
         } else {
             None
         };
 
-        Ok(Some((idx, finished, opcode, length, mask)))
+        Ok(Some((idx, finished, rsv1, opcode, length, mask)))
     }
 
-    /// Parse the input stream into a frame.
+    /// Parses one WebSocket frame from `src`.
+    ///
+    /// `server` selects the expected masking direction: server-side parsing
+    /// requires masked frames, while client-side parsing rejects them.
+    /// `max_size` limits the frame payload size.
+    ///
+    /// Returns the final-fragment flag, opcode, and optional payload when a
+    /// complete frame is available. Returns [`None`] without consuming a
+    /// partial frame.
     pub fn parse(
         src: &mut BytesMut,
         server: bool,
         max_size: usize,
     ) -> Result<Option<(bool, OpCode, Option<Bytes>)>, ProtocolError> {
+        Ok(Parser::parse_frame(src, server, max_size, false)?
+            .map(|(finished, _, opcode, payload)| (finished, opcode, payload)))
+    }
+
+    /// Parses one WebSocket frame from `src`, like [`Parser::parse`].
+    ///
+    /// If `allow_rsv1` is set, the RSV1 bit is accepted and returned after
+    /// the final-fragment flag.
+    // inlined into the decoder, the frame tuple is not moved
+    #[allow(clippy::inline_always)]
+    #[inline(always)]
+    pub(super) fn parse_frame(
+        src: &mut BytesMut,
+        server: bool,
+        max_size: usize,
+        allow_rsv1: bool,
+    ) -> Result<Option<(bool, bool, OpCode, Option<Bytes>)>, ProtocolError> {
         // try to parse ws frame metadata
-        let Some((idx, finished, opcode, length, mask)) =
-            Parser::parse_metadata(src, server, max_size)?
+        let Some((idx, finished, rsv1, opcode, length, mask)) =
+            Parser::parse_metadata(src, server, max_size, allow_rsv1)?
         else {
             return Ok(None);
         };
@@ -107,21 +151,7 @@ impl Parser {
 
         // no need for body
         if length == 0 {
-            return Ok(Some((finished, opcode, None)));
-        }
-
-        // control frames must have length <= 125
-        match opcode {
-            OpCode::Ping | OpCode::Pong if length > 125 => {
-                return Err(ProtocolError::InvalidLength(length));
-            }
-            OpCode::Close if length > 125 => {
-                log::trace!(
-                    "Received close frame with payload length exceeding 125. Morphing to protocol close frame."
-                );
-                return Ok(Some((true, OpCode::Close, None)));
-            }
-            _ => (),
+            return Ok(Some((finished, rsv1, opcode, None)));
         }
 
         // unmask
@@ -129,36 +159,91 @@ impl Parser {
             apply_mask(&mut src[..length], mask);
         }
 
-        Ok(Some((finished, opcode, Some(src.split_to(length)))))
+        Ok(Some((finished, rsv1, opcode, Some(src.split_to(length)))))
     }
 
-    /// Parse the payload of a close frame.
-    pub fn parse_close_payload(payload: &[u8]) -> Option<CloseReason> {
-        if payload.len() >= 2 {
-            let raw_code = u16::from_be_bytes(TryFrom::try_from(&payload[..2]).unwrap());
-            let code = CloseCode::from(raw_code);
-            let description = if payload.len() > 2 {
-                Some(String::from_utf8_lossy(&payload[2..]).into())
-            } else {
-                None
-            };
-            Some(CloseReason { code, description })
+    /// Parses a close-frame payload.
+    ///
+    /// Returns [`None`] for an empty payload.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for a one-byte payload, an invalid close status code,
+    /// or a description that is not valid UTF-8.
+    pub fn parse_close_payload(payload: &[u8]) -> Result<Option<CloseReason>, ProtocolError> {
+        if payload.is_empty() {
+            return Ok(None);
+        }
+
+        if payload.len() == 1 {
+            return Err(ProtocolError::InvalidClosePayload);
+        }
+
+        let raw_code = u16::from_be_bytes(TryFrom::try_from(&payload[..2]).unwrap());
+        let code = CloseCode::from(raw_code);
+        if !code.is_valid() {
+            return Err(ProtocolError::InvalidCloseCode(raw_code));
+        }
+        let description = if payload.len() > 2 {
+            Some(
+                std::str::from_utf8(&payload[2..])
+                    .map_err(|_| ProtocolError::InvalidUtf8)?
+                    .to_owned(),
+            )
         } else {
             None
-        }
+        };
+        Ok(Some(CloseReason { code, description }))
     }
 
-    /// Generate binary representation
-    pub fn write_message<B>(dst: &mut BytePages, pl: B, op: OpCode, fin: bool, mask: bool)
+    /// Encodes a WebSocket frame into `dst`.
+    ///
+    /// `fin` controls the final-fragment bit and `mask` controls whether a new
+    /// random masking key is applied.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if a control frame is fragmented or has a payload
+    /// larger than 125 bytes.
+    pub fn write_message<B>(
+        dst: &mut BytePages,
+        pl: B,
+        op: OpCode,
+        fin: bool,
+        mask: bool,
+    ) -> Result<(), ProtocolError>
     where
         BytePage: From<B>,
     {
-        let payload = BytePage::from(pl);
-        let one: u8 = if fin {
-            0x80 | Into::<u8>::into(op)
-        } else {
-            op.into()
-        };
+        Parser::write_frame(dst, BytePage::from(pl), op, fin, false, mask)
+    }
+
+    /// Encodes a WebSocket frame into `dst`, like [`Parser::write_message`],
+    /// `rsv1` sets the RSV1 bit.
+    pub(super) fn write_frame(
+        dst: &mut BytePages,
+        payload: BytePage,
+        op: OpCode,
+        fin: bool,
+        rsv1: bool,
+        mask: bool,
+    ) -> Result<(), ProtocolError> {
+        if op.is_control() {
+            if !fin {
+                return Err(ProtocolError::FragmentedControlFrame(op));
+            }
+            if payload.len() > 125 {
+                return Err(ProtocolError::InvalidLength(payload.len()));
+            }
+        }
+
+        let mut one: u8 = op.into();
+        if fin {
+            one |= 0x80;
+        }
+        if rsv1 {
+            one |= 0x40;
+        }
         let payload_len = payload.len();
         let two = if mask { 0x80 } else { 0 };
 
@@ -173,25 +258,38 @@ impl Parser {
         }
 
         if mask {
-            let mask: u32 = WyRand::new().generate();
+            let mask = fastrand::u32(..);
             let mut buf = BytesMut::from(payload);
             apply_mask(&mut buf, mask);
-            dst.put_u32_le(mask);
+            dst.extend_from_slice(&mask.to_ne_bytes());
             dst.append::<BytesMut>(buf);
         } else {
             dst.append::<BytePage>(payload);
         }
+        Ok(())
     }
 
-    /// Create a new Close control frame.
+    /// Encodes a final close control frame into `dst`.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the close code cannot be sent or the encoded close
+    /// payload would exceed 125 bytes.
     #[inline]
-    pub fn write_close(dst: &mut BytePages, reason: Option<CloseReason>, mask: bool) {
+    pub fn write_close(
+        dst: &mut BytePages,
+        reason: Option<CloseReason>,
+        mask: bool,
+    ) -> Result<(), ProtocolError> {
         let payload = match reason {
             None => Bytes::new(),
             Some(reason) => {
-                let mut payload = BytesMut::with_capacity(
-                    reason.description.as_ref().map_or(0, String::len) + 2,
-                );
+                if !reason.code.is_valid() || (!mask && matches!(reason.code, CloseCode::Extension))
+                {
+                    return Err(ProtocolError::InvalidCloseCode(reason.code.into()));
+                }
+                let mut payload =
+                    BytesMut::with_capacity(reason.description.as_ref().map_or(0, String::len) + 2);
                 payload.put_u16(u16::from(reason.code));
                 if let Some(description) = reason.description {
                     payload.extend_from_slice(description.as_bytes());
@@ -200,7 +298,7 @@ impl Parser {
             }
         };
 
-        Parser::write_message(dst, payload, OpCode::Close, true, mask);
+        Parser::write_message(dst, payload, OpCode::Close, true, mask)
     }
 }
 
@@ -253,18 +351,44 @@ mod tests {
     }
 
     #[test]
+    fn test_reserved_bits() {
+        for reserved in [0x10, 0x20, 0x40, 0x70] {
+            let mut buf = BytesMut::from(&[0x81 | reserved, 0][..]);
+            assert!(matches!(
+                Parser::parse(&mut buf, false, 1024),
+                Err(ProtocolError::ReservedBits(_))
+            ));
+        }
+    }
+
+    #[test]
+    fn test_invalid_control_frames() {
+        let mut fragmented = BytesMut::from(&[0x09, 0][..]);
+        assert!(matches!(
+            Parser::parse(&mut fragmented, false, 1024),
+            Err(ProtocolError::FragmentedControlFrame(OpCode::Ping))
+        ));
+
+        let mut oversized = BytesMut::from(&[0x88, 126, 0, 126][..]);
+        assert!(matches!(
+            Parser::parse(&mut oversized, false, 1024),
+            Err(ProtocolError::InvalidLength(126))
+        ));
+    }
+
+    #[test]
     fn test_parse_length2() {
         let mut buf = BytesMut::from(&[0b0000_0001u8, 126u8][..]);
         assert!(is_none(&Parser::parse(&mut buf, false, 1024)));
 
         let mut buf = BytesMut::from(&[0b0000_0001u8, 126u8][..]);
-        buf.extend(&[0u8, 4u8][..]);
-        buf.extend(b"1234");
+        buf.extend(&[0u8, 126u8][..]);
+        buf.extend(vec![1; 126]);
 
         let frame = extract(Parser::parse(&mut buf, false, 1024));
         assert!(!frame.finished);
         assert_eq!(frame.opcode, OpCode::Text);
-        assert_eq!(frame.payload.as_ref(), &b"1234"[..]);
+        assert_eq!(frame.payload.len(), 126);
     }
 
     #[test]
@@ -273,13 +397,34 @@ mod tests {
         assert!(is_none(&Parser::parse(&mut buf, false, 1024)));
 
         let mut buf = BytesMut::from(&[0b0000_0001u8, 127u8][..]);
-        buf.extend(&[0u8, 0u8, 0u8, 0u8, 0u8, 0u8, 0u8, 4u8][..]);
-        buf.extend(b"1234");
+        buf.extend(&[0u8, 0u8, 0u8, 0u8, 0u8, 1u8, 0u8, 0u8][..]);
+        buf.extend(vec![1; 65_536]);
 
-        let frame = extract(Parser::parse(&mut buf, false, 1024));
+        let frame = extract(Parser::parse(&mut buf, false, 65_536));
         assert!(!frame.finished);
         assert_eq!(frame.opcode, OpCode::Text);
-        assert_eq!(frame.payload.as_ref(), &b"1234"[..]);
+        assert_eq!(frame.payload.len(), 65_536);
+    }
+
+    #[test]
+    fn test_noncanonical_lengths() {
+        let mut short = BytesMut::from(&[0x82, 126, 0, 125][..]);
+        assert!(matches!(
+            Parser::parse(&mut short, false, usize::MAX),
+            Err(ProtocolError::InvalidLengthEncoding)
+        ));
+
+        let mut medium = BytesMut::from(&[0x82, 127, 0, 0, 0, 0, 0, 0, 0xff, 0xff][..]);
+        assert!(matches!(
+            Parser::parse(&mut medium, false, usize::MAX),
+            Err(ProtocolError::InvalidLengthEncoding)
+        ));
+
+        let mut high_bit = BytesMut::from(&[0x82, 127, 0x80, 0, 0, 0, 0, 1, 0, 0][..]);
+        assert!(matches!(
+            Parser::parse(&mut high_bit, false, usize::MAX),
+            Err(ProtocolError::InvalidLengthEncoding)
+        ));
     }
 
     #[test]
@@ -323,9 +468,28 @@ mod tests {
     }
 
     #[test]
+    fn test_masked_frames_roundtrip_with_distinct_masks() {
+        let mut masks = Vec::new();
+        for _ in 0..4 {
+            let mut pages = BytePages::default();
+            Parser::write_message(&mut pages, Bytes::from("data"), OpCode::Binary, true, true)
+                .unwrap();
+            let mut buf = BytesMut::from(&Bytes::from(pages)[..]);
+            masks.push(buf[2..6].to_vec());
+
+            let frame = extract(Parser::parse(&mut buf, true, 1024));
+            assert!(frame.finished);
+            assert_eq!(frame.opcode, OpCode::Binary);
+            assert_eq!(frame.payload, Bytes::from("data"));
+        }
+        masks.dedup();
+        assert!(masks.len() > 1);
+    }
+
+    #[test]
     fn test_ping_frame() {
         let mut buf = BytePages::default();
-        Parser::write_message(&mut buf, Bytes::from("data"), OpCode::Ping, true, false);
+        Parser::write_message(&mut buf, Bytes::from("data"), OpCode::Ping, true, false).unwrap();
 
         let mut v = vec![137u8, 4u8];
         v.extend(b"data");
@@ -335,7 +499,7 @@ mod tests {
     #[test]
     fn test_pong_frame() {
         let mut buf = BytePages::default();
-        Parser::write_message(&mut buf, Bytes::from("data"), OpCode::Pong, true, false);
+        Parser::write_message(&mut buf, Bytes::from("data"), OpCode::Pong, true, false).unwrap();
 
         let mut v = vec![138u8, 4u8];
         v.extend(b"data");
@@ -346,7 +510,7 @@ mod tests {
     fn test_close_frame() {
         let mut buf = BytePages::default();
         let reason = (CloseCode::Normal, "data");
-        Parser::write_close(&mut buf, Some(reason.into()), false);
+        Parser::write_close(&mut buf, Some(reason.into()), false).unwrap();
 
         let mut v = vec![136u8, 6u8, 3u8, 232u8];
         v.extend(b"data");
@@ -356,7 +520,107 @@ mod tests {
     #[test]
     fn test_empty_close_frame() {
         let mut buf = BytePages::default();
-        Parser::write_close(&mut buf, None, false);
+        Parser::write_close(&mut buf, None, false).unwrap();
         assert_eq!(&Bytes::from(buf)[..], &[0x88, 0x00]);
+    }
+
+    #[test]
+    fn test_close_validation() {
+        assert!(matches!(
+            Parser::parse_close_payload(&[1]),
+            Err(ProtocolError::InvalidClosePayload)
+        ));
+        assert!(matches!(
+            Parser::parse_close_payload(&1006u16.to_be_bytes()),
+            Err(ProtocolError::InvalidCloseCode(1006))
+        ));
+        assert!(matches!(
+            Parser::parse_close_payload(&[0x03, 0xe8, 0xff]),
+            Err(ProtocolError::InvalidUtf8)
+        ));
+
+        let mut buf = BytePages::default();
+        assert!(matches!(
+            Parser::write_message(
+                &mut buf,
+                Bytes::from(vec![0; 126]),
+                OpCode::Ping,
+                true,
+                false
+            ),
+            Err(ProtocolError::InvalidLength(126))
+        ));
+        assert!(matches!(
+            Parser::write_message(&mut buf, Bytes::new(), OpCode::Pong, false, false),
+            Err(ProtocolError::FragmentedControlFrame(OpCode::Pong))
+        ));
+        assert!(matches!(
+            Parser::write_close(
+                &mut buf,
+                Some(CloseReason {
+                    code: CloseCode::Other(2000),
+                    description: None,
+                }),
+                false
+            ),
+            Err(ProtocolError::InvalidCloseCode(2000))
+        ));
+        assert!(matches!(
+            Parser::write_close(
+                &mut buf,
+                Some(CloseReason {
+                    code: CloseCode::Extension,
+                    description: None,
+                }),
+                false
+            ),
+            Err(ProtocolError::InvalidCloseCode(1010))
+        ));
+        assert!(matches!(
+            Parser::write_close(
+                &mut buf,
+                Some(CloseReason {
+                    code: CloseCode::Normal,
+                    description: Some("x".repeat(124)),
+                }),
+                false
+            ),
+            Err(ProtocolError::InvalidLength(126))
+        ));
+    }
+
+    #[test]
+    fn test_parse_edge_cases() {
+        // 64-bit length over the max size
+        let mut buf = BytesMut::from(&[0x82u8, 127, 0, 0, 0, 0, 0, 1, 0, 0][..]);
+        assert!(matches!(
+            Parser::parse(&mut buf, false, 65_535),
+            Err(ProtocolError::Overflow)
+        ));
+
+        // masking key is not received yet
+        let mut buf = BytesMut::from(&[0x82u8, 0x81, 1, 2][..]);
+        assert!(is_none(&Parser::parse(&mut buf, true, 1024)));
+
+        assert!(Parser::parse_close_payload(&[]).unwrap().is_none());
+        let reason = Parser::parse_close_payload(&[0x03, 0xe8, b'o', b'k'])
+            .unwrap()
+            .unwrap();
+        assert_eq!(reason.code, CloseCode::Normal);
+        assert_eq!(reason.description.as_deref(), Some("ok"));
+    }
+
+    #[test]
+    fn test_large_frame_roundtrip() {
+        let payload = Bytes::from(vec![7u8; 70_000]);
+        let mut buf = BytePages::default();
+        Parser::write_message(&mut buf, payload.clone(), OpCode::Binary, true, false).unwrap();
+
+        let mut buf = BytesMut::from(&Bytes::from(buf)[..]);
+        assert_eq!(&buf[..2], &[0x82, 127]);
+        let frame = extract(Parser::parse(&mut buf, false, 100_000));
+        assert!(frame.finished);
+        assert_eq!(frame.opcode, OpCode::Binary);
+        assert_eq!(frame.payload, payload);
     }
 }

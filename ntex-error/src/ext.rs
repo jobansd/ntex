@@ -3,7 +3,7 @@ use std::{any::Any, any::TypeId, collections::HashMap, sync::Arc};
 use foldhash::fast::RandomState;
 
 #[derive(Clone)]
-/// A type map of request extensions.
+/// A type map of error extensions.
 pub(crate) struct Extensions {
     pub(crate) map: HashMap<TypeId, Arc<dyn Any + Sync + Send>, RandomState>,
 }
@@ -22,7 +22,7 @@ impl Extensions {
         self.map.insert(TypeId::of::<T>(), Arc::new(val));
     }
 
-    /// Get a reference to a type previously inserted on this `Extensions`.
+    /// Returns a reference to a previously inserted value of type `T`.
     pub(crate) fn get<T: 'static>(&self) -> Option<&T> {
         self.map
             .get(&TypeId::of::<T>())

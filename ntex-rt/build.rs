@@ -1,6 +1,8 @@
 use std::{collections::HashSet, env};
 
 fn main() {
+    println!("cargo::rustc-check-cfg=cfg(ntex_loom)");
+
     let mut features = HashSet::<&'static str>::default();
 
     for (key, _) in env::vars() {
@@ -12,8 +14,6 @@ fn main() {
     }
 
     if features.len() > 1 {
-        panic!(
-            "Only one runtime feature could be selected, current selection {features:?}"
-        );
+        panic!("Only one runtime feature could be selected, current selection {features:?}");
     }
 }

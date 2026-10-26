@@ -1,7 +1,6 @@
 use std::{fs::File, io, io::BufReader, sync::Arc};
 
-use ntex::service::{chain_factory, fn_service};
-use ntex::{codec, io::Io, server, util::Either};
+use ntex::{SharedCfg, codec, io::Io, server, service, util::Either};
 use ntex_tls::rustls::TlsAcceptor;
 use tls_rustls::ServerConfig;
 
@@ -9,11 +8,15 @@ use tls_rustls::ServerConfig;
 async fn main() -> io::Result<()> {
     env_logger::init();
 
-    println!("Started rustls server: 127.0.0.1:8443");
+    println!("Started rustls echo server: 127.0.0.1:8443");
 
     // load ssl keys
-    let cert_file = &mut BufReader::new(File::open("./examples/cert.pem").unwrap());
-    let key_file = &mut BufReader::new(File::open("./examples/key.pem").unwrap());
+    let cert_file = &mut BufReader::new(
+        File::open(concat!(env!("CARGO_MANIFEST_DIR"), "/examples/cert.pem")).unwrap(),
+    );
+    let key_file = &mut BufReader::new(
+        File::open(concat!(env!("CARGO_MANIFEST_DIR"), "/examples/key.pem")).unwrap(),
+    );
     let keys = rustls_pemfile::private_key(key_file).unwrap().unwrap();
     let cert_chain = rustls_pemfile::certs(cert_file)
         .collect::<Result<Vec<_>, _>>()
@@ -26,19 +29,14 @@ async fn main() -> io::Result<()> {
     );
 
     // start server
-    server::ServerBuilder::new()
-        .bind("basic", "127.0.0.1:8443", async move |_| {
-            chain_factory(TlsAcceptor::new(tls_config.clone())).and_then(fn_service(
-                |io: Io<_>| async move {
+    server::build()
+        .bind(
+            "basic",
+            "127.0.0.1:8443",
+            SharedCfg::new("S"),
+            async move |_| {
+                service(TlsAcceptor::new(tls_config.clone())).and_then(async move |io: Io<_>| {
                     println!("New client is connected");
-
-                    io.send(
-                        ntex_bytes::Bytes::from_static(b"Welcome!\n"),
-                        &codec::BytesCodec,
-                    )
-                    .await
-                    .map_err(Either::into_inner)?;
-
                     loop {
                         match io.recv(&codec::BytesCodec).await {
                             Ok(Some(msg)) => {
@@ -56,9 +54,9 @@ async fn main() -> io::Result<()> {
                     }
                     println!("Client is disconnected");
                     Ok(())
-                },
-            ))
-        })?
+                })
+            },
+        )?
         .workers(1)
         .run()
         .await

@@ -1,10 +1,11 @@
 use proc_macro::TokenStream;
-use proc_macro2::{Span, TokenStream as TokenStream2};
+use proc_macro2::{Ident, Literal, Span, TokenStream as TokenStream2, TokenTree};
 use quote::{ToTokens, TokenStreamExt, quote};
-use syn::{Ident, Path};
+
+use crate::parse::{Error, ItemFn, parse_args, str_value};
 
 #[derive(Debug, Copy, Clone, PartialEq, Eq)]
-pub enum MethodType {
+pub(crate) enum MethodType {
     Get,
     Post,
     Put,
@@ -14,6 +15,7 @@ pub enum MethodType {
     Options,
     Trace,
     Patch,
+    Query,
 }
 
 impl MethodType {
@@ -28,6 +30,7 @@ impl MethodType {
             MethodType::Options => "Options",
             MethodType::Trace => "Trace",
             MethodType::Patch => "Patch",
+            MethodType::Query => "Query",
         }
     }
 }
@@ -41,34 +44,43 @@ impl ToTokens for MethodType {
 }
 
 struct Args {
-    path: syn::LitStr,
+    path: Literal,
     guards: Vec<Ident>,
-    error: Path,
+    state: TokenStream2,
 }
 
-impl syn::parse::Parse for Args {
-    fn parse(input: syn::parse::ParseStream<'_>) -> syn::Result<Self> {
-        let path: syn::LitStr = input.parse()?;
-        let mut guards = Vec::new();
-        let mut error: Option<Path> = None;
+impl Args {
+    fn parse(input: TokenStream2) -> Result<Self, Error> {
+        let mut iter = input.into_iter();
+        let path = match iter.next() {
+            Some(TokenTree::Literal(lit)) if str_value(&lit).is_some() => lit,
+            Some(tt) => return Err(Error::new_spanned(&tt, "expected string literal")),
+            None => return Err(Error::new(Span::call_site(), "expected string literal")),
+        };
+        match iter.next() {
+            Some(TokenTree::Punct(p)) if p.as_char() == ',' => {}
+            Some(tt) => return Err(Error::new_spanned(&tt, "expected `,`")),
+            None => {}
+        }
 
-        while !input.is_empty() {
-            input.parse::<syn::token::Comma>()?;
-            if input.is_empty() {
-                break;
-            }
-            let ident: syn::Ident = input.parse()?;
-            input.parse::<syn::token::Eq>()?;
-            if ident == "guard" {
-                let lit: syn::LitStr = input.parse()?;
-                guards.push(Ident::new(&lit.value(), Span::call_site()));
-            } else if ident == "error" {
-                let lit: syn::LitStr = input.parse()?;
-                error = Some(syn::parse_str(&lit.value())?);
+        let mut guards = Vec::new();
+        let mut state = None;
+        for arg in parse_args(iter.collect())? {
+            if arg.name == "guard" {
+                let lit = arg
+                    .lit_str()
+                    .and_then(|lit| str_value(&lit))
+                    .ok_or_else(|| arg.value_error("expected string literal"))?;
+                guards.push(Ident::new(&lit, Span::call_site()));
+            } else if arg.name == "state" {
+                state = Some(
+                    arg.path()
+                        .ok_or_else(|| arg.value_error("expected identifier"))?,
+                );
             } else {
-                return Err(syn::Error::new_spanned(
-                    ident,
-                    "Unknown attribute key is specified. Allowed: guard or error",
+                return Err(Error::new_spanned(
+                    &arg.name,
+                    "unknown argument, expected `guard` or `state`",
                 ));
             }
         }
@@ -76,16 +88,25 @@ impl syn::parse::Parse for Args {
         Ok(Args {
             path,
             guards,
-            error: error
-                .unwrap_or_else(|| syn::parse_str("ntex::web::DefaultError").unwrap()),
+            state: state.unwrap_or_else(|| quote!(ntex::web::dev::DefaultState)),
         })
     }
 }
 
-pub struct Route {
-    name: syn::Ident,
+fn missing_path(method: MethodType) -> Error {
+    Error::new(
+        Span::call_site(),
+        format!(
+            r#"missing path, expected #[{}("<path>")]"#,
+            method.as_str().to_ascii_lowercase()
+        ),
+    )
+}
+
+pub(crate) struct Route {
+    name: Ident,
     args: Args,
-    ast: syn::ItemFn,
+    ast: TokenStream2,
     method: MethodType,
 }
 
@@ -96,23 +117,17 @@ impl std::fmt::Debug for Route {
 }
 
 impl Route {
-    pub fn new(
+    pub(crate) fn new(
         args: TokenStream,
         input: TokenStream,
         method: MethodType,
-    ) -> syn::Result<Self> {
+    ) -> Result<Self, Error> {
         if args.is_empty() {
-            return Err(syn::Error::new(
-                Span::call_site(),
-                format!(
-                    r#"invalid server definition, expected #[{}("<some path>")]"#,
-                    method.as_str().to_ascii_lowercase()
-                ),
-            ));
+            return Err(missing_path(method));
         }
-        let ast: syn::ItemFn = syn::parse(input)?;
-        let name = ast.sig.ident.clone();
-        let args = syn::parse::<Args>(args)?;
+        let ast = TokenStream2::from(input);
+        let name = ItemFn::parse(ast.clone())?.ident().clone();
+        let args = Args::parse(args.into())?;
 
         Ok(Self {
             name,
@@ -122,34 +137,74 @@ impl Route {
         })
     }
 
-    pub fn generate(&self) -> TokenStream {
+    pub(crate) fn generate(&self) -> TokenStream {
         let name = &self.name;
         let resource_name = name.to_string();
         let ast = &self.ast;
         let path = &self.args.path;
         let extra_guards = &self.args.guards;
-        let error = &self.args.error;
+        let state = &self.args.state;
         let method = &self.method;
 
         let stream = quote! {
             #[allow(non_camel_case_types)]
             pub struct #name;
 
-            impl ntex::web::dev::WebServiceFactory<#error> for #name
-            {
-                fn register(self, __config: &mut ntex::web::dev::WebServiceConfig<#error>) {
+            impl<St: 'static> ntex::web::dev::WebServiceFactory<#state, St> for #name {
+                fn register(self, __config: &mut ntex::web::dev::WebServiceConfig<#state, St>) {
                     #ast
 
-                    let __resource = ntex::web::Resource::new(#path)
+                    let __resource = ntex::web::Resource::<_, St>::new(#path)
                         .name(#resource_name)
-                        .guard(ntex::web::guard::#method())
                         #(.guard(ntex::web::guard::fn_guard(#extra_guards)))*
+                        .guard(ntex::web::guard::#method())
                         .to(#name);
 
-                    ntex::web::dev::WebServiceFactory::register(__resource, __config)
+                    ntex::web::dev::WebServiceFactory::<_, St>::register(__resource, __config)
                 }
             }
         };
         stream.into()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn parse(args: &str) -> Result<Args, Error> {
+        Args::parse(args.parse().unwrap())
+    }
+
+    fn err(args: &str) -> String {
+        parse(args).err().unwrap().to_string()
+    }
+
+    #[test]
+    fn args() {
+        let args = parse(r#""/a", guard = "g1", guard = "g2", state = St"#)
+            .ok()
+            .unwrap();
+        assert_eq!(str_value(&args.path).unwrap(), "/a");
+        assert_eq!(args.guards.len(), 2);
+        assert_eq!(args.state.to_string(), "St");
+
+        let args = parse(r#""/a","#).ok().unwrap();
+        assert!(args.guards.is_empty());
+        assert_eq!(args.state.to_string(), "ntex :: web :: dev :: DefaultState");
+
+        assert_eq!(err("a"), "expected string literal");
+        assert_eq!(err(r#""/a" b"#), "expected `,`");
+        assert_eq!(err(r#""/a", guard = g"#), "expected string literal");
+        assert_eq!(err(r#""/a", state = "St""#), "expected identifier");
+
+        assert_eq!(
+            err(r#""/a", error = "Foo""#),
+            "unknown argument, expected `guard` or `state`"
+        );
+        assert_eq!(
+            missing_path(MethodType::Get).to_string(),
+            r#"missing path, expected #[get("<path>")]"#
+        );
     }
 }

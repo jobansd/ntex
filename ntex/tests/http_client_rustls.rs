@@ -1,11 +1,11 @@
+#![recursion_limit = "256"]
 #![cfg(feature = "rustls")]
 use std::sync::{Arc, atomic::AtomicUsize, atomic::Ordering};
 
-use ntex::client::{Client, Connector};
-use ntex::http::{HttpService, Version, test::server as test_server};
-use ntex::service::{ServiceFactory, cfg::SharedCfg, chain_factory};
-use ntex::util::Ready;
+use ntex::client::Client;
+use ntex::http::{self, HttpService, Version, test::server as test_server};
 use ntex::web::{self, App, HttpResponse};
+use ntex::{SharedCfg, service};
 
 mod rustls_utils;
 
@@ -14,31 +14,26 @@ async fn test_connection_reuse_h2() {
     let num = Arc::new(AtomicUsize::new(0));
     let num2 = num.clone();
 
-    let srv = test_server(async move || {
+    let srv = test_server(async move |_| {
         let num2 = num2.clone();
-        chain_factory(move |io| {
+        service(async move |io| {
             num2.fetch_add(1, Ordering::Relaxed);
-            Ready::Ok(io)
+            Ok(io)
         })
-        .and_then(
-            HttpService::h2(App::new().service(
-                web::resource("/").route(web::to(|| async { HttpResponse::Ok() })),
-            ))
-            .rustls(rustls_utils::tls_acceptor())
-            .map_err(|_| ()),
-        )
-    })
-    .await;
+        .and_then(http::rustls(
+            rustls_utils::tls_acceptor(),
+            http::ALPN_PROTO_H2,
+            HttpService::h2(
+                App::new().service(web::resource("/").route(web::to(async || HttpResponse::Ok()))),
+            ),
+        ))
+    });
 
     // disable ssl verification
     let mut config = rustls_utils::tls_connector();
     config.alpn_protocols = vec![b"h2".to_vec(), b"http/1.1".to_vec()];
 
-    let client = Client::builder()
-        .connector::<&str>(Connector::default().rustls(config))
-        .build(SharedCfg::default())
-        .await
-        .unwrap();
+    let client = Client::builder().rustls(config).build(SharedCfg::default());
 
     // req 1
     let response = client.get(srv.surl("/")).send().await.unwrap();

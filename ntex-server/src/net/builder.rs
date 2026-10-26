@@ -1,59 +1,46 @@
-#![allow(clippy::missing_panics_doc)]
 use std::{fmt, io, net, sync::Arc};
 
 use ntex_io::Io;
 use ntex_rt::System;
-use ntex_service::{ServiceFactory, cfg::SharedCfg};
+use ntex_service::{IntoService, Service, cfg::SharedCfg};
 use ntex_util::time::Millis;
 use socket2::{Domain, SockAddr, Socket, Type};
 
-use crate::{Server, WorkerPool};
+use crate::{Affinity, LoadBalancing, NoConfig, Server, ServerAppConfig, WorkerPool};
 
 use super::accept::AcceptLoop;
-use super::config::{Config, ServiceConfig};
+use super::config::ServiceConfig;
 use super::factory::{self, FactoryServiceType};
-use super::factory::{OnAccept, OnAcceptWrapper, OnWorkerStart, OnWorkerStartWrapper};
-use super::{Connection, ServerStatus, Stream, StreamServer, Token, socket::Listener};
+use super::{Connection, StreamServer, Token, socket::Listener};
 
-/// Streaming service builder
+/// Builder for a network server.
 ///
-/// This type can be used to construct an instance of `net streaming server` through a
-/// builder-like pattern.
-pub struct ServerBuilder {
+/// Register listeners and their service factories, configure the worker pool,
+/// and call [`run`](Self::run) to start the server.
+pub struct ServerBuilder<Cfg = NoConfig> {
     name: String,
     token: Token,
     backlog: i32,
-    services: Vec<FactoryServiceType>,
+    state: Arc<Cfg>,
+    services: Vec<FactoryServiceType<Cfg>>,
     sockets: Vec<(Token, String, Listener)>,
-    on_worker_start: Vec<Box<dyn OnWorkerStart + Send>>,
-    on_accept: Option<Box<dyn OnAccept + Send>>,
     accept: AcceptLoop,
     pool: WorkerPool,
 }
 
 impl Default for ServerBuilder {
     fn default() -> Self {
-        Self::new()
+        Self::new(NoConfig)
     }
 }
 
-impl fmt::Debug for ServerBuilder {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("ServerBuilder")
-            .field("name", &self.name)
-            .field("token", &self.token)
-            .field("backlog", &self.backlog)
-            .field("sockets", &self.sockets)
-            .field("accept", &self.accept)
-            .field("worker-pool", &self.pool)
-            .finish()
-    }
-}
-
-impl ServerBuilder {
+impl<Cfg> ServerBuilder<Cfg>
+where
+    Cfg: ServerAppConfig,
+{
     #[must_use]
-    /// Create new Server builder instance
-    pub fn new() -> ServerBuilder {
+    /// Creates a server builder with the specified application configuration.
+    pub fn new(cfg: Cfg) -> ServerBuilder<Cfg> {
         let sys = System::current();
         let mut accept = AcceptLoop::default();
         accept.name(sys.name());
@@ -65,19 +52,19 @@ impl ServerBuilder {
             accept,
             name: sys.name().to_string(),
             token: Token(0),
+            state: Arc::new(cfg),
             services: Vec::new(),
             sockets: Vec::new(),
-            on_accept: None,
-            on_worker_start: Vec::new(),
             backlog: 2048,
             pool: WorkerPool::default().name(sys.name()),
         }
     }
 
     #[must_use]
-    /// Set server name.
+    /// Sets the server name.
     ///
-    /// Name is used for worker thread name
+    /// The name is also used for the accept and worker thread names. It
+    /// defaults to the current system name.
     pub fn name<T: AsRef<str>>(mut self, name: T) -> Self {
         self.name = name.as_ref().to_string();
         self.accept.name(self.name.as_str());
@@ -86,17 +73,16 @@ impl ServerBuilder {
     }
 
     #[must_use]
-    /// Set number of workers to start.
+    /// Sets the number of worker threads to start.
     ///
-    /// By default server uses number of available logical cpu as workers
-    /// count.
+    /// By default, the server uses the number of available logical CPUs.
     pub fn workers(mut self, num: usize) -> Self {
         self.pool = self.pool.workers(num);
         self
     }
 
     #[must_use]
-    /// Set the maximum number of pending connections.
+    /// Sets the maximum number of pending connections.
     ///
     /// This refers to the number of clients that can be waiting to be served.
     /// Exceeding this number results in the client getting an error when
@@ -105,7 +91,9 @@ impl ServerBuilder {
     ///
     /// Generally set in the 64-2048 range. Default value is 2048.
     ///
-    /// This method should be called before `bind()` method call.
+    /// It applies to listeners created by later [`bind`](Self::bind) and
+    /// [`configure`](Self::configure) calls. It does not affect listeners
+    /// passed to [`listen`](Self::listen) or `listen_uds`.
     pub fn backlog(mut self, num: i32) -> Self {
         self.backlog = num;
         self
@@ -114,75 +102,109 @@ impl ServerBuilder {
     #[must_use]
     /// Sets the maximum per-worker number of concurrent connections.
     ///
-    /// All socket listeners will stop accepting connections when this limit is
-    /// reached for each worker.
+    /// A worker stops taking new connections while it is at this limit. When
+    /// no worker can take a connection, the listeners stop accepting.
     ///
-    /// By default max connections is set to a 25k per worker.
-    pub fn maxconn(self, num: usize) -> Self {
+    /// The limit is a process-wide setting shared by every server in the
+    /// process. Set it before the server starts, because each worker reads
+    /// it when its first service is created.
+    ///
+    /// The default is 25,600 connections per worker.
+    pub fn max_connections(self, num: usize) -> Self {
         super::max_concurrent_connections(num);
         self
     }
 
     #[must_use]
-    /// Stop ntex runtime when server get dropped.
+    /// Stops the current ntex runtime after the server has stopped.
     ///
-    /// By default "stop runtime" is disabled.
+    /// By default, "stop runtime" is disabled.
     pub fn stop_runtime(mut self) -> Self {
         self.pool = self.pool.stop_runtime();
         self
     }
 
     #[must_use]
-    /// Disable signal handling.
+    /// Stops the server when one of the workers fails.
     ///
-    /// By default signal handling is enabled.
+    /// A worker fails when it panics or its service cannot be created. The
+    /// stop is graceful only if [`graceful_shutdown`](Self::graceful_shutdown)
+    /// is enabled. Without this option, a failed worker is restarted.
+    ///
+    /// By default, "stop on panic" is disabled.
+    pub fn stop_on_panic(mut self) -> Self {
+        self.pool = self.pool.stop_on_panic();
+        self
+    }
+
+    #[must_use]
+    /// Disables signal handling.
+    ///
+    /// By default, the server stops on SIGINT, SIGTERM, and SIGQUIT.
     pub fn disable_signals(mut self) -> Self {
         self.pool = self.pool.disable_signals();
         self
     }
 
     #[must_use]
-    /// Enable cpu affinity
+    /// Sets the CPU affinity of worker threads.
     ///
-    /// By default affinity is disabled.
-    pub fn enable_affinity(mut self) -> Self {
-        self.pool = self.pool.enable_affinity();
+    /// See [`WorkerPool::affinity`].
+    pub fn affinity(mut self, affinity: Affinity) -> Self {
+        self.pool = self.pool.affinity(affinity);
         self
     }
 
     #[must_use]
-    /// Timeout for graceful workers shutdown.
+    /// Sets how new connections are distributed between workers.
+    ///
+    /// See [`WorkerPool::load_balancing`].
+    pub fn load_balancing(mut self, balancing: LoadBalancing) -> Self {
+        self.pool = self.pool.load_balancing(balancing);
+        self
+    }
+
+    #[must_use]
+    /// Enables graceful shutdown on SIGQUIT, fatal signals, and panics.
+    ///
+    /// When enabled, SIGQUIT, SIGSEGV, SIGABRT, application panics, and
+    /// worker failures with "stop on panic" stop the server gracefully.
+    /// SIGTERM always stops gracefully and SIGINT always stops immediately.
+    ///
+    /// By default, these events stop the server immediately.
+    pub fn graceful_shutdown(mut self) -> Self {
+        self.pool = self.pool.graceful_shutdown();
+        self
+    }
+
+    #[must_use]
+    /// Timeout for graceful worker shutdown.
     ///
     /// After receiving a stop signal, workers have this much time to finish
-    /// serving requests. Workers still alive after the timeout are force
-    /// dropped.
+    /// serving requests. Workers that are still alive after the timeout are
+    /// forcefully dropped.
     ///
-    /// By default shutdown timeout sets to 30 seconds.
-    pub fn shutdown_timeout<T: Into<Millis>>(mut self, timeout: T) -> Self {
-        self.pool = self.pool.shutdown_timeout(timeout);
+    /// This bounds the worker as a whole, not an individual connection. Each
+    /// connection is bound separately by `IoConfig::set_shutdown_timeout`, so
+    /// this value should leave room for the connections a worker is still
+    /// draining to shut down themselves.
+    ///
+    /// By default, the timeout is set to 30 seconds.
+    pub fn graceful_shutdown_timeout<T: Into<Millis>>(mut self, timeout: T) -> Self {
+        self.pool = self.pool.graceful_shutdown_timeout(timeout);
         self
     }
 
-    #[must_use]
-    /// Set server status handler.
-    ///
-    /// Server calls this handler on every inner status update.
-    pub fn status_handler<F>(mut self, handler: F) -> Self
-    where
-        F: FnMut(ServerStatus) + Send + 'static,
-    {
-        self.accept.set_status_handler(handler);
-        self
-    }
-
-    /// Execute external async configuration as part of the server building
+    /// Runs asynchronous configuration as part of the server building
     /// process.
     ///
-    /// This function is useful for moving parts of configuration to a
-    /// different module or even library.
-    pub async fn configure<F>(mut self, f: F) -> io::Result<ServerBuilder>
+    /// Listeners registered on the [`ServiceConfig`] are added to the server.
+    /// Services for them are attached per worker in
+    /// [`ServiceConfig::on_worker_start`]. This is useful for moving parts of
+    /// the configuration to a different module or library.
+    pub async fn configure<F>(mut self, f: F) -> io::Result<Self>
     where
-        F: AsyncFn(ServiceConfig) -> io::Result<()>,
+        F: AsyncFnOnce(ServiceConfig<Cfg>) -> io::Result<()>,
     {
         let cfg = ServiceConfig::new(self.token, self.backlog);
 
@@ -196,41 +218,29 @@ impl ServerBuilder {
         Ok(self)
     }
 
-    #[must_use]
-    /// Register async service configuration function.
+    #[allow(clippy::needless_pass_by_value)]
+    /// Binds TCP listeners and registers a service factory.
     ///
-    /// This function get called during worker runtime configuration stage.
-    /// It get executed in the worker thread.
-    pub fn on_worker_start<F, E>(mut self, f: F) -> Self
-    where
-        F: AsyncFn() -> Result<(), E> + Send + Clone + 'static,
-        E: fmt::Display + 'static,
-    {
-        self.on_worker_start.push(OnWorkerStartWrapper::create(f));
-        self
-    }
-
-    #[must_use]
-    /// Register on-accept callback function.
+    /// A listener is created for every address resolved from `addr`. Binding
+    /// succeeds if at least one of them binds; addresses that fail to bind
+    /// are skipped.
     ///
-    /// This function get called with accepted stream.
-    pub fn on_accept<F, E>(mut self, f: F) -> Self
+    /// `cfg` is the I/O configuration for accepted connections. `factory` is
+    /// called once per worker with that worker's application state and
+    /// returns the connection service.
+    pub fn bind<F, S, I>(
+        mut self,
+        name: impl AsRef<str>,
+        addr: impl net::ToSocketAddrs,
+        cfg: impl Into<SharedCfg>,
+        factory: F,
+    ) -> io::Result<Self>
     where
-        F: AsyncFn(Arc<str>, Stream) -> Result<Stream, E> + Send + Clone + 'static,
-        E: fmt::Display + 'static,
+        F: AsyncFn(&Cfg::State) -> I + Send + Clone + 'static,
+        S: Service<Cfg::State, Io> + 'static,
+        I: IntoService<S, Cfg::State, Io> + 'static,
     {
-        self.on_accept = Some(OnAcceptWrapper::create(f));
-        self
-    }
-
-    /// Add new service to the server.
-    pub fn bind<F, U, N, R>(mut self, name: N, addr: U, factory: F) -> io::Result<Self>
-    where
-        U: net::ToSocketAddrs,
-        N: AsRef<str>,
-        F: AsyncFn(Config) -> R + Send + Clone + 'static,
-        R: ServiceFactory<Io, SharedCfg> + 'static,
-    {
+        let cfg = cfg.into();
         let sockets = bind_addr(addr, self.backlog)?;
 
         let mut tokens = Vec::new();
@@ -238,7 +248,7 @@ impl ServerBuilder {
             let token = self.token.next();
             self.sockets
                 .push((token, name.as_ref().to_string(), Listener::from_tcp(lst)));
-            tokens.push((token, SharedCfg::default()));
+            tokens.push((token, cfg.clone()));
         }
 
         self.services.push(factory::create_factory_service(
@@ -251,13 +261,22 @@ impl ServerBuilder {
     }
 
     #[cfg(unix)]
-    /// Add new unix domain service to the server.
-    pub fn bind_uds<F, U, N, R>(self, name: N, addr: U, factory: F) -> io::Result<Self>
+    /// Binds a Unix domain socket and registers a service factory.
+    ///
+    /// Any existing file at `addr` is removed before binding. The socket file
+    /// is removed again when the server stops. See [`bind`](Self::bind) for
+    /// `cfg` and `factory`.
+    pub fn bind_uds<F, I, S>(
+        self,
+        name: impl AsRef<str>,
+        addr: impl AsRef<std::path::Path>,
+        cfg: impl Into<SharedCfg>,
+        factory: F,
+    ) -> io::Result<Self>
     where
-        N: AsRef<str>,
-        U: AsRef<std::path::Path>,
-        F: AsyncFn(Config) -> R + Send + Clone + 'static,
-        R: ServiceFactory<Io, SharedCfg> + 'static,
+        F: AsyncFn(&Cfg::State) -> I + Send + Clone + 'static,
+        I: IntoService<S, Cfg::State, Io> + 'static,
+        S: Service<Cfg::State, Io> + 'static,
     {
         use std::os::unix::net::UnixListener;
 
@@ -271,27 +290,31 @@ impl ServerBuilder {
         }
 
         let lst = UnixListener::bind(addr)?;
-        self.listen_uds(name, lst, factory)
+        self.listen_uds(name, lst, cfg.into(), factory)
     }
 
     #[cfg(unix)]
-    /// Add new unix domain service to the server.
-    /// Useful when running as a systemd service and
-    /// a socket FD can be acquired using the systemd crate.
-    pub fn listen_uds<F, N: AsRef<str>, R>(
+    /// Registers a service factory for an existing Unix domain listener.
+    ///
+    /// This is useful for socket activation, including listeners acquired
+    /// through systemd. The listener is switched to non-blocking mode. See
+    /// [`bind`](Self::bind) for `cfg` and `factory`.
+    pub fn listen_uds<F, I, S>(
         mut self,
-        name: N,
+        name: impl AsRef<str>,
         lst: std::os::unix::net::UnixListener,
+        cfg: impl Into<SharedCfg>,
         factory: F,
     ) -> io::Result<Self>
     where
-        F: AsyncFn(Config) -> R + Send + Clone + 'static,
-        R: ServiceFactory<Io, SharedCfg> + 'static,
+        F: AsyncFn(&Cfg::State) -> I + Send + Clone + 'static,
+        I: IntoService<S, Cfg::State, Io> + 'static,
+        S: Service<Cfg::State, Io> + 'static,
     {
         let token = self.token.next();
         self.services.push(factory::create_factory_service(
             name.as_ref().to_string(),
-            vec![(token, SharedCfg::default())],
+            vec![(token, cfg.into())],
             factory,
         ));
         self.sockets
@@ -299,21 +322,26 @@ impl ServerBuilder {
         Ok(self)
     }
 
-    /// Add new service to the server.
-    pub fn listen<F, N: AsRef<str>, R>(
+    /// Registers a service factory for an existing TCP listener.
+    ///
+    /// The listener is switched to non-blocking mode. See
+    /// [`bind`](Self::bind) for `cfg` and `factory`.
+    pub fn listen<F, S, I>(
         mut self,
-        name: N,
+        name: impl AsRef<str>,
         lst: net::TcpListener,
+        cfg: impl Into<SharedCfg>,
         factory: F,
     ) -> io::Result<Self>
     where
-        F: AsyncFn(Config) -> R + Send + Clone + 'static,
-        R: ServiceFactory<Io, SharedCfg> + 'static,
+        F: AsyncFn(&Cfg::State) -> I + Send + Clone + 'static,
+        S: Service<Cfg::State, Io> + 'static,
+        I: IntoService<S, Cfg::State, Io> + 'static,
     {
         let token = self.token.next();
         self.services.push(factory::create_factory_service(
             name.as_ref().to_string(),
-            vec![(token, SharedCfg::default())],
+            vec![(token, cfg.into())],
             factory,
         ));
         self.sockets
@@ -321,67 +349,55 @@ impl ServerBuilder {
         Ok(self)
     }
 
-    #[must_use]
-    /// Set shared config for named service
+    /// Starts processing incoming connections and returns a server controller.
     ///
     /// # Panics
     ///
-    /// Panics if named service is not registered
-    pub fn config<N, U>(mut self, name: N, cfg: U) -> Self
-    where
-        N: AsRef<str>,
-        U: Into<SharedCfg>,
-    {
-        let cfg = cfg.into();
-        let mut token = None;
-        for sock in &self.sockets {
-            if sock.1 == name.as_ref() {
-                token = Some(sock.0);
-                break;
-            }
-        }
-
-        if let Some(token) = token {
-            for svc in &mut self.services {
-                if svc.name(token) == name.as_ref() {
-                    svc.set_config(token, cfg.clone());
-                }
-            }
-        } else {
-            panic!("Cannot find service by name {:?}", name.as_ref());
-        }
-
-        self
-    }
-
-    /// Starts processing incoming connections and return server controller.
+    /// Panics if no listener has been registered.
     pub fn run(self) -> Server<Connection> {
-        if self.sockets.is_empty() {
-            panic!("Server should have at least one bound socket");
-        } else {
-            let srv = StreamServer::new(
-                self.accept.notify(),
-                self.services,
-                self.on_worker_start,
-                self.on_accept,
-            );
-            let svc = self.pool.run(srv);
+        assert!(
+            !self.sockets.is_empty(),
+            "Server should have at least one bound socket"
+        );
+        let srv = StreamServer::new(self.accept.notify(), self.state, self.services);
+        let svc = self.pool.run(srv);
 
-            let sockets = self
-                .sockets
-                .into_iter()
-                .map(|sock| {
-                    log::info!("Starting \"{}\" service on {}", sock.1, sock.2);
-                    (sock.0, sock.2)
-                })
-                .collect();
-            self.accept.start(sockets, svc.clone());
+        svc.metrics_ref().listeners(
+            self.sockets
+                .iter()
+                .map(|sock| (sock.1.clone(), sock.2.local_addr().to_string())),
+        );
+        let sockets = self
+            .sockets
+            .into_iter()
+            .map(|sock| {
+                log::info!("Starting \"{}\" service on {}", sock.1, sock.2);
+                (sock.0, sock.2)
+            })
+            .collect();
+        self.accept.start(sockets, svc.clone());
 
-            svc
-        }
+        svc
     }
 }
 
+impl<Cfg> fmt::Debug for ServerBuilder<Cfg> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("ServerBuilder")
+            .field("name", &self.name)
+            .field("token", &self.token)
+            .field("backlog", &self.backlog)
+            .field("sockets", &self.sockets)
+            .field("accept", &self.accept)
+            .field("worker-pool", &self.pool)
+            .finish()
+    }
+}
+
+/// Binds TCP listeners for every address resolved from `addr`.
+///
+/// Succeeds if at least one address binds and returns only the listeners that
+/// bound. Otherwise, returns the last bind error.
 pub fn bind_addr<S: net::ToSocketAddrs>(
     addr: S,
     backlog: i32,
@@ -411,10 +427,8 @@ pub fn bind_addr<S: net::ToSocketAddrs>(
     }
 }
 
-pub fn create_tcp_listener(
-    addr: net::SocketAddr,
-    backlog: i32,
-) -> io::Result<net::TcpListener> {
+/// Creates and binds a TCP listener with the specified listen backlog.
+pub fn create_tcp_listener(addr: net::SocketAddr, backlog: i32) -> io::Result<net::TcpListener> {
     let builder = match addr {
         net::SocketAddr::V4(_) => Socket::new(Domain::IPV4, Type::STREAM, None)?,
         net::SocketAddr::V6(_) => Socket::new(Domain::IPV6, Type::STREAM, None)?,

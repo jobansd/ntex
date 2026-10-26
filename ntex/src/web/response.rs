@@ -3,8 +3,7 @@ use std::fmt;
 use crate::http::body::{Body, MessageBody, ResponseBody};
 use crate::http::{HeaderMap, Response, ResponseHead, StatusCode};
 
-use super::error::{ErrorContainer, ErrorRenderer};
-use super::httprequest::HttpRequest;
+use super::{HttpRequest, State, WebResponseError};
 
 /// An http service response.
 pub struct WebResponse {
@@ -20,12 +19,15 @@ impl WebResponse {
 
     #[must_use]
     /// Create web response from the error.
-    pub fn from_err<Err: ErrorRenderer, E: Into<Err::Container>>(
-        err: E,
+    pub fn from_err<St>(
+        st: &St,
+        err: &impl WebResponseError<St, St::Error>,
         request: HttpRequest,
-    ) -> Self {
-        let err = err.into();
-        let res: Response = err.error_response(&request);
+    ) -> Self
+    where
+        St: State,
+    {
+        let res = err.error_response(st);
 
         if res.head().status == StatusCode::INTERNAL_SERVER_ERROR {
             log::error!("Internal Server Error: {err:?}");
@@ -42,11 +44,11 @@ impl WebResponse {
     #[inline]
     #[must_use]
     /// Create web response for error.
-    pub fn error_response<Err: ErrorRenderer, E: Into<Err::Container>>(
-        self,
-        err: E,
-    ) -> Self {
-        Self::from_err::<Err, E>(err, self.request)
+    pub fn error_response<St>(self, st: &St, err: &impl WebResponseError<St, St::Error>) -> Self
+    where
+        St: State,
+    {
+        Self::from_err(st, err, self.request)
     }
 
     #[inline]
@@ -91,22 +93,6 @@ impl WebResponse {
     /// Returns mutable response's headers.
     pub fn headers_mut(&mut self) -> &mut HeaderMap {
         self.response.headers_mut()
-    }
-
-    #[must_use]
-    /// Execute closure and in case of error convert it to response.
-    pub fn checked_expr<Err, F, E>(mut self, f: F) -> Self
-    where
-        F: FnOnce(&mut Self) -> Result<(), E>,
-        E: Into<Err::Container>,
-        Err: ErrorRenderer,
-    {
-        if let Err(err) = f(&mut self) {
-            let res: Response = err.into().into();
-            WebResponse::new(res, self.request)
-        } else {
-            self
-        }
     }
 
     #[must_use]
@@ -162,26 +148,44 @@ impl fmt::Debug for WebResponse {
 #[cfg(test)]
 mod tests {
     use crate::http::{self, StatusCode};
-    use crate::web::test::TestRequest;
-    use crate::web::{DefaultError, HttpResponse};
+    use crate::web::{HttpResponse, test::TestRequest};
 
     #[test]
     fn test_response() {
-        let res = TestRequest::default().to_srv_response(HttpResponse::Ok().finish());
-        let res = res.into_response(HttpResponse::BadRequest().finish());
+        let res = TestRequest::default().to_srv_response(HttpResponse::Ok().build());
+        let res = res.into_response(HttpResponse::BadRequest().build());
         assert_eq!(res.response().status(), StatusCode::BAD_REQUEST);
 
         let err = http::error::PayloadError::Overflow;
-        let res = res.error_response::<DefaultError, _>(err);
+        let res = res.error_response::<()>(&(), &err);
         assert_eq!(res.response().status(), StatusCode::PAYLOAD_TOO_LARGE);
+    }
 
-        let res = TestRequest::default().to_srv_response(HttpResponse::Ok().finish());
-        let mut res = res
-            .checked_expr::<DefaultError, _, _>(|_| Ok::<_, http::error::PayloadError>(()));
-        assert_eq!(res.response_mut().status(), StatusCode::OK);
-        let res = res.checked_expr::<DefaultError, _, _>(|_| {
-            Err(http::error::PayloadError::Overflow)
-        });
-        assert_eq!(res.response().status(), StatusCode::PAYLOAD_TOO_LARGE);
+    #[test]
+    fn test_response_accessors() {
+        use crate::http::body::{Body, ResponseBody};
+        use crate::util::Bytes;
+
+        let mut res =
+            TestRequest::with_uri("/path").to_srv_response(HttpResponse::Ok().body("body"));
+        assert_eq!(res.request().path(), "/path");
+        assert_eq!(res.status(), StatusCode::OK);
+        *res.response_mut().status_mut() = StatusCode::CREATED;
+        assert_eq!(res.status(), StatusCode::CREATED);
+        assert!(matches!(
+            res.take_body(),
+            ResponseBody::Body(Body::Bytes(b)) if b == Bytes::from_static(b"body")
+        ));
+
+        let (resp, req) = res.into_parts();
+        assert_eq!(resp.status(), StatusCode::CREATED);
+        assert_eq!(req.path(), "/path");
+    }
+
+    #[test]
+    fn test_from_err() {
+        let req = TestRequest::default().to_http_request();
+        let res = super::WebResponse::from_err(&(), &std::io::Error::other("err"), req);
+        assert_eq!(res.status(), StatusCode::INTERNAL_SERVER_ERROR);
     }
 }

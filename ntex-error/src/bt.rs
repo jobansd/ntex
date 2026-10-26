@@ -3,12 +3,12 @@
 use std::collections::HashMap;
 use std::hash::{BuildHasher, Hasher};
 use std::panic::Location;
-use std::{cell::RefCell, fmt, fmt::Write, os, path, ptr, sync::Arc, sync::LazyLock};
+use std::{cell::RefCell, ffi::c_void, fmt, fmt::Write, os, path, ptr, sync::Arc, sync::LazyLock};
 
-use backtrace::{BacktraceFmt, BacktraceFrame, BytesOrWideString, Frame};
+use backtrace::{BacktraceFmt, BytesOrWideString, Frame, SymbolName};
 
 thread_local! {
-    static FRAMES: RefCell<HashMap<usize, Arc<BacktraceFrame>>> = RefCell::new(HashMap::default());
+    static FRAMES: RefCell<HashMap<usize, Arc<ResolvedFrame>>> = RefCell::new(HashMap::default());
     static REPRS: RefCell<HashMap<u64, Arc<str>>> = RefCell::new(HashMap::default());
     static DEFAULT: Arc<str> = Arc::from("Unresolved backtrace");
 }
@@ -16,6 +16,11 @@ thread_local! {
 static mut START: Option<(&'static str, u32)> = None;
 static mut START_ALT: Option<(&'static str, u32)> = None;
 
+/// Sets the source location where rendered backtraces are cut off.
+///
+/// The frame matching `file` (a path suffix) and `line` (`0` matches any line),
+/// and all of its callers, are omitted from the rendered backtrace.
+/// Must be called once during initialization, before any backtrace is resolved.
 pub fn set_backtrace_start(file: &'static str, line: u32) {
     unsafe {
         START = Some((file, line));
@@ -35,7 +40,7 @@ pub fn set_backtrace_start_alt(file: &'static str, line: u32) {
 /// This structure can be used to capture a backtrace at various
 /// points in a program and later used to inspect what the backtrace
 /// was at that time.
-pub struct Backtrace(Arc<BacktraceInner>);
+pub struct Backtrace(Arc<BacktraceRaw>);
 
 #[derive(Debug)]
 /// Backtrace resolver.
@@ -47,51 +52,194 @@ pub struct Backtrace(Arc<BacktraceInner>);
 /// **Note:** Once resolution is complete, control must return to the
 /// originating thread to ensure caching is performed correctly.
 pub struct BacktraceResolver {
-    bt: Arc<BacktraceInner>,
+    bt: Arc<BacktraceRaw>,
     repr: Option<Arc<str>>,
     resolved: bool,
-    frames: HashMap<usize, Arc<BacktraceFrame>>,
+    frames: HashMap<usize, Arc<ResolvedFrame>>,
 }
 
 #[derive(Debug)]
-struct BacktraceInner {
+/// Representation of a backtrace.
+pub struct BacktraceRaw {
     id: u64,
-    frames: [Option<Frame>; 80],
-    location: &'static Location<'static>,
+    frames: [Option<RawFrame>; 80],
+    location: &'static str,
 }
 
-impl Backtrace {
+#[derive(Debug, Clone)]
+enum RawFrame {
+    Frame(Frame),
+    Ip(usize),
+}
+
+impl RawFrame {
+    fn ip(&self) -> usize {
+        match self {
+            RawFrame::Frame(frm) => frm.ip() as usize,
+            RawFrame::Ip(ip) => *ip,
+        }
+    }
+}
+
+#[derive(Debug)]
+struct ResolvedFrame {
+    ip: usize,
+    symbols: Vec<ResolvedSymbol>,
+}
+
+#[derive(Debug)]
+struct ResolvedSymbol {
+    name: Option<Vec<u8>>,
+    filename: Option<path::PathBuf>,
+    lineno: Option<u32>,
+    colno: Option<u32>,
+}
+
+impl ResolvedFrame {
+    fn resolve(frm: &RawFrame) -> Self {
+        let mut symbols = Vec::new();
+        let mut cb = |sym: &backtrace::Symbol| {
+            symbols.push(ResolvedSymbol {
+                name: sym.name().map(|n| n.as_bytes().to_vec()),
+                filename: sym.filename().map(path::Path::to_path_buf),
+                lineno: sym.lineno(),
+                colno: sym.colno(),
+            });
+        };
+        match frm {
+            RawFrame::Frame(f) => backtrace::resolve_frame(f, &mut cb),
+            RawFrame::Ip(ip) => backtrace::resolve(*ip as *mut c_void, &mut cb),
+        }
+        ResolvedFrame {
+            ip: frm.ip(),
+            symbols,
+        }
+    }
+}
+
+impl BacktraceRaw {
     /// Create new backtrace
     pub fn new(location: &'static Location<'static>) -> Self {
+        Self::with_filename(location.file())
+    }
+
+    #[track_caller]
+    /// Create new backtrace with current location
+    pub fn with_current() -> Self {
+        Self::new(Location::caller())
+    }
+
+    /// Create new backtrace with filename location
+    pub fn with_filename(location: &'static str) -> Self {
+        Self::capture(location, |cb| backtrace::trace(cb))
+    }
+
+    #[doc(hidden)]
+    /// Create new backtrace without acquiring the global backtrace lock.
+    ///
+    /// Does not allocate or lock, so it can be used from a signal handler
+    /// (subject to the platform unwinder being signal-safe).
+    ///
+    /// # Safety
+    ///
+    /// Same requirements as [`backtrace::trace_unsynchronized`].
+    pub unsafe fn with_filename_unsynchronized(location: &'static str) -> Self {
+        Self::capture(location, |cb| unsafe {
+            backtrace::trace_unsynchronized(cb);
+        })
+    }
+
+    #[doc(hidden)]
+    /// Create new backtrace from instruction pointers, innermost frame first.
+    ///
+    /// Used for stacks walked outside of the `backtrace` crate, for example
+    /// of another suspended thread. Does not allocate or lock.
+    pub fn from_ips(ips: &[usize], location: &'static str) -> Self {
+        let mut st = foldhash::fast::FixedState::default().build_hasher();
+        let mut frames: [Option<RawFrame>; 80] = [const { None }; 80];
+
+        for (frm, ip) in frames.iter_mut().zip(ips) {
+            st.write_usize(*ip);
+            *frm = Some(RawFrame::Ip(*ip));
+        }
+        let id = st.finish();
+
+        BacktraceRaw {
+            id,
+            frames,
+            location,
+        }
+    }
+
+    fn capture<F>(location: &'static str, trace: F) -> Self
+    where
+        F: FnOnce(&mut dyn FnMut(&Frame) -> bool),
+    {
         let mut st = foldhash::fast::FixedState::default().build_hasher();
         let mut idx = 0;
-        let mut frames: [Option<Frame>; 80] = [const { None }; 80];
+        let mut frames: [Option<RawFrame>; 80] = [const { None }; 80];
 
-        backtrace::trace(|frm| {
+        trace(&mut |frm| {
             let ip = frm.ip();
             st.write_usize(ip as usize);
-            frames[idx] = Some(frm.clone());
+            frames[idx] = Some(RawFrame::Frame(frm.clone()));
             idx += 1;
             idx < 80
         });
         let id = st.finish();
 
-        Self(Arc::new(BacktraceInner {
+        BacktraceRaw {
             id,
             frames,
             location,
-        }))
+        }
+    }
+}
+
+impl From<BacktraceRaw> for Backtrace {
+    fn from(bt: BacktraceRaw) -> Backtrace {
+        Backtrace(Arc::new(bt))
+    }
+}
+
+impl Backtrace {
+    /// Create new backtrace
+    pub fn new(location: &'static Location<'static>) -> Self {
+        Self(Arc::new(BacktraceRaw::new(location)))
     }
 
-    /// Backtrace repr
+    #[track_caller]
+    /// Create new backtrace with current location
+    pub fn with_current() -> Self {
+        Self(Arc::new(BacktraceRaw::new(Location::caller())))
+    }
+
+    /// Create new backtrace with filename location
+    pub fn with_filename(location: &'static str) -> Self {
+        Self(Arc::new(BacktraceRaw::with_filename(location)))
+    }
+
+    /// Returns the rendered backtrace, if it has been resolved on the current thread.
     pub fn repr(&self) -> Option<Arc<str>> {
         REPRS.with(|r| r.borrow_mut().get(&self.0.id).cloned())
     }
 
+    /// Returns `true` if this backtrace has been resolved (or resolution
+    /// has started) on the current thread.
     pub fn is_resolved(&self) -> bool {
         REPRS.with(|r| r.borrow_mut().contains_key(&self.0.id))
     }
 
+    /// Resolves the backtrace symbols on the current thread and caches the result.
+    #[must_use]
+    pub fn resolve(self) -> Self {
+        self.resolver().resolve();
+        self
+    }
+
+    /// Returns a resolver that can resolve symbols outside the current thread.
+    ///
+    /// See [`BacktraceResolver`] for details.
     pub fn resolver(&self) -> BacktraceResolver {
         REPRS.with(|r| {
             let mut reprs = r.borrow_mut();
@@ -114,7 +262,7 @@ impl Backtrace {
 
                     for frm in &self.0.frames {
                         if let Some(frm) = frm {
-                            let ip = frm.ip() as usize;
+                            let ip = frm.ip();
                             if let Some(frame) = cache.get(&ip) {
                                 frames.insert(ip, frame.clone());
                             }
@@ -134,6 +282,9 @@ impl Backtrace {
 }
 
 impl BacktraceResolver {
+    /// Resolves backtrace symbols and renders the representation.
+    ///
+    /// The result is cached when the resolver is dropped.
     #[allow(clippy::return_self_not_must_use)]
     pub fn resolve(mut self) -> Self {
         if self.resolved {
@@ -142,22 +293,20 @@ impl BacktraceResolver {
 
         for frm in &self.bt.frames {
             if let Some(frm) = frm {
-                let ip = frm.ip() as usize;
+                let ip = frm.ip();
                 if self.frames.contains_key(&ip) {
                     continue;
                 }
-
-                let mut f = BacktraceFrame::from(frm.clone());
-                f.resolve();
-                self.frames.insert(ip, Arc::new(f));
+                self.frames
+                    .insert(ip, Arc::new(ResolvedFrame::resolve(frm)));
             }
         }
 
         let mut idx = 0;
-        let mut frames: [Option<&BacktraceFrame>; 80] = [None; 80];
+        let mut frames: [Option<&ResolvedFrame>; 80] = [None; 80];
         for frm in &self.bt.frames {
             if let Some(frm) = frm {
-                let ip = frm.ip() as usize;
+                let ip = frm.ip();
                 frames[idx] = Some(self.frames[&ip].as_ref());
                 idx += 1;
             }
@@ -213,7 +362,7 @@ impl Drop for BacktraceResolver {
                 let mut cache = c.borrow_mut();
 
                 for (ip, frm) in &self.frames {
-                    let ip = frm.ip() as usize;
+                    let ip = frm.ip;
                     if !cache.contains_key(&ip) {
                         cache.insert(ip, frm.clone());
                     }
@@ -223,14 +372,14 @@ impl Drop for BacktraceResolver {
     }
 }
 
-fn find_loc(loc: &Location<'_>, frames: &mut [Option<&BacktraceFrame>]) {
+fn find_loc(loc: &str, frames: &mut [Option<&ResolvedFrame>]) {
     let mut idx = 0;
 
     'outter: for (i, frm) in frames.iter().enumerate() {
         if let Some(f) = frm {
-            for sym in f.symbols() {
-                if let Some(fname) = sym.filename()
-                    && fname.ends_with(loc.file())
+            for sym in &f.symbols {
+                if let Some(fname) = &sym.filename
+                    && fname.ends_with(loc)
                 {
                     idx = i;
                     break 'outter;
@@ -248,8 +397,8 @@ fn find_loc(loc: &Location<'_>, frames: &mut [Option<&BacktraceFrame>]) {
     PATHS.with(|paths| {
         'outter: for frm in &mut frames[idx..] {
             if let Some(f) = frm {
-                for sym in f.symbols() {
-                    if let Some(fname) = sym.filename() {
+                for sym in &f.symbols {
+                    if let Some(fname) = &sym.filename {
                         for p in paths {
                             if fname.ends_with(p) {
                                 *frm = None;
@@ -300,13 +449,13 @@ thread_local! {
     }
 }
 
-fn find_loc_start(loc: (&str, u32), frames: &mut [Option<&BacktraceFrame>]) {
+fn find_loc_start(loc: (&str, u32), frames: &mut [Option<&ResolvedFrame>]) {
     let mut idx = 0;
     while idx < frames.len() {
         if let Some(frm) = &frames[idx] {
-            for sym in frm.symbols() {
-                if let Some(fname) = sym.filename()
-                    && let Some(lineno) = sym.lineno()
+            for sym in &frm.symbols {
+                if let Some(fname) = &sym.filename
+                    && let Some(lineno) = sym.lineno
                     && fname.ends_with(loc.0)
                     && (loc.1 == 0 || lineno == loc.1)
                 {
@@ -323,21 +472,35 @@ fn find_loc_start(loc: (&str, u32), frames: &mut [Option<&BacktraceFrame>]) {
     }
 }
 
-struct Bt<'a>(&'a [Option<&'a BacktraceFrame>]);
+struct Bt<'a>(&'a [Option<&'a ResolvedFrame>]);
 
 impl fmt::Debug for Bt<'_> {
     fn fmt(&self, fmt: &mut fmt::Formatter<'_>) -> fmt::Result {
         let cwd = std::env::current_dir();
-        let mut print_path =
-            move |fmt: &mut fmt::Formatter<'_>, path: BytesOrWideString<'_>| {
-                let path = crate::utils::module_path_fs(path.to_str_lossy().as_ref());
-                fmt::Display::fmt(&path, fmt)
-            };
+        let mut print_path = move |fmt: &mut fmt::Formatter<'_>, path: BytesOrWideString<'_>| {
+            let path = crate::utils::module_path_fs(path.to_str_lossy().as_ref());
+            fmt::Display::fmt(&path, fmt)
+        };
 
         let mut f = BacktraceFmt::new(fmt, backtrace::PrintFmt::Short, &mut print_path);
         f.add_context()?;
         for frm in self.0.iter().flatten() {
-            f.frame().backtrace_frame(frm)?;
+            let ip = frm.ip as *mut c_void;
+            let mut ff = f.frame();
+            for sym in &frm.symbols {
+                ff.print_raw_with_column(
+                    ip,
+                    sym.name.as_deref().map(SymbolName::new),
+                    sym.filename
+                        .as_deref()
+                        .and_then(|p| Some(BytesOrWideString::Bytes(p.to_str()?.as_bytes()))),
+                    sym.lineno,
+                    sym.colno,
+                )?;
+            }
+            if frm.symbols.is_empty() {
+                ff.print_raw(ip, None, None, None)?;
+            }
         }
         f.finish()?;
         Ok(())

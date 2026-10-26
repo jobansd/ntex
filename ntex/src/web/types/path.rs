@@ -3,14 +3,22 @@ use std::{fmt, ops};
 
 use serde::de;
 
-use crate::web::error::{ErrorRenderer, PathError};
-use crate::web::{FromRequest, HttpRequest};
+use crate::web::error::PathError;
+use crate::web::{FromRequest, HttpRequest, State};
 use crate::{http::Payload, router::PathDeserializer};
 
 #[derive(PartialEq, Eq, PartialOrd, Ord)]
 /// Extract typed information from the request's path.
 ///
-/// [**`PathConfig`**](struct.PathConfig.html) allows to configure extraction process.
+/// If the path segments cannot be deserialized into `T`, extraction fails with
+/// [`PathError`](crate::web::error::PathError), which the default error domain
+/// renders as `404 Not Found`.
+///
+/// Path segments are percent-decoded after the path is split on `/`, so
+/// extracted values can contain any character, including `/`. For example
+/// `/files/..%2F..%2Fetc` matches `/files/{name}` with `name` set to
+/// `../../etc`. Validate such values before using them, e.g. as a file system
+/// path.
 ///
 /// ## Example
 ///
@@ -19,13 +27,13 @@ use crate::{http::Payload, router::PathDeserializer};
 ///
 /// /// extract path info from "/{username}/{count}/index.html" url
 /// /// {username} - deserializes to a String
-/// /// {count} -  - deserializes to a u32
+/// /// {count} - deserializes to a u32
 /// async fn index(info: web::types::Path<(String, u32)>) -> String {
 ///     format!("Welcome {}! {}", info.0, info.1)
 /// }
 ///
 /// fn main() {
-///     let app = web::App::new().service(
+///     let app = web::App::default().service(
 ///         web::resource("/{username}/{count}/index.html") // <- define path parameters
 ///              .route(web::get().to(index))               // <- register handler with `Path` extractor
 ///     );
@@ -36,6 +44,7 @@ use crate::{http::Payload, router::PathDeserializer};
 /// implements `Deserialize` trait from *serde*.
 ///
 /// ```rust
+/// use std::convert::Infallible;
 /// use ntex::web;
 ///
 /// #[derive(serde::Deserialize)]
@@ -44,14 +53,14 @@ use crate::{http::Payload, router::PathDeserializer};
 /// }
 ///
 /// /// extract `Info` from a path using serde
-/// async fn index(info: web::types::Path<Info>) -> Result<String, web::Error> {
+/// async fn index(info: web::types::Path<Info>) -> Result<String, Infallible> {
 ///     Ok(format!("Welcome {}!", info.username))
 /// }
 ///
 /// fn main() {
-///     let app = web::App::new().service(
+///     let app = web::App::default().service(
 ///         web::resource("/{username}/index.html") // <- define path parameters
-///              .route(web::get().to(index)) // <- use handler with Path` extractor
+///              .route(web::get().to(index)) // <- use handler with `Path` extractor
 ///     );
 /// }
 /// ```
@@ -113,13 +122,13 @@ impl<T: fmt::Display> fmt::Display for Path<T> {
 ///
 /// /// extract path info from "/{username}/{count}/index.html" url
 /// /// {username} - deserializes to a String
-/// /// {count} -  - deserializes to a u32
+/// /// {count} - deserializes to a u32
 /// async fn index(info: web::types::Path<(String, u32)>) -> String {
 ///     format!("Welcome {}! {}", info.0, info.1)
 /// }
 ///
 /// fn main() {
-///     let app = web::App::new().service(
+///     let app = web::App::default().service(
 ///         web::resource("/{username}/{count}/index.html") // <- define path parameters
 ///              .route(web::get().to(index)) // <- register handler with `Path` extractor
 ///     );
@@ -130,6 +139,7 @@ impl<T: fmt::Display> fmt::Display for Path<T> {
 /// implements `Deserialize` trait from *serde*.
 ///
 /// ```rust
+/// use std::convert::Infallible;
 /// use ntex::web;
 ///
 /// #[derive(serde::Deserialize)]
@@ -138,24 +148,24 @@ impl<T: fmt::Display> fmt::Display for Path<T> {
 /// }
 ///
 /// /// extract `Info` from a path using serde
-/// async fn index(info: web::types::Path<Info>) -> Result<String, web::Error> {
+/// async fn index(info: web::types::Path<Info>) -> Result<String, Infallible> {
 ///     Ok(format!("Welcome {}!", info.username))
 /// }
 ///
 /// fn main() {
-///     let app = web::App::new().service(
+///     let app = web::App::default().service(
 ///         web::resource("/{username}/index.html") // <- define path parameters
-///              .route(web::get().to(index)) // <- use handler with Path` extractor
+///              .route(web::get().to(index)) // <- use handler with `Path` extractor
 ///     );
 /// }
 /// ```
-impl<T, Err: ErrorRenderer> FromRequest<Err> for Path<T>
+impl<T, St: State> FromRequest<St> for Path<T>
 where
     T: de::DeserializeOwned,
 {
     type Error = PathError;
 
-    async fn from_request(req: &HttpRequest, _: &mut Payload) -> Result<Self, Self::Error> {
+    async fn from_request(_: &St, req: &HttpRequest, _: &mut Payload) -> Result<Self, Self::Error> {
         de::Deserialize::deserialize(PathDeserializer::new(req.match_info()))
             .map(|inner| Path { inner })
             .map_err(move |e| {
@@ -190,36 +200,45 @@ mod tests {
 
     #[crate::rt_test]
     async fn test_extract_path_single() {
-        let mut router = Router::<usize>::build();
-        router.path("/{value}/", 10).0.set_id(0);
-        let router = router.finish();
+        let mut router = Router::<usize>::builder();
+        router.path("/{value}/", 10).set_id(0);
+        let router = router.build();
 
         let mut req = TestRequest::with_uri("/32/").to_srv_request();
         router.recognize(req.match_info_mut());
 
-        let (req, mut pl) = req.into_parts();
-        assert_eq!(*from_request::<Path<i8>>(&req, &mut pl).await.unwrap(), 32);
-        assert!(from_request::<Path<MyStruct>>(&req, &mut pl).await.is_err());
+        let (req, mut pl, ()) = req.into_parts();
+        assert_eq!(
+            *from_request::<_, Path<i8>>(&(), &req, &mut pl)
+                .await
+                .unwrap(),
+            32
+        );
+        assert!(
+            from_request::<_, Path<MyStruct>>(&(), &req, &mut pl)
+                .await
+                .is_err()
+        );
     }
 
     #[crate::rt_test]
     async fn test_tuple_extract() {
-        let mut router = Router::<usize>::build();
-        router.path("/{key}/{value}/", 10).0.set_id(0);
-        let router = router.finish();
+        let mut router = Router::<usize>::builder();
+        router.path("/{key}/{value}/", 10).set_id(0);
+        let router = router.build();
 
         let mut req = TestRequest::with_uri("/name/user1/?id=test").to_srv_request();
         router.recognize(req.match_info_mut());
 
-        let (req, mut pl) = req.into_parts();
-        let res = from_request::<(Path<(String, String)>,)>(&req, &mut pl)
+        let (req, mut pl, ()) = req.into_parts();
+        let res = from_request::<_, (Path<(String, String)>,)>(&(), &req, &mut pl)
             .await
             .unwrap();
         assert_eq!((res.0).0, "name");
         assert_eq!((res.0).1, "user1");
 
         let res =
-            from_request::<(Path<(String, String)>, Path<(String, String)>)>(&req, &mut pl)
+            from_request::<_, (Path<(String, String)>, Path<(String, String)>)>(&(), &req, &mut pl)
                 .await
                 .unwrap();
         assert_eq!((res.0).0, "name");
@@ -227,20 +246,22 @@ mod tests {
         assert_eq!((res.1).0, "name");
         assert_eq!((res.1).1, "user1");
 
-        from_request::<()>(&req, &mut pl).await.unwrap();
+        from_request::<_, ()>(&(), &req, &mut pl).await.unwrap();
     }
 
     #[crate::rt_test]
     async fn test_request_extract() {
-        let mut router = Router::<usize>::build();
-        router.path("/{key}/{value}/", 10).0.set_id(0);
-        let router = router.finish();
+        let mut router = Router::<usize>::builder();
+        router.path("/{key}/{value}/", 10).set_id(0);
+        let router = router.build();
 
         let mut req = TestRequest::with_uri("/name/user1/?id=test").to_srv_request();
         router.recognize(req.match_info_mut());
 
-        let (req, mut pl) = req.into_parts();
-        let mut s = from_request::<Path<MyStruct>>(&req, &mut pl).await.unwrap();
+        let (req, mut pl, ()) = req.into_parts();
+        let mut s = from_request::<_, Path<MyStruct>>(&(), &req, &mut pl)
+            .await
+            .unwrap();
         assert_eq!(s.key, "name");
         assert_eq!(s.value, "user1");
         s.value = "user2".to_string();
@@ -252,7 +273,7 @@ mod tests {
         let s = s.into_inner();
         assert_eq!(s.value, "user2");
 
-        let s = from_request::<Path<(String, String)>>(&req, &mut pl)
+        let s = from_request::<_, Path<(String, String)>>(&(), &req, &mut pl)
             .await
             .unwrap();
         assert_eq!(s.0, "name");
@@ -261,21 +282,30 @@ mod tests {
         let mut req = TestRequest::with_uri("/name/32/").to_srv_request();
         router.recognize(req.match_info_mut());
 
-        let (req, mut pl) = req.into_parts();
-        let s = from_request::<Path<Test2>>(&req, &mut pl).await.unwrap();
+        let (req, mut pl, ()) = req.into_parts();
+        let s = from_request::<_, Path<Test2>>(&(), &req, &mut pl)
+            .await
+            .unwrap();
         assert_eq!(s.as_ref().key, "name");
         assert_eq!(s.value, 32);
 
-        let s = from_request::<Path<(String, u8)>>(&req, &mut pl)
+        let s = from_request::<_, Path<(String, u8)>>(&(), &req, &mut pl)
             .await
             .unwrap();
         assert_eq!(s.0, "name");
         assert_eq!(s.1, 32);
 
-        let res = from_request::<Path<Vec<String>>>(&req, &mut pl)
+        let res = from_request::<_, Path<Vec<String>>>(&(), &req, &mut pl)
             .await
             .unwrap();
         assert_eq!(res[0], "name".to_owned());
         assert_eq!(res[1], "32".to_owned());
+    }
+
+    #[test]
+    fn test_path_from() {
+        let path = Path::from(10u32);
+        assert_eq!(*path, 10);
+        assert_eq!(path.into_inner(), 10);
     }
 }

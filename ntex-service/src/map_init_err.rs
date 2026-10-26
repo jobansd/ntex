@@ -2,85 +2,84 @@ use std::{fmt, marker::PhantomData};
 
 use super::ServiceFactory;
 
-/// `MapInitErr` service combinator
-pub struct MapInitErr<A, R, C, F, E> {
-    a: A,
+/// Service factory produced by the `map_init_err` combinator.
+///
+/// This is created by the `ServiceChainFactory::map_init_err()` method.
+pub struct MapInitErr<F, Sf, Err> {
     f: F,
-    e: PhantomData<fn(R, C) -> E>,
+    sf: Sf,
+    e: PhantomData<fn() -> Err>,
 }
 
-impl<A, R, C, F, E> MapInitErr<A, R, C, F, E>
-where
-    A: ServiceFactory<R, C>,
-    F: Fn(A::InitError) -> E,
-{
-    /// Create new `MapInitErr` combinator
-    pub(crate) fn new(a: A, f: F) -> Self {
+impl<F, Sf, Err> MapInitErr<F, Sf, Err> {
+    /// Creates a new `MapInitErr` factory.
+    pub(crate) fn new<St, Req>(f: F, sf: Sf) -> Self
+    where
+        Sf: ServiceFactory<St, Req>,
+        F: Fn(Sf::InitError) -> Err,
+    {
         Self {
-            a,
             f,
+            sf,
             e: PhantomData,
         }
     }
 }
 
-impl<A, R, C, F, E> Clone for MapInitErr<A, R, C, F, E>
+impl<F, Sf, Err> Clone for MapInitErr<F, Sf, Err>
 where
-    A: Clone,
     F: Clone,
+    Sf: Clone,
 {
     fn clone(&self) -> Self {
         Self {
-            a: self.a.clone(),
             f: self.f.clone(),
+            sf: self.sf.clone(),
             e: PhantomData,
         }
     }
 }
 
-impl<A, R, C, F, E> fmt::Debug for MapInitErr<A, R, C, F, E>
+impl<F, Sf, Err> fmt::Debug for MapInitErr<F, Sf, Err>
 where
-    A: fmt::Debug,
+    Sf: fmt::Debug,
 {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("MapInitErr")
-            .field("service", &self.a)
+            .field("sf", &self.sf)
             .field("map", &std::any::type_name::<F>())
             .finish()
     }
 }
 
-impl<A, R, C, F, E> ServiceFactory<R, C> for MapInitErr<A, R, C, F, E>
+impl<F, Sf, St, Req, Err> ServiceFactory<St, Req> for MapInitErr<F, Sf, Err>
 where
-    A: ServiceFactory<R, C>,
-    F: Fn(A::InitError) -> E + Clone,
+    F: Fn(Sf::InitError) -> Err + Clone,
+    Sf: ServiceFactory<St, Req>,
 {
-    type Response = A::Response;
-    type Error = A::Error;
+    type Res = Sf::Res;
+    type Error = Sf::Error;
 
-    type Service = A::Service;
-    type InitError = E;
+    type Service = Sf::Service;
+    type InitError = Err;
 
     #[inline]
-    async fn create(&self, cfg: C) -> Result<Self::Service, Self::InitError> {
-        self.a.create(cfg).await.map_err(|e| (self.f)(e))
+    async fn create(&self, st: &St) -> Result<Self::Service, Self::InitError> {
+        self.sf.create(st).await.map_err(|e| (self.f)(e))
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use crate::{ServiceFactory, chain_factory, fn_factory_with_config, fn_service};
+    use crate::{ServiceFactory, factory, fn_factory, fn_service};
 
     #[ntex::test]
     async fn map_init_err() {
-        let factory = chain_factory(fn_factory_with_config(|err: &bool| {
-            let err = *err;
-            async move {
-                if err {
-                    Err(())
-                } else {
-                    Ok(fn_service(|i: usize| async move { Ok::<_, ()>(i * 2) }))
-                }
+        let factory = factory(fn_factory(async move |err: &bool| {
+            if *err {
+                Err(())
+            } else {
+                Ok(fn_service(async |i: usize| Ok::<_, ()>(i * 2)))
             }
         }))
         .map_init_err(|()| std::io::Error::other("err"))
@@ -93,16 +92,13 @@ mod tests {
 
     #[ntex::test]
     async fn map_init_err2() {
-        let factory = fn_factory_with_config(|err: &bool| {
-            let err = *err;
-            async move {
-                if err {
-                    Err(())
-                } else {
-                    Ok(fn_service(|i: usize| async move { Ok::<_, ()>(i * 2) }))
-                }
+        let factory = factory(fn_factory(async |err: &bool| {
+            if *err {
+                Err(())
+            } else {
+                Ok(fn_service(async |i: usize| Ok::<_, ()>(i * 2)))
             }
-        })
+        }))
         .map_init_err(|()| std::io::Error::other("err"))
         .clone();
 

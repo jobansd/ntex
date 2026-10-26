@@ -3,11 +3,10 @@
     clippy::no_effect,
     clippy::missing_safety_doc
 )]
-use std::{cmp, error::Error, fmt, str, str::FromStr};
+use std::{cmp, fmt, hash, str, str::FromStr};
 
-use ntex_bytes::{ByteString, Bytes};
+use ntex_bytes::{ByteString, Bytes, BytesMut};
 
-#[allow(clippy::derived_hash_with_manual_eq)]
 /// Represents an HTTP header field value.
 ///
 /// In practice, HTTP header field values are usually valid ASCII. However, the
@@ -15,15 +14,15 @@ use ntex_bytes::{ByteString, Bytes};
 /// case, the header field value is not able to be represented as a string.
 ///
 /// To handle this, the `HeaderValue` is useable as a type and can be compared
-/// with strings and implements `Debug`. A `to_str` fn is provided that returns
-/// an `Err` if the header value contains non visible ascii characters.
-#[derive(Clone, Hash, Eq)]
+/// with strings and implements `Debug`. [`to_str`](Self::to_str) returns an
+/// error if the value is not valid UTF-8.
+#[derive(Clone, Eq)]
 pub struct HeaderValue {
     inner: Bytes,
     is_sensitive: bool,
 }
 
-#[derive(thiserror::Error, Copy, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Default)]
+#[derive(thiserror::Error, Copy, Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Default)]
 #[error("Invalid HTTP header value")]
 /// A possible error when converting a `HeaderValue` from a string or byte
 /// slice.
@@ -34,8 +33,10 @@ pub struct InvalidHeaderValue {
 /// A possible error when converting a `HeaderValue` to a string representation.
 ///
 /// Header field values may contain opaque bytes, in which case it is not
-/// possible to represent the value as a string.
-#[derive(Debug, Copy, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+/// possible to represent the value as a string. Returned if the value is not
+/// valid UTF-8.
+#[derive(thiserror::Error, Copy, Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[error("failed to convert header to a str")]
 pub struct ToStrError {
     _priv: (),
 }
@@ -44,34 +45,13 @@ impl HeaderValue {
     /// Convert a static string to a `HeaderValue`.
     ///
     /// This function will not perform any copying, however the string is
-    /// checked to ensure that no invalid characters are present. Only visible
-    /// ASCII characters (32-127) are permitted.
+    /// checked to ensure that no invalid characters are present. Only HTAB and
+    /// visible ASCII characters (32-126) are permitted.
     ///
     /// # Panics
     ///
     /// This function panics if the argument contains invalid header value
     /// characters.
-    ///
-    /// Until [Allow panicking in constants](https://github.com/rust-lang/rfcs/pull/2345)
-    /// makes its way into stable, the panic message at compile-time is
-    /// going to look cryptic, but should at least point at your header value:
-    ///
-    /// ```text
-    /// error: any use of this value will cause an error
-    ///   --> http/src/header/value.rs:67:17
-    ///    |
-    /// 67 |                 ([] as [u8; 0])[0]; // Invalid header value
-    ///    |                 ^^^^^^^^^^^^^^^^^^
-    ///    |                 |
-    ///    |                 index out of bounds: the length is 0 but the index is 0
-    ///    |                 inside `HeaderValue::from_static` at http/src/header/value.rs:67:17
-    ///    |                 inside `INVALID_HEADER` at src/main.rs:73:33
-    ///    |
-    ///   ::: src/main.rs:73:1
-    ///    |
-    /// 73 | const INVALID_HEADER: HeaderValue = HeaderValue::from_static("жsome value");
-    ///    | ----------------------------------------------------------------------------
-    /// ```
     ///
     /// # Examples
     ///
@@ -81,15 +61,11 @@ impl HeaderValue {
     /// assert_eq!(val, "hello");
     /// ```
     #[inline]
-    #[allow(unconditional_panic)] // required for the panic circumvention
     pub const fn from_static(src: &'static str) -> HeaderValue {
         let bytes = src.as_bytes();
         let mut i = 0;
         while i < bytes.len() {
-            if !is_visible_ascii(bytes[i]) {
-                #[allow(clippy::out_of_bounds_indexing)]
-                ([] as [u8; 0])[0]; // Invalid header value
-            }
+            assert!(is_visible_ascii(bytes[i]), "invalid header value");
             i += 1;
         }
 
@@ -102,12 +78,8 @@ impl HeaderValue {
     /// Attempt to convert a string to a `HeaderValue`.
     ///
     /// If the argument contains invalid header value characters, an error is
-    /// returned. Only visible ASCII characters (32-127) are permitted. Use
-    /// `from_bytes` to create a `HeaderValue` that includes opaque octets
-    /// (128-255).
-    ///
-    /// This function is intended to be replaced in the future by a `TryFrom`
-    /// implementation once the trait is stabilized in std.
+    /// returned. The same bytes as in [`from_bytes`](Self::from_bytes) are
+    /// permitted, so non-ASCII characters are accepted.
     ///
     /// # Examples
     ///
@@ -115,6 +87,9 @@ impl HeaderValue {
     /// # use ntex_http::header::HeaderValue;
     /// let val = HeaderValue::from_str("hello").unwrap();
     /// assert_eq!(val, "hello");
+    ///
+    /// let val = HeaderValue::from_str("caf\u{e9}").unwrap();
+    /// assert_eq!(val.to_str().unwrap(), "caf\u{e9}");
     /// ```
     ///
     /// An invalid value
@@ -132,11 +107,8 @@ impl HeaderValue {
     /// Attempt to convert a byte slice to a `HeaderValue`.
     ///
     /// If the argument contains invalid header value bytes, an error is
-    /// returned. Only byte values between 32 and 255 (inclusive) are permitted,
-    /// excluding byte 127 (DEL).
-    ///
-    /// This function is intended to be replaced in the future by a `TryFrom`
-    /// implementation once the trait is stabilized in std.
+    /// returned. Only HTAB and byte values between 32 and 255 (inclusive) are
+    /// permitted, excluding byte 127 (DEL).
     ///
     /// # Examples
     ///
@@ -160,8 +132,9 @@ impl HeaderValue {
 
     /// Attempt to convert a `Bytes` buffer to a `HeaderValue`.
     ///
-    /// This will try to prevent a copy if the type passed is the type used
-    /// internally, and will copy the data if it is not.
+    /// The conversion avoids copying when `src` can be converted into the
+    /// internal [`Bytes`] representation without allocation. The same bytes as
+    /// in [`from_bytes`](Self::from_bytes) are permitted.
     pub fn from_shared<T>(src: T) -> Result<HeaderValue, InvalidHeaderValue>
     where
         Bytes: From<T>,
@@ -179,10 +152,12 @@ impl HeaderValue {
         })
     }
 
-    /// Attempt to convert a `Bytes` buffer to a `HeaderValue`.
+    /// Creates a header value from bytes without validation.
     ///
-    /// This will try to prevent a copy if the type passed is the type used
-    /// internally, and will copy the data if it is not.
+    /// # Safety
+    ///
+    /// `src` must contain only bytes allowed in an HTTP header field value:
+    /// HTAB and bytes 32 through 255, excluding 127.
     pub unsafe fn from_shared_unchecked(src: Bytes) -> HeaderValue {
         HeaderValue {
             inner: src,
@@ -205,11 +180,9 @@ impl HeaderValue {
         })
     }
 
-    /// Yields a `&str` slice if the `HeaderValue` only contains visible ASCII
-    /// chars.
+    /// Yields a `&str` slice if the `HeaderValue` is valid UTF-8.
     ///
-    /// This function will perform a scan of the header value, checking all the
-    /// characters.
+    /// This function validates the whole header value as UTF-8.
     ///
     /// # Examples
     ///
@@ -217,17 +190,12 @@ impl HeaderValue {
     /// # use ntex_http::header::HeaderValue;
     /// let val = HeaderValue::from_static("hello");
     /// assert_eq!(val.to_str().unwrap(), "hello");
+    ///
+    /// let val = HeaderValue::from_bytes(b"caf\xe9").unwrap();
+    /// assert!(val.to_str().is_err());
     /// ```
     pub fn to_str(&self) -> Result<&str, ToStrError> {
-        let bytes = self.as_ref();
-
-        for &b in bytes {
-            if !is_visible_ascii(b) {
-                return Err(ToStrError { _priv: () });
-            }
-        }
-
-        unsafe { Ok(str::from_utf8_unchecked(bytes)) }
+        simdutf8::basic::from_utf8(self.as_ref()).map_err(|_| ToStrError { _priv: () })
     }
 
     /// Returns the length of `self`.
@@ -246,7 +214,7 @@ impl HeaderValue {
         self.as_ref().len()
     }
 
-    /// Returns true if the `HeaderValue` has a length of zero bytes.
+    /// Returns `true` if the header value is empty.
     ///
     /// # Examples
     ///
@@ -263,7 +231,7 @@ impl HeaderValue {
         self.len() == 0
     }
 
-    /// Converts a `HeaderValue` to a byte slice.
+    /// Returns the header value as a byte slice.
     ///
     /// # Examples
     ///
@@ -277,7 +245,7 @@ impl HeaderValue {
         self.as_ref()
     }
 
-    /// Converts a `HeaderValue` to a bytes object.
+    /// Returns the underlying shared byte buffer.
     ///
     /// # Examples
     ///
@@ -292,7 +260,7 @@ impl HeaderValue {
         &self.inner
     }
 
-    /// Mark that the header value represents sensitive information.
+    /// Marks whether the header value contains sensitive information.
     ///
     /// # Examples
     ///
@@ -476,6 +444,24 @@ impl TryFrom<Vec<u8>> for HeaderValue {
     }
 }
 
+impl TryFrom<Bytes> for HeaderValue {
+    type Error = InvalidHeaderValue;
+
+    #[inline]
+    fn try_from(bytes: Bytes) -> Result<Self, Self::Error> {
+        HeaderValue::from_shared(bytes)
+    }
+}
+
+impl TryFrom<BytesMut> for HeaderValue {
+    type Error = InvalidHeaderValue;
+
+    #[inline]
+    fn try_from(bytes: BytesMut) -> Result<Self, Self::Error> {
+        HeaderValue::from_shared(bytes)
+    }
+}
+
 impl From<HeaderValue> for http::header::HeaderValue {
     #[inline]
     fn from(t: HeaderValue) -> Self {
@@ -503,23 +489,15 @@ fn is_valid(b: u8) -> bool {
     b >= 32 && b != 127 || b == b'\t'
 }
 
-impl fmt::Debug for InvalidHeaderValue {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("InvalidHeaderValue")
-            // skip _priv noise
-            .finish()
+// ===== Hash / PartialEq / PartialOrd =====
+
+// Must agree with `PartialEq`, which ignores the sensitive flag
+impl hash::Hash for HeaderValue {
+    #[inline]
+    fn hash<H: hash::Hasher>(&self, state: &mut H) {
+        self.inner.hash(state);
     }
 }
-
-impl Error for ToStrError {}
-
-impl fmt::Display for ToStrError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str("failed to convert header to a str")
-    }
-}
-
-// ===== PartialEq / PartialOrd =====
 
 impl PartialEq for HeaderValue {
     #[inline]
@@ -735,6 +713,18 @@ mod tests {
     use super::*;
 
     #[test]
+    fn test_hash_ignores_sensitive() {
+        use std::hash::{BuildHasher, RandomState};
+
+        let state = RandomState::new();
+        let hdr = HeaderValue::from_static("secret");
+        let mut sensitive = hdr.clone();
+        sensitive.set_sensitive(true);
+        assert_eq!(hdr, sensitive);
+        assert_eq!(state.hash_one(&hdr), state.hash_one(&sensitive));
+    }
+
+    #[test]
     #[allow(clippy::op_ref, clippy::cmp_owned)]
     fn test_basics() {
         assert!(HeaderValue::from_str("").unwrap().is_empty());
@@ -763,15 +753,15 @@ mod tests {
         assert_eq!(hdr.as_bytes(), b"upgrade");
         let hdr2 = HeaderValue::try_from(&ByteString::from("upgrade2")).unwrap();
 
-        assert!(hdr == hdr);
-        assert!(hdr == &hdr);
-        assert!(hdr == "upgrade");
-        assert!(hdr == "upgrade".to_string());
-        assert!(hdr == b"upgrade".as_ref());
-        assert!("upgrade" == hdr);
-        assert!("upgrade" == &hdr);
-        assert!("upgrade".to_string() == hdr);
-        assert!(b"upgrade".as_ref() == &hdr);
+        assert_eq!(hdr, hdr);
+        assert_eq!(hdr, &hdr);
+        assert_eq!(hdr, "upgrade");
+        assert_eq!(hdr, "upgrade".to_string());
+        assert_eq!(hdr, b"upgrade".as_ref());
+        assert_eq!("upgrade", hdr);
+        assert_eq!("upgrade", &hdr);
+        assert_eq!("upgrade".to_string(), hdr);
+        assert_eq!(b"upgrade".as_ref(), &hdr);
         assert!(hdr < hdr2);
         assert!(hdr < &hdr2);
         assert!(&hdr < &hdr2);
@@ -782,18 +772,25 @@ mod tests {
         assert!(hdr < "upgrade2".to_string());
         assert!(hdr < &b"upgrade2"[..]);
         assert!(hdr < b"upgrade2"[..]);
-        assert!(hdr != &b"upgrade2"[..]);
-        assert!(hdr != b"upgrade2"[..]);
+        assert_ne!(hdr, &b"upgrade2"[..]);
+        assert_ne!(hdr, b"upgrade2"[..]);
         assert!("upgrade2" > hdr);
         assert!("upgrade2" > &hdr);
         assert!("upgrade2".to_string() > hdr);
         assert!(b"upgrade2"[..] > hdr);
-        assert!("upgrade2"[..] != hdr);
+        assert_ne!("upgrade2"[..], hdr);
     }
 
     #[test]
     fn test_try_from() {
         HeaderValue::try_from(vec![127]).unwrap_err();
+
+        let hdr = HeaderValue::try_from(Bytes::from_static(b"upgrade")).unwrap();
+        assert_eq!(hdr, "upgrade");
+        HeaderValue::try_from(Bytes::from_static(b"\n")).unwrap_err();
+        let hdr = HeaderValue::try_from(BytesMut::copy_from_slice(b"upgrade")).unwrap();
+        assert_eq!(hdr, "upgrade");
+        HeaderValue::try_from(BytesMut::copy_from_slice(b"\n")).unwrap_err();
     }
 
     #[test]
@@ -826,10 +823,17 @@ mod tests {
         sensitive.set_sensitive(true);
         assert_eq!("Sensitive", format!("{sensitive:?}"));
 
-        let s = format!("{:?}", InvalidHeaderValue { _priv: {} });
-        assert_eq!(s, "InvalidHeaderValue");
+        let s = format!("{}", InvalidHeaderValue { _priv: {} });
+        assert_eq!(s, "Invalid HTTP header value");
 
         let s = format!("{}", ToStrError { _priv: {} });
         assert_eq!(s, "failed to convert header to a str");
+    }
+
+    #[test]
+    #[should_panic(expected = "invalid header value")]
+    fn from_static_invalid() {
+        let src: &'static str = std::hint::black_box("bad\nvalue");
+        let _ = HeaderValue::from_static(src);
     }
 }

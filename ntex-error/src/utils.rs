@@ -1,7 +1,4 @@
-use std::{
-    borrow::Cow, cell::RefCell, convert::Infallible, error::Error as StdError, fmt, io,
-    path::Path, path::PathBuf,
-};
+use std::{borrow::Cow, cell::RefCell, convert, error::Error as StdError, fmt, io, path};
 
 use ntex_bytes::ByteString;
 
@@ -9,7 +6,14 @@ use crate::{Error, ErrorDiagnostic, ResultType};
 
 /// The retry policy of the error.
 pub trait Retryable {
+    /// Returns `true` if the failed operation can be retried.
     fn is_retryable(&self) -> bool;
+}
+
+impl<E: Retryable> Retryable for Error<E> {
+    fn is_retryable(&self) -> bool {
+        self.inner.error.is_retryable()
+    }
 }
 
 impl<T, E> Retryable for Result<T, E>
@@ -24,12 +28,12 @@ where
     }
 }
 
-/// Helper type holding a result type and classification signature.
+/// Helper type holding a result classification signature.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub struct ResultSignature(pub &'static str);
 
 impl ResultSignature {
-    /// Construct new `ResultInfo`
+    /// Creates a new `ResultSignature`.
     pub fn new(sig: &'static str) -> Self {
         Self(sig)
     }
@@ -55,54 +59,38 @@ impl<'a, T, E: ErrorDiagnostic> From<&'a Result<T, E>> for ResultSignature {
     }
 }
 
-impl ErrorDiagnostic for Infallible {
+impl ErrorDiagnostic for convert::Infallible {
     fn signature(&self) -> &'static str {
         unreachable!()
     }
 }
 
 impl ErrorDiagnostic for io::Error {
-    fn typ(&self) -> ResultType {
-        match self.kind() {
-            io::ErrorKind::InvalidData
-            | io::ErrorKind::InvalidInput
-            | io::ErrorKind::Unsupported
-            | io::ErrorKind::UnexpectedEof
-            | io::ErrorKind::BrokenPipe
-            | io::ErrorKind::ConnectionReset
-            | io::ErrorKind::ConnectionAborted
-            | io::ErrorKind::NotConnected
-            | io::ErrorKind::TimedOut => ResultType::ClientError,
-            _ => ResultType::ServiceError,
-        }
-    }
-
     fn signature(&self) -> &'static str {
         match self.kind() {
-            io::ErrorKind::InvalidData => "io-InvalidData",
-            io::ErrorKind::InvalidInput => "io-InvalidInput",
-            io::ErrorKind::Unsupported => "io-Unsupported",
-            io::ErrorKind::UnexpectedEof => "io-UnexpectedEof",
-            io::ErrorKind::BrokenPipe => "io-BrokenPipe",
-            io::ErrorKind::ConnectionReset => "io-ConnectionReset",
-            io::ErrorKind::ConnectionAborted => "io-ConnectionAborted",
-            io::ErrorKind::NotConnected => "io-NotConnected",
-            io::ErrorKind::TimedOut => "io-TimedOut",
-            _ => "io-Error",
+            io::ErrorKind::InvalidData => "std-io-InvalidData",
+            io::ErrorKind::InvalidInput => "std-io-InvalidInput",
+            io::ErrorKind::Unsupported => "std-io-Unsupported",
+            io::ErrorKind::UnexpectedEof => "std-io-UnexpectedEof",
+            io::ErrorKind::BrokenPipe => "std-io-BrokenPipe",
+            io::ErrorKind::ConnectionReset => "std-io-ConnectionReset",
+            io::ErrorKind::ConnectionAborted => "std-io-ConnectionAborted",
+            io::ErrorKind::NotConnected => "std-io-NotConnected",
+            io::ErrorKind::TimedOut => "std-io-TimedOut",
+            _ => "std-io-Error",
         }
     }
 }
 
+/// Marker diagnostic type representing a successful result.
+///
+/// Its signature is [`ResultType::Success`].
 #[derive(Copy, Clone, PartialEq, Eq, Hash, Debug)]
 pub struct Success;
 
 impl StdError for Success {}
 
 impl ErrorDiagnostic for Success {
-    fn typ(&self) -> ResultType {
-        ResultType::Success
-    }
-
     fn signature(&self) -> &'static str {
         ResultType::Success.as_str()
     }
@@ -124,42 +112,50 @@ where
 {
     fut.await.map_err(|err: Error<E>| {
         if err.service().is_none() {
-            err.set_service(svc)
+            err.with_service(svc)
         } else {
             err
         }
     })
 }
 
-/// Generates a module path from the given file path.
+/// Generates a Rust module path from the given source file path.
+///
+/// The path is resolved relative to the crate directory (the parent of `src`),
+/// e.g. `/p/my-crate/src/net/io.rs` becomes `my_crate::net::io`.
 pub fn module_path(file_path: &str) -> ByteString {
     module_path_ext("", "", "::", "", file_path)
 }
 
-/// Generates a module path with a prefix from the given file path.
+/// Generates a Rust module path from the given source file path,
+/// prepending `prefix`.
 pub fn module_path_prefix(prefix: &'static str, file_path: &str) -> ByteString {
     module_path_ext(prefix, "", "::", "", file_path)
 }
 
-/// Generates a module path from a file path.
+/// Generates a `/`-separated file path relative to the crate's parent directory.
+///
+/// e.g. `/p/my-crate/src/net/io.rs` becomes `my-crate/src/net/io.rs`.
 pub fn module_path_fs(file_path: &str) -> ByteString {
     module_path_ext("", "/src", "/", ".rs", file_path)
 }
 
 fn module_path_ext(
     prefix: &'static str,
-    mod_sep: &str,
-    sep: &str,
-    suffix: &str,
+    mod_sep: &'static str,
+    sep: &'static str,
+    suffix: &'static str,
     file_path: &str,
 ) -> ByteString {
     type HashMap<K, V> = std::collections::HashMap<K, V, foldhash::fast::RandomState>;
+    type Key = (&'static str, &'static str, &'static str, &'static str);
     thread_local! {
-        static CACHE: RefCell<HashMap<&'static str, HashMap<String, ByteString>>> = RefCell::new(HashMap::default());
+        static CACHE: RefCell<HashMap<Key, HashMap<String, ByteString>>> = RefCell::new(HashMap::default());
     }
 
+    let key = (prefix, mod_sep, sep, suffix);
     let cached = CACHE.with(|cache| {
-        if let Some(c) = cache.borrow().get(prefix) {
+        if let Some(c) = cache.borrow().get(&key) {
             c.get(file_path).cloned()
         } else {
             None
@@ -170,8 +166,7 @@ fn module_path_ext(
         cached
     } else {
         let normalized_file_path = normalize_file_path(file_path);
-        let (module_name, module_root) =
-            module_root_from_file(mod_sep, &normalized_file_path);
+        let (module_name, module_root) = module_root_from_file(mod_sep, &normalized_file_path);
         let module = module_path_from_file_with_root(
             prefix,
             sep,
@@ -184,7 +179,7 @@ fn module_path_ext(
         let _ = CACHE.with(|cache| {
             cache
                 .borrow_mut()
-                .entry(prefix)
+                .entry(key)
                 .or_default()
                 .insert(file_path.to_string(), module.clone())
         });
@@ -193,7 +188,7 @@ fn module_path_ext(
 }
 
 fn normalize_file_path(file_path: &str) -> String {
-    let path = Path::new(file_path);
+    let path = path::Path::new(file_path);
     if path.is_absolute() {
         return path.to_string_lossy().into_owned();
     }
@@ -204,10 +199,10 @@ fn normalize_file_path(file_path: &str) -> String {
     }
 }
 
-fn module_root_from_file(mod_sep: &str, file_path: &str) -> (String, PathBuf) {
+fn module_root_from_file(mod_sep: &str, file_path: &str) -> (String, path::PathBuf) {
     let normalized = file_path.replace('\\', "/");
     if let Some((root, _)) = normalized.rsplit_once("/src/") {
-        let mut root = PathBuf::from(root);
+        let mut root = path::PathBuf::from(root);
         let mod_name = root
             .file_name()
             .map_or(Cow::Borrowed("crate"), |s| s.to_string_lossy());
@@ -220,9 +215,9 @@ fn module_root_from_file(mod_sep: &str, file_path: &str) -> (String, PathBuf) {
         return (format!("{mod_name}{mod_sep}"), root);
     }
 
-    let path = Path::new(file_path)
+    let path = path::Path::new(file_path)
         .parent()
-        .map_or_else(|| PathBuf::from("."), Path::to_path_buf);
+        .map_or_else(|| path::PathBuf::from("."), path::Path::to_path_buf);
 
     let m = path
         .parent()
@@ -262,13 +257,15 @@ fn module_path_from_file_with_root(
     sep: &str,
     file_path: &str,
     module_name: &str,
-    module_root: &Path,
+    module_root: &path::Path,
     suffix: &str,
 ) -> ByteString {
     let normalized = file_path.replace('\\', "/");
     let module_root_norm = module_root.to_string_lossy().replace('\\', "/");
+    // filesystem roots (`/`, `C:/`) already end with a separator
+    let module_root_norm = module_root_norm.trim_end_matches('/');
 
-    let Some(relative) = normalized.strip_prefix(&(module_root_norm.clone() + "/")) else {
+    let Some(relative) = normalized.strip_prefix(&(module_root_norm.to_string() + "/")) else {
         return format!(
             "{prefix}{module_name}{sep}{}{suffix}",
             module_path_from_file(sep, file_path)
@@ -295,5 +292,75 @@ fn module_path_from_file_with_root(
         ByteString::from(format!("{prefix}{module_name}{suffix}"))
     } else {
         format!("{prefix}{module_name}{sep}{module}{suffix}").into()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn module_paths() {
+        assert_eq!(module_path("/p/my-crate/src/lib.rs"), "my_crate::lib.rs");
+        assert_eq!(module_path("/p/my-crate/src/main.rs"), "my_crate::main.rs");
+        assert_eq!(
+            module_path("/p/my-crate/src/net/mod.rs"),
+            "my_crate::net::mod"
+        );
+        assert_eq!(
+            module_path("/p/my-crate/src/net/io.rs"),
+            "my_crate::net::io"
+        );
+        assert_eq!(module_path("/p/my-crate/src/.rs"), "my_crate");
+        assert_eq!(module_path("/p/my-crate/src/a/src/b.rs"), "a::b");
+        assert_eq!(module_path("/a/b/c.rs"), "a::c");
+        assert_eq!(module_path("/c.rs"), "crate::c");
+        assert_eq!(module_path("src/lib.rs"), "ntex_error::lib.rs");
+        assert_eq!(
+            module_path("C:\\p\\my-crate\\src\\net\\io.rs"),
+            "my_crate::net::io"
+        );
+        // cached
+        assert_eq!(
+            module_path("/p/my-crate/src/net/io.rs"),
+            "my_crate::net::io"
+        );
+
+        assert_eq!(
+            module_path_prefix("pfx::", "/p/my-crate/src/net/io.rs"),
+            "pfx::my_crate::net::io"
+        );
+        assert_eq!(
+            module_path_fs("/p/my-crate/src/lib.rs"),
+            "my-crate/src/lib.rs"
+        );
+        assert_eq!(
+            module_path_fs("/p/my-crate/src/net/mod.rs"),
+            "my-crate/src/net/mod.rs"
+        );
+        assert_eq!(
+            module_path_fs("/p/my-crate/src/net/io.rs"),
+            "my-crate/src/net/io.rs"
+        );
+        assert_eq!(module_path_fs("/p/my-crate/src/.rs"), "my-crate/src.rs");
+    }
+
+    #[test]
+    fn module_path_cache_per_format() {
+        // the same file path must not share cache entries between formats
+        let p = "/p/other-crate/src/x/y.rs";
+        assert_eq!(module_path(p), "other_crate::x::y");
+        assert_eq!(module_path_fs(p), "other-crate/src/x/y.rs");
+        assert_eq!(module_path(p), "other_crate::x::y");
+    }
+
+    #[test]
+    fn module_path_from_file_variants() {
+        assert_eq!(module_path_from_file("::", "/x/src/lib.rs"), "lib.rs");
+        assert_eq!(module_path_from_file("::", "/x/src/main.rs"), "main.rs");
+        assert_eq!(module_path_from_file("::", "/x/src/net/mod.rs"), "net");
+        assert_eq!(module_path_from_file("::", "/x/src/net/io.rs"), "net::io");
+        assert_eq!(module_path_from_file("::", "/x/src/.rs"), "crate");
+        assert_eq!(module_path_from_file("/", "a/b.rs"), "a/b");
     }
 }

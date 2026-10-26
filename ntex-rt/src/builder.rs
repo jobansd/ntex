@@ -1,23 +1,27 @@
 use std::{fmt, future::Future, io, marker::PhantomData, panic, rc::Rc, sync::Arc, time};
 
-use crate::driver::Runner;
-use crate::system::{System, SystemConfig};
+use crate::{driver::Runner, signals, system::System, system::SystemConfig};
 
 #[derive(Debug, Clone)]
-/// Builder struct for a ntex runtime.
+/// Builder for an ntex runtime system.
 ///
-/// Either use `Builder::build` to create a system and start actors.
-/// Alternatively, use `Builder::run` to start the runtime and
-/// run a function in its context.
+/// Use [`build`](Self::build) to create a [`SystemRunner`], then run the event
+/// loop or block on a future.
 pub struct Builder {
     /// Name of the System. Defaults to "ntex" if unset.
     name: String,
-    /// Whether the Arbiter will stop the whole System on uncaught panic. Defaults to false.
-    stop_on_panic: bool,
     /// New thread stack size
     stack_size: usize,
     /// Arbiters ping interval
     ping_interval: usize,
+    /// Arbiter ping response threshold
+    ping_threshold: usize,
+    /// Arbiter latency sampling interval
+    latency_interval: usize,
+    /// Signal handling
+    signals: bool,
+    /// Panic handling
+    panics: bool,
     /// Thread pool config
     pool_limit: usize,
     pool_recv_timeout: time::Duration,
@@ -29,12 +33,15 @@ impl Builder {
     pub(super) fn new() -> Self {
         Builder {
             name: "ntex".into(),
-            stop_on_panic: false,
             stack_size: 0,
-            ping_interval: 1000,
+            ping_interval: 2000,
+            ping_threshold: 1000,
+            latency_interval: 100,
+            signals: false,
+            panics: false,
             testing: false,
             pool_limit: 256,
-            pool_recv_timeout: time::Duration::from_secs(60),
+            pool_recv_timeout: time::Duration::from_mins(1),
         }
     }
 
@@ -46,52 +53,115 @@ impl Builder {
     }
 
     #[must_use]
-    /// Sets the option `stop_on_panic`
+    /// Enables or disables process signal handling.
     ///
-    /// It controls whether the System is stopped when an
-    /// uncaught panic is thrown from a worker thread.
-    ///
-    /// Defaults is set to false.
-    pub fn stop_on_panic(mut self, stop_on_panic: bool) -> Self {
-        self.stop_on_panic = stop_on_panic;
+    /// By default, signal handling is disabled.
+    pub fn signals(mut self, eanbled: bool) -> Self {
+        self.signals = eanbled;
         self
     }
 
     #[must_use]
-    /// Sets the size of the stack (in bytes) for the new thread.
+    /// Enables panic handling.
+    ///
+    /// When panic handling is enabled, the application can receive
+    /// `Signal::Panic(PanicSource::App(..))` signals while signal handling
+    /// is enabled. The previously installed panic hook is still called.
+    /// By default, panic handling is disabled.
+    pub fn panic_handling(mut self, eanbled: bool) -> Self {
+        self.panics = eanbled;
+        self
+    }
+
+    #[doc(hidden)]
+    #[must_use]
+    /// Disable signal handling.
+    ///
+    /// By default, signal handling is disabled.
+    pub fn disable_signals(mut self) -> Self {
+        self.signals = false;
+        self
+    }
+
+    #[doc(hidden)]
+    #[must_use]
+    /// Enable signal handling.
+    ///
+    /// By default, signal handling is enabled.
+    pub fn enable_signals(mut self) -> Self {
+        self.signals = true;
+        self
+    }
+
+    #[must_use]
+    /// Sets the size of the stack (in bytes) for the new worker thread.
     pub fn stack_size(mut self, size: usize) -> Self {
         self.stack_size = size;
         self
     }
 
     #[must_use]
-    /// Sets ping interval for spawned arbiters.
+    /// Sets the ping interval for spawned arbiters.
     ///
-    /// Interval is in milliseconds. By default 5000 milliseconds is set.
-    /// To disable pings set value to zero.
+    /// The interval is specified in milliseconds and defaults to 2,000.
+    /// Set it to zero to disable pings.
     pub fn ping_interval(mut self, interval: usize) -> Self {
         self.ping_interval = interval;
         self
     }
 
     #[must_use]
-    /// Set the thread number limit of the inner thread pool, if exists. The
-    /// default value is 256.
+    /// Sets the arbiter stall threshold.
+    ///
+    /// A watchdog thread marks an arbiter as stalled when it records no
+    /// latency sample for longer than the
+    /// [`latency_interval`](Self::latency_interval) plus this threshold, see
+    /// [`LatencyMetrics::stalls`](crate::LatencyMetrics::stalls). On Linux and
+    /// Windows an attempt is made to create a backtrace for the stalled arbiter.
+    ///
+    /// The threshold is specified in milliseconds and defaults to 1,000.
+    pub fn ping_threshold(mut self, interval: usize) -> Self {
+        self.ping_threshold = interval;
+        self
+    }
+
+    #[must_use]
+    /// Sets the scheduling latency sampling interval for arbiters.
+    ///
+    /// Each arbiter runs a task that sleeps for the interval and records how
+    /// late it wakes up, see [`Arbiter::latency`](crate::Arbiter::latency).
+    ///
+    /// The interval is specified in milliseconds and defaults to 100.
+    /// Set it to zero to disable sampling and stall detection.
+    pub fn latency_interval(mut self, interval: usize) -> Self {
+        self.latency_interval = interval;
+        self
+    }
+
+    #[must_use]
+    /// Sets the maximum number of blocking thread-pool workers.
+    ///
+    /// The default is 256.
     pub fn thread_pool_limit(mut self, value: usize) -> Self {
         self.pool_limit = value;
         self
     }
 
     #[must_use]
-    /// Mark system as testing
+    /// Configures the system for testing.
+    ///
+    /// This disables signal and panic handling.
     pub fn testing(mut self) -> Self {
         self.testing = true;
+        self.signals = false;
+        self.panics = false;
         self
     }
 
     #[must_use]
-    /// Set the waiting timeout of the inner thread, if exists. The default is
-    /// 60 seconds.
+    /// Sets how long an idle blocking worker waits before exiting.
+    ///
+    /// The default is 60 seconds.
     pub fn thread_pool_recv_timeout<T>(mut self, timeout: T) -> Self
     where
         time::Duration: From<T>,
@@ -100,16 +170,19 @@ impl Builder {
         self
     }
 
-    /// Create new System.
+    /// Creates a system runner using the specified runtime runner.
     ///
-    /// This method panics if it can not create runtime
+    /// # Panics
+    ///
+    /// Panics if the runtime cannot be created.
     pub fn build<R: Runner>(self, runner: R) -> SystemRunner {
         let config = SystemConfig {
             name: self.name.clone(),
             testing: self.testing,
             stack_size: self.stack_size,
-            stop_on_panic: self.stop_on_panic,
             ping_interval: self.ping_interval,
+            ping_threshold: self.ping_threshold,
+            latency_interval: self.latency_interval,
             pool_limit: self.pool_limit,
             pool_recv_timeout: self.pool_recv_timeout,
             runner: Arc::new(runner),
@@ -117,61 +190,73 @@ impl Builder {
         self.build_with(config)
     }
 
-    /// Create new System.
+    /// Creates a system runner from an existing system configuration.
     ///
-    /// This method panics if it can not create runtime
+    /// # Panics
+    ///
+    /// Panics if the runtime cannot be created.
     pub fn build_with(self, config: SystemConfig) -> SystemRunner {
         let runner = config.runner.clone();
-        let system = System::construct(config);
 
         // init system arbiter and run configuration method
         SystemRunner {
-            system,
+            config,
             runner,
+            signals: self.signals,
+            panics: self.panics,
             _t: PhantomData,
         }
     }
 }
 
-/// Helper object that runs System's event loop
+/// A configured system that has not yet started its event loop.
 #[must_use = "SystemRunner must be run"]
 pub struct SystemRunner {
-    system: System,
+    config: SystemConfig,
     runner: Arc<dyn Runner>,
+    signals: bool,
+    panics: bool,
     _t: PhantomData<Rc<()>>,
 }
 
 impl SystemRunner {
-    /// Get current system.
-    pub fn system(&self) -> System {
-        self.system.clone()
-    }
-
-    /// This function will start event loop and will finish once the
-    /// `System::stop()` function is called.
+    /// Runs the event loop until [`System::stop()`] is called.
     pub fn run_until_stop(self) -> io::Result<()> {
         self.run(|| Ok(()))
     }
 
-    /// This function will start event loop and will finish once the
-    /// `System::stop()` function is called.
+    /// Runs `f`, then drives the event loop until [`System::stop()`] is called.
     pub fn run<F>(self, f: F) -> io::Result<()>
     where
         F: FnOnce() -> io::Result<()> + 'static,
     {
-        log::info!("Starting {:?} system", self.system.name());
+        log::info!("Starting {:?} system", self.config.name);
 
         let SystemRunner {
-            mut system, runner, ..
+            config,
+            runner,
+            signals,
+            panics,
+            ..
         } = self;
 
+        if panics {
+            signals::enable_panic_handling();
+        }
+
         // run loop
-        crate::driver::block_on(runner.as_ref(), async move {
-            let stop = system.start();
+        crate::driver::block_on_panic(runner.as_ref(), async move {
+            let (system, stop) = System::start(config);
+            let _guard = SystemGuard(system.clone());
+            if signals {
+                system.enable_signals();
+            }
 
             f()?;
 
-            match stop.await {
+            let result = stop.await;
+
+            match result {
                 Ok(code) => {
                     if code != 0 {
                         Err(io::Error::other(format!("Non-zero exit code: {code}")))
@@ -184,6 +269,7 @@ impl SystemRunner {
         })
     }
 
+    #[allow(clippy::missing_panics_doc)]
     /// Execute a future and wait for result.
     pub fn block_on<F, R>(self, fut: F) -> R
     where
@@ -191,12 +277,23 @@ impl SystemRunner {
         R: 'static,
     {
         let SystemRunner {
-            mut system, runner, ..
+            config,
+            runner,
+            signals,
+            panics,
+            ..
         } = self;
 
-        crate::driver::block_on(runner.as_ref(), async move {
-            let stop = system.start();
-            drop(stop);
+        if panics {
+            signals::enable_panic_handling();
+        }
+
+        crate::driver::block_on_panic(runner.as_ref(), async move {
+            let (system, _) = System::start(config);
+            let _guard = SystemGuard(system.clone());
+            if signals {
+                system.enable_signals();
+            }
 
             let loc = current_location();
             ntex_error::set_backtrace_start(loc.file(), loc.line() + 2);
@@ -211,19 +308,55 @@ impl SystemRunner {
         F: Future<Output = R> + 'static,
         R: 'static,
     {
-        let SystemRunner { mut system, .. } = self;
+        let SystemRunner { config, .. } = self;
 
         // run loop
-        tok_io::task::LocalSet::new()
+        let result = tok_io::task::LocalSet::new()
             .run_until(async move {
-                let stop = system.start();
-                drop(stop);
+                let (system, _) = System::start(config);
+                let _guard = SystemGuard(system);
 
                 let loc = current_location();
                 ntex_error::set_backtrace_start(loc.file(), loc.line() + 2);
                 fut.await
             })
-            .await
+            .await;
+
+        crate::arbiter::run_shutdown_callbacks();
+        unsafe {
+            crate::remove_all_items();
+        }
+        if let Some(arb) = crate::Arbiter::try_current() {
+            arb.finalize();
+        }
+        result
+    }
+}
+
+/// Stops the system's arbiters and releases the signals for other systems when
+/// the system's future completes, fails, panics or is dropped.
+struct SystemGuard(System);
+
+impl Drop for SystemGuard {
+    fn drop(&mut self) {
+        self.0.disable_signals();
+
+        if std::thread::panicking() {
+            // some executors (compio) abort the process if a task is woken
+            // while the thread unwinds, stop arbiters from another thread
+            let list = self.0.take_arbiters();
+            if !list.is_empty() {
+                let stopped = std::thread::Builder::new()
+                    .spawn(move || list.into_iter().for_each(|arb| arb.stop()))
+                    .map(std::thread::JoinHandle::join);
+                if let Ok(Err(payload)) = stopped {
+                    std::mem::forget(payload);
+                    crate::abort_on_second_panic();
+                }
+            }
+        } else {
+            self.0.stop_arbiters();
+        }
     }
 }
 
@@ -235,7 +368,192 @@ pub(crate) fn current_location() -> &'static panic::Location<'static> {
 impl fmt::Debug for SystemRunner {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("SystemRunner")
-            .field("system", &self.system)
+            .field("config", &self.config)
             .finish()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::{cell::Cell, cell::RefCell, time::Duration};
+
+    use super::*;
+    use crate::{Arbiter, testing::TestRunner};
+
+    #[test]
+    fn builder_options() {
+        let builder = System::build()
+            .name("opts")
+            .signals(false)
+            .panic_handling(false)
+            .enable_signals()
+            .disable_signals()
+            .stack_size(2 * 1024 * 1024)
+            .ping_interval(0)
+            .ping_threshold(10)
+            .thread_pool_limit(1)
+            .thread_pool_recv_timeout(Duration::from_millis(100))
+            .testing();
+        assert!(format!("{builder:?}").contains("opts"));
+
+        let runner = builder.build(TestRunner);
+        assert!(format!("{runner:?}").contains("opts"));
+        runner.block_on(async {
+            let sys = System::current();
+            assert_eq!(sys.name(), "opts");
+            assert!(sys.testing());
+            assert!(!sys.signals());
+
+            // arbiter thread with configured stack size
+            let mut arb = Arbiter::new();
+            arb.stop();
+            arb.join().unwrap();
+
+            assert_eq!(sys.spawn_blocking(|| 1).await, Ok(1));
+        });
+    }
+
+    #[test]
+    fn run_exit_codes() {
+        // `f` error is returned
+        let err = System::new("test", TestRunner)
+            .run(|| Err(io::Error::other("init failed")))
+            .unwrap_err();
+        assert_eq!(err.to_string(), "init failed");
+
+        System::new("test", TestRunner)
+            .run(|| {
+                System::current().stop();
+                Ok(())
+            })
+            .unwrap();
+
+        // stopping the system stops arbiters and runs shutdown callbacks
+        let called = Rc::new(Cell::new(false));
+        let arb = Rc::new(RefCell::new(None));
+        let (called2, arb2) = (called.clone(), arb.clone());
+        let err = System::new("test", TestRunner)
+            .run(move || {
+                Arbiter::on_shutdown(move || called2.set(true));
+                *arb2.borrow_mut() = Some(Arbiter::new());
+                System::current().stop_with_code(3);
+                Ok(())
+            })
+            .unwrap_err();
+        assert_eq!(err.to_string(), "Non-zero exit code: 3");
+        assert!(called.get());
+
+        let mut arb = arb.borrow_mut().take().unwrap();
+        arb.join().unwrap();
+        assert!(!arb.is_running());
+    }
+
+    #[test]
+    fn exit_stops_child_arbiters() {
+        fn assert_stopped(arb: &Rc<RefCell<Option<Arbiter>>>) {
+            let arb = arb.borrow_mut().take().unwrap();
+            let mut arb2 = arb.clone();
+            let (tx, rx) = std::sync::mpsc::channel();
+            std::thread::spawn(move || {
+                let _ = tx.send(arb2.join().is_ok());
+            });
+            let stopped = rx.recv_timeout(Duration::from_secs(5));
+            arb.stop();
+            assert_eq!(stopped, Ok(true), "child arbiter is still running");
+        }
+
+        // initialization error
+        let arb = Rc::new(RefCell::new(None));
+        let arb2 = arb.clone();
+        let err = System::new("test", TestRunner)
+            .run(move || {
+                *arb2.borrow_mut() = Some(Arbiter::new());
+                Err(io::Error::other("init failed"))
+            })
+            .unwrap_err();
+        assert_eq!(err.to_string(), "init failed");
+        assert_stopped(&arb);
+
+        // root future completion
+        let arb2 = arb.clone();
+        System::new("test", TestRunner).block_on(async move {
+            *arb2.borrow_mut() = Some(Arbiter::new());
+        });
+        assert_stopped(&arb);
+
+        // root future panic
+        let arb2 = arb.clone();
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            System::new("test", TestRunner).block_on(async move {
+                *arb2.borrow_mut() = Some(Arbiter::new());
+                panic!("root future panic");
+            });
+        }));
+        assert!(result.is_err());
+        assert_stopped(&arb);
+    }
+
+    #[test]
+    fn primary_arbiter_finalized() {
+        fn with_on_stop(calls: &Arc<AtomicUsize>) -> Arbiter {
+            let calls = calls.clone();
+            Arbiter::current().on_stop(move || {
+                calls.fetch_add(1, Ordering::Relaxed);
+            })
+        }
+
+        // root future completion
+        let calls = Arc::new(AtomicUsize::new(0));
+        let calls2 = calls.clone();
+        let arb = System::new("test", TestRunner).block_on(async move { with_on_stop(&calls2) });
+        assert!(!arb.is_running());
+        assert_eq!(calls.load(Ordering::Relaxed), 1);
+
+        // root future panic
+        let calls = Arc::new(AtomicUsize::new(0));
+        let (calls2, slot) = (calls.clone(), Rc::new(RefCell::new(None)));
+        let slot2 = slot.clone();
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            System::new("test", TestRunner).block_on(async move {
+                *slot2.borrow_mut() = Some(with_on_stop(&calls2));
+                panic!("root future panic");
+            });
+        }));
+        assert!(result.is_err());
+        assert!(!slot.borrow().as_ref().unwrap().is_running());
+        assert_eq!(calls.load(Ordering::Relaxed), 1);
+
+        // `run`
+        let calls = Arc::new(AtomicUsize::new(0));
+        let (calls2, slot) = (calls.clone(), Rc::new(RefCell::new(None)));
+        let slot2 = slot.clone();
+        System::new("test", TestRunner)
+            .run(move || {
+                *slot2.borrow_mut() = Some(with_on_stop(&calls2));
+                System::current().stop();
+                Ok(())
+            })
+            .unwrap();
+        assert!(!slot.borrow().as_ref().unwrap().is_running());
+        assert_eq!(calls.load(Ordering::Relaxed), 1);
+    }
+
+    #[cfg(feature = "tokio")]
+    #[test]
+    fn run_local_finalizes_primary_arbiter() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let calls2 = calls.clone();
+        let rt = tok_io::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let arb = rt.block_on(System::new("test", TestRunner).run_local(async move {
+            Arbiter::current().on_stop(move || {
+                calls2.fetch_add(1, Ordering::Relaxed);
+            })
+        }));
+        assert!(!arb.is_running());
+        assert_eq!(calls.load(Ordering::Relaxed), 1);
     }
 }

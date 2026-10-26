@@ -1,82 +1,71 @@
-use std::{cell::Ref, cell::RefMut, fmt, marker::PhantomData, net, rc::Rc};
+use std::{cell::Ref, cell::RefMut, fmt, net};
 
-use crate::http::{
-    HeaderMap, HttpMessage, Method, Payload, RequestHead, Response, Uri, Version, header,
-};
+use urly::Url;
+
+use crate::http::header;
+use crate::http::{HeaderMap, HttpMessage, Method, Payload, RequestHead, Response, Version};
 use crate::io::{IoRef, types};
 use crate::router::{Path, Resource};
 use crate::util::Extensions;
 
 use super::config::WebAppConfig;
-use super::error::{ErrorRenderer, WebResponseError};
-use super::httprequest::HttpRequest;
 use super::info::ConnectionInfo;
-use super::response::WebResponse;
 use super::rmap::ResourceMap;
-use super::service::AppState;
+use super::{HttpRequest, State, WebResponse, WebResponseError};
 
 /// An service http request
 ///
 /// `WebRequest` allows mutable access to request's internal structures
-pub struct WebRequest<Err> {
-    req: HttpRequest,
-    _t: PhantomData<Err>,
+pub struct WebRequest<St = ()> {
+    pub(crate) req: HttpRequest,
+    payload: Payload,
+    state: St,
 }
 
-impl<Err: ErrorRenderer> WebRequest<Err> {
-    /// Create web response for error
-    #[inline]
-    pub fn render_error<E: WebResponseError<Err>>(self, err: &E) -> WebResponse {
-        WebResponse::new(err.error_response(&self.req), self.req)
-    }
-
-    /// Create web response for error
-    #[inline]
-    pub fn error_response<E: Into<Err::Container>>(self, err: E) -> WebResponse {
-        WebResponse::from_err::<Err, E>(err, self.req)
-    }
-}
-
-impl<Err> WebRequest<Err> {
+impl<St> WebRequest<St> {
     /// Construct web request
-    pub(crate) fn new(req: HttpRequest) -> Self {
+    pub(crate) fn new(req: HttpRequest, payload: Payload, state: St) -> Self {
         WebRequest {
             req,
-            _t: PhantomData,
+            payload,
+            state,
         }
     }
 
+    /// Create web response for error
+    #[inline]
+    pub fn error_response<AppSt, E>(self, st: &AppSt, err: &E) -> WebResponse
+    where
+        AppSt: State,
+        E: WebResponseError<AppSt, AppSt::Error>,
+    {
+        WebResponse::new(err.error_response(st), self.req)
+    }
+}
+
+impl WebRequest<()> {
+    /// Construct request from request.
+    pub fn from_request(req: HttpRequest) -> Self {
+        WebRequest {
+            req,
+            payload: Payload::None,
+            state: (),
+        }
+    }
+}
+
+impl<St> WebRequest<St> {
     /// Deconstruct request into parts
-    pub fn into_parts(mut self) -> (HttpRequest, Payload) {
-        let pl = Rc::get_mut(&mut (self.req).0).unwrap().payload.take();
-        (self.req, pl)
+    pub fn into_parts(self) -> (HttpRequest, Payload, St) {
+        (self.req, self.payload, self.state)
     }
 
     /// Construct request from parts.
-    ///
-    /// `WebRequest` can be re-constructed only if `req` hasnt been cloned.
-    pub fn from_parts(
-        mut req: HttpRequest,
-        pl: Payload,
-    ) -> Result<Self, (HttpRequest, Payload)> {
-        if Rc::strong_count(&req.0) == 1 {
-            Rc::get_mut(&mut req.0).unwrap().payload = pl;
-            Ok(WebRequest::new(req))
-        } else {
-            Err((req, pl))
-        }
-    }
-
-    /// Construct request from request.
-    ///
-    /// `HttpRequest` implements `Clone` trait via `Rc` type. `WebRequest`
-    /// can be re-constructed only if rc's strong pointers count eq 1 and
-    /// weak pointers count is 0.
-    pub fn from_request(req: HttpRequest) -> Result<Self, HttpRequest> {
-        if Rc::strong_count(&req.0) == 1 {
-            Ok(WebRequest::new(req))
-        } else {
-            Err(req)
+    pub fn from_parts(req: HttpRequest, payload: Payload, state: St) -> Self {
+        WebRequest {
+            req,
+            payload,
+            state,
         }
     }
 
@@ -98,7 +87,7 @@ impl<Err> WebRequest<Err> {
         self.req.head()
     }
 
-    /// This method returns reference to the request head
+    /// This method returns mutable reference to the request head
     #[inline]
     pub fn head_mut(&mut self) -> &mut RequestHead {
         self.req.head_mut()
@@ -106,7 +95,7 @@ impl<Err> WebRequest<Err> {
 
     /// Request's uri.
     #[inline]
-    pub fn uri(&self) -> &Uri {
+    pub fn uri(&self) -> &Url {
         &self.head().uri
     }
 
@@ -122,13 +111,12 @@ impl<Err> WebRequest<Err> {
         self.head().version
     }
 
-    #[inline]
     /// Returns request's headers.
+    #[inline]
     pub fn headers(&self) -> &HeaderMap {
         &self.head().headers
     }
 
-    #[inline]
     /// Returns mutable request's headers.
     pub fn headers_mut(&mut self) -> &mut HeaderMap {
         &mut self.head_mut().headers
@@ -137,7 +125,7 @@ impl<Err> WebRequest<Err> {
     /// The target path of this Request.
     #[inline]
     pub fn path(&self) -> &str {
-        self.head().uri.path()
+        self.head().uri.path().as_str()
     }
 
     /// The query string in the URL.
@@ -145,7 +133,7 @@ impl<Err> WebRequest<Err> {
     /// E.g., id=10
     #[inline]
     pub fn query_string(&self) -> &str {
-        self.uri().query().unwrap_or_default()
+        self.uri().query().map_or("", urly::Query::as_str)
     }
 
     /// Peer socket address
@@ -162,8 +150,21 @@ impl<Err> WebRequest<Err> {
             .and_then(|io| io.query::<types::PeerAddr>().get().map(|addr| addr.0))
     }
 
-    /// Get `ConnectionInfo` for the current request.
+    /// Take request's payload.
+    ///
+    /// The payload is replaced with an empty one, so subsequent calls return
+    /// an empty payload.
     #[inline]
+    pub fn take_payload(&mut self) -> Payload {
+        self.payload.take()
+    }
+
+    /// Set request payload.
+    pub fn set_payload(&mut self, payload: Payload) {
+        self.payload = payload;
+    }
+
+    /// Get `ConnectionInfo` for the current request.
     pub fn connection_info(&self) -> Ref<'_, ConnectionInfo> {
         ConnectionInfo::get(self.head(), self.app_config())
     }
@@ -175,18 +176,18 @@ impl<Err> WebRequest<Err> {
     /// where the identifier can be used later in a request handler to
     /// access the matched value for that segment.
     #[inline]
-    pub fn match_info(&self) -> &Path<Uri> {
+    pub fn match_info(&self) -> &Path<Url> {
         self.req.match_info()
     }
 
-    #[inline]
     /// Get a mutable reference to the Path parameters.
-    pub fn match_info_mut(&mut self) -> &mut Path<Uri> {
+    #[inline]
+    pub fn match_info_mut(&mut self) -> &mut Path<Url> {
         self.req.match_info_mut()
     }
 
-    #[inline]
     /// Get a reference to a `ResourceMap` of current application.
+    #[inline]
     pub fn resource_map(&self) -> &ResourceMap {
         self.req.resource_map()
     }
@@ -197,30 +198,10 @@ impl<Err> WebRequest<Err> {
         self.req.app_config()
     }
 
+    /// Get an application state.
     #[inline]
-    /// Get an application state stored with `App::app_state()` method during
-    /// application configuration.
-    ///
-    /// To get state stored with `App::state()` use `web::types::State<T>` as type.
     pub fn app_state<T: 'static>(&self) -> Option<&T> {
-        (self.req).0.app_state.get::<T>()
-    }
-
-    #[inline]
-    /// Get request's payload
-    pub fn take_payload(&mut self) -> Payload {
-        Rc::get_mut(&mut (self.req).0).unwrap().payload.take()
-    }
-
-    #[inline]
-    /// Set request payload.
-    pub fn set_payload(&mut self, payload: Payload) {
-        Rc::get_mut(&mut (self.req).0).unwrap().payload = payload;
-    }
-
-    /// Set new app state container
-    pub(super) fn set_state_container(&mut self, state: AppState) {
-        Rc::get_mut(&mut (self.req).0).unwrap().app_state = state;
+        (self.req).app_config().state()
     }
 
     /// Request extensions
@@ -234,19 +215,73 @@ impl<Err> WebRequest<Err> {
     pub fn extensions_mut(&self) -> RefMut<'_, Extensions> {
         self.req.extensions_mut()
     }
+
+    /// Get request state ref.
+    #[inline]
+    pub fn st(&self) -> &St {
+        &self.state
+    }
+
+    /// Get request state mut ref
+    #[inline]
+    pub fn st_mut(&mut self) -> &mut St {
+        &mut self.state
+    }
+
+    /// Transform the request state into a new type.
+    ///
+    /// This method consumes the request and returns request with different
+    /// state a `WebRequest<NewSt>`. The HTTP request and payload are preserved.
+    /// It is useful in application and resource filters that add
+    /// request-specific data before passing the request to the next service.
+    ///
+    /// Application state is not affected; only the state stored in this
+    /// `WebRequest` is replaced.
+    ///
+    /// ```rust
+    /// use std::convert::Infallible;
+    /// use ntex::web::{self, WebRequest};
+    ///
+    /// async fn index(_: &(), user_id: usize) -> String {
+    ///     format!("User {user_id}")
+    /// }
+    ///
+    /// web::App::default()
+    ///     .filter(async |req: WebRequest<()>| {
+    ///         Ok::<_, Infallible>(req.map_state(|()| 42usize))
+    ///     })
+    ///     .service(web::resource("/").to_with_state(index));
+    /// ```
+    #[inline]
+    pub fn map_state<F, NewSt>(self, f: F) -> WebRequest<NewSt>
+    where
+        F: FnOnce(St) -> NewSt,
+    {
+        let WebRequest {
+            req,
+            payload,
+            state,
+        } = self;
+
+        WebRequest {
+            req,
+            payload,
+            state: f(state),
+        }
+    }
 }
 
-impl<Err> Resource<Uri> for WebRequest<Err> {
+impl<St> Resource<Url> for WebRequest<St> {
     fn path(&self) -> &str {
         self.match_info().path()
     }
 
-    fn resource_path(&mut self) -> &mut Path<Uri> {
+    fn resource_path(&mut self) -> &mut Path<Url> {
         self.match_info_mut()
     }
 }
 
-impl<Err> HttpMessage for WebRequest<Err> {
+impl<St> HttpMessage for WebRequest<St> {
     #[inline]
     /// Returns Request's headers.
     fn message_headers(&self) -> &HeaderMap {
@@ -266,7 +301,7 @@ impl<Err> HttpMessage for WebRequest<Err> {
     }
 }
 
-impl<Err: ErrorRenderer> fmt::Debug for WebRequest<Err> {
+impl<St> fmt::Debug for WebRequest<St> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         writeln!(
             f,
@@ -296,8 +331,7 @@ impl<Err: ErrorRenderer> fmt::Debug for WebRequest<Err> {
 #[cfg(test)]
 mod tests {
     use crate::http::{self, HttpMessage, header};
-    use crate::web::HttpResponse;
-    use crate::web::test::TestRequest;
+    use crate::web::{HttpResponse, test::TestRequest};
 
     #[test]
     fn test_request() {
@@ -306,13 +340,7 @@ mod tests {
         assert!(req.peer_addr().is_none());
         let err = http::error::PayloadError::Overflow;
 
-        let res: HttpResponse = req.render_error(&err).into();
-        assert_eq!(res.status(), http::StatusCode::PAYLOAD_TOO_LARGE);
-
-        let req = TestRequest::default().to_srv_request();
-        let err = http::error::PayloadError::Overflow;
-
-        let res: HttpResponse = req.error_response(err).into();
+        let res: HttpResponse = req.error_response::<(), _>(&(), &err).into();
         assert_eq!(res.status(), http::StatusCode::PAYLOAD_TOO_LARGE);
 
         let mut req = TestRequest::default().to_srv_request();
@@ -328,9 +356,6 @@ mod tests {
         assert!(!req.headers().contains_key(header::CONTENT_TYPE));
         assert!(!req.message_headers().contains_key(header::CONTENT_TYPE));
 
-        let pl = req.take_payload();
-        req.set_payload(pl);
-
         req.extensions_mut().insert("TEXT".to_string());
         assert_eq!(req.message_extensions().get::<String>().unwrap(), "TEXT");
         req.message_extensions_mut().remove::<String>();
@@ -338,5 +363,48 @@ mod tests {
 
         let t = format!("{req:?}");
         assert!(t.contains("\"authorization\": <REDACTED>"));
+    }
+
+    #[test]
+    fn test_request_parts() {
+        use crate::web::{WebRequest, types::Payload};
+
+        let (req, _, ()) = TestRequest::with_uri("/path").to_http_parts();
+        let mut wreq = WebRequest::from_request(req.clone());
+        assert_eq!(wreq.path(), "/path");
+        assert!(wreq.io().is_none());
+        assert!(
+            wreq.resource_map()
+                .url_for(&req, "unknown", [""; 0])
+                .is_err()
+        );
+
+        assert!(matches!(wreq.take_payload(), crate::http::Payload::None));
+
+        let mut preq = TestRequest::default().payload("data").to_srv_request();
+        let payload = Payload(preq.take_payload()).into_inner();
+        assert!(!matches!(payload, crate::http::Payload::None));
+        assert!(matches!(preq.take_payload(), crate::http::Payload::None));
+        wreq.set_payload(payload);
+        assert!(!matches!(wreq.take_payload(), crate::http::Payload::None));
+
+        let wreq = WebRequest::from_parts(req, crate::http::Payload::None, 10usize);
+        assert_eq!(*wreq.st(), 10);
+    }
+
+    #[test]
+    fn test_request_debug_params() {
+        let req = TestRequest::with_uri("/test")
+            .param("id", "10")
+            .to_srv_request();
+        let s = format!("{req:?}");
+        assert!(s.contains("params:"), "{s}");
+        assert!(s.contains("id"), "{s}");
+
+        let req = TestRequest::with_uri("/test")
+            .param("id", "10")
+            .to_http_request();
+        let s = format!("{req:?}");
+        assert!(s.contains("params:"), "{s}");
     }
 }

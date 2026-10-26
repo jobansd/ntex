@@ -7,7 +7,7 @@ use regex::Regex;
 
 use crate::http::body::{Body, BodySize, MessageBody, ResponseBody};
 use crate::http::header::HeaderName;
-use crate::service::{Middleware, Service, ServiceCtx, cfg::SharedCfg};
+use crate::service::{Ctx, Middleware, Service};
 use crate::util::{Bytes, HashSet};
 use crate::web::{HttpResponse, WebRequest, WebResponse};
 
@@ -31,7 +31,7 @@ use crate::web::{HttpResponse, WebRequest, WebResponse};
 /// use ntex::web::middleware::Logger;
 ///
 /// fn main() {
-///     let app = App::new()
+///     let app = App::default()
 ///         .middleware(Logger::default())
 ///         .middleware(Logger::new("%a %{User-Agent}i"));
 /// }
@@ -43,26 +43,27 @@ use crate::web::{HttpResponse, WebRequest, WebResponse};
 ///
 /// `%a`  Remote IP-address (IP-address of proxy if using reverse proxy)
 ///
-/// `%t`  Time when the request was started to process (in rfc3339 format)
+/// `%t`  Time when the request was started to process (in HTTP-date format,
+/// e.g. `Thu, 04 Sep 2025 15:33:20 GMT`)
 ///
 /// `%r`  First line of request
 ///
 /// `%s`  Response status code
 ///
-/// `%b`  Size of response in bytes, including HTTP headers
+/// `%b`  Size of response in bytes, excluding HTTP headers
 ///
-/// `%T` Time taken to serve the request, in seconds with floating fraction in
-/// .06f format
+/// `%T`  Time taken to serve the request, in seconds with six decimal places
 ///
-/// `%D`  Time taken to serve the request, in milliseconds
+/// `%D`  Time taken to serve the request, in milliseconds with six decimal
+/// places
 ///
-/// `%U`  Request URL
+/// `%U`  Request URL path, without the query string
 ///
-/// `%{FOO}i`  request.headers[`FOO`]
+/// `%{FOO}i`  `request.headers["FOO"]`
 ///
-/// `%{FOO}o`  response.headers[`FOO`]
+/// `%{FOO}o`  `response.headers["FOO"]`
 ///
-/// `%{FOO}e`  os.environ[`FOO`]
+/// `%{FOO}e`  `os.environ["FOO"]`
 ///
 #[derive(Debug)]
 pub struct Logger {
@@ -113,10 +114,10 @@ impl Default for Logger {
     }
 }
 
-impl<S> Middleware<S, SharedCfg> for Logger {
+impl<S, St> Middleware<S, St> for Logger {
     type Service = LoggerMiddleware<S>;
 
-    fn create(&self, service: S, _: SharedCfg) -> Self::Service {
+    fn create(&self, _: &St, service: S) -> Self::Service {
         LoggerMiddleware {
             service,
             inner: self.inner.clone(),
@@ -131,42 +132,40 @@ pub struct LoggerMiddleware<S> {
     service: S,
 }
 
-impl<S, E> Service<WebRequest<E>> for LoggerMiddleware<S>
+impl<S, St, In> Service<St, WebRequest<In>> for LoggerMiddleware<S>
 where
-    S: Service<WebRequest<E>, Response = WebResponse>,
+    S: Service<St, WebRequest<In>, Res = WebResponse>,
 {
-    type Response = WebResponse;
+    type Res = WebResponse;
     type Error = S::Error;
 
-    crate::forward_poll!(service);
-    crate::forward_ready!(service);
-    crate::forward_shutdown!(service);
+    crate::forward_bind!(St, service);
+    crate::forward_ready!(St, service);
+    crate::forward_shutdown!(St, service);
 
     async fn call(
         &self,
-        req: WebRequest<E>,
-        ctx: ServiceCtx<'_, Self>,
-    ) -> Result<Self::Response, Self::Error> {
+        req: WebRequest<In>,
+        ctx: Ctx<'_, Self, St>,
+    ) -> Result<Self::Res, S::Error> {
         if self.inner.exclude.contains(req.path()) {
             ctx.call(&self.service, req).await
         } else {
             let time = time::SystemTime::now();
-            let mut format = self.inner.format.clone();
-
-            for unit in &mut format.0 {
-                unit.render_request(time, &req);
-            }
+            let mut values = self.inner.format.render_request(time, &req);
 
             let res = ctx.call(&self.service, req).await?;
-            for unit in &mut format.0 {
-                unit.render_response(res.response());
-            }
+            self.inner
+                .format
+                .render_response(res.response(), &mut values);
 
+            let inner = self.inner.clone();
             Ok(res.map_body(move |_, body| {
                 ResponseBody::Other(Body::from_message(StreamLog {
                     body,
                     time,
-                    format: Some(format),
+                    inner,
+                    values,
                     size: 0,
                 }))
             }))
@@ -176,22 +175,20 @@ where
 
 struct StreamLog {
     body: ResponseBody<Body>,
-    format: Option<Format>,
+    inner: Rc<Inner>,
+    values: Vec<Option<String>>,
     size: usize,
     time: time::SystemTime,
 }
 
 impl Drop for StreamLog {
     fn drop(&mut self) {
-        if let Some(ref format) = self.format {
-            let render = |fmt: &mut fmt::Formatter<'_>| {
-                for unit in &format.0 {
-                    unit.render(fmt, self.size, self.time)?;
-                }
-                Ok(())
-            };
-            log::info!("{}", FormatDisplay(&render));
-        }
+        let render = |fmt: &mut fmt::Formatter<'_>| {
+            self.inner
+                .format
+                .render(fmt, &self.values, self.size, self.time)
+        };
+        log::info!("{}", FormatDisplay(&render));
     }
 }
 
@@ -216,7 +213,7 @@ impl MessageBody for StreamLog {
 
 /// A formatting style for the `Logger`, consisting of multiple
 /// `FormatText`s concatenated into one line.
-#[derive(Clone, Debug)]
+#[derive(Debug)]
 #[doc(hidden)]
 struct Format(Vec<FormatText>);
 
@@ -230,10 +227,10 @@ impl Default for Format {
 impl Format {
     /// Create a `Format` from a format string.
     ///
-    /// Returns `None` if the format string syntax is incorrect.
+    /// Text that is not a recognized format specifier is logged verbatim.
     fn new(s: &str) -> Format {
         log::trace!("Access log format: {s}");
-        let fmt = Regex::new(r"%(\{([A-Za-z0-9\-_]+)\}([ioe])|[atPrUsbTD]?)").unwrap();
+        let fmt = Regex::new(r"%(\{([A-Za-z0-9\-_]+)\}([ioe])|[%atrUsbTD]?)").unwrap();
 
         let mut idx = 0;
         let mut results = Vec::new();
@@ -247,12 +244,8 @@ impl Format {
 
             if let Some(key) = cap.get(2) {
                 results.push(match cap.get(3).unwrap().as_str() {
-                    "i" => FormatText::RequestHeader(
-                        HeaderName::try_from(key.as_str()).unwrap(),
-                    ),
-                    "o" => FormatText::ResponseHeader(
-                        HeaderName::try_from(key.as_str()).unwrap(),
-                    ),
+                    "i" => FormatText::RequestHeader(HeaderName::try_from(key.as_str()).unwrap()),
+                    "o" => FormatText::ResponseHeader(HeaderName::try_from(key.as_str()).unwrap()),
                     "e" => FormatText::EnvironHeader(key.as_str().to_owned()),
                     _ => unreachable!(),
                 });
@@ -278,12 +271,46 @@ impl Format {
 
         Format(results)
     }
+
+    /// Renders the request fields, one entry per unit.
+    fn render_request<R>(&self, now: time::SystemTime, req: &WebRequest<R>) -> Vec<Option<String>> {
+        self.0
+            .iter()
+            .map(|unit| unit.render_request(now, req))
+            .collect()
+    }
+
+    /// Renders the response fields into the entries of `values`.
+    fn render_response<B>(&self, res: &HttpResponse<B>, values: &mut [Option<String>]) {
+        for (unit, value) in self.0.iter().zip(values) {
+            if let Some(s) = unit.render_response(res) {
+                *value = Some(s);
+            }
+        }
+    }
+
+    fn render(
+        &self,
+        fmt: &mut fmt::Formatter<'_>,
+        values: &[Option<String>],
+        size: usize,
+        entry_time: time::SystemTime,
+    ) -> Result<(), fmt::Error> {
+        for (idx, unit) in self.0.iter().enumerate() {
+            if let Some(Some(value)) = values.get(idx) {
+                fmt.write_str(value)?;
+            } else {
+                unit.render(fmt, size, entry_time)?;
+            }
+        }
+        Ok(())
+    }
 }
 
 /// A string of text to be logged. This is either one of the data
 /// fields supported by the `Logger`, or a custom `String`.
 #[doc(hidden)]
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 enum FormatText {
     Str(String),
     Percent,
@@ -332,72 +359,52 @@ impl FormatText {
         }
     }
 
-    fn render_response<B>(&mut self, res: &HttpResponse<B>) {
+    fn render_response<B>(&self, res: &HttpResponse<B>) -> Option<String> {
         match *self {
-            FormatText::ResponseStatus => {
-                *self = FormatText::Str(format!("{}", res.status().as_u16()));
-            }
+            FormatText::ResponseStatus => Some(res.status().as_u16().to_string()),
             FormatText::ResponseHeader(ref name) => {
                 let s = if let Some(val) = res.headers().get(name) {
                     val.to_str().unwrap_or("-")
                 } else {
                     "-"
                 };
-                *self = FormatText::Str(s.to_string());
+                Some(s.to_string())
             }
-            _ => (),
+            _ => None,
         }
     }
 
-    fn render_request<E>(&mut self, now: time::SystemTime, req: &WebRequest<E>) {
+    fn render_request<R>(&self, now: time::SystemTime, req: &WebRequest<R>) -> Option<String> {
         match *self {
             FormatText::RequestLine => {
                 let q = req.query_string();
-                *self = if q.is_empty() {
-                    FormatText::Str(format!(
-                        "{} {} {:?}",
-                        req.method(),
-                        req.path(),
-                        req.version()
-                    ))
+                Some(if q.is_empty() {
+                    format!("{} {} {:?}", req.method(), req.path(), req.version())
                 } else {
-                    FormatText::Str(format!(
-                        "{} {}?{} {:?}",
-                        req.method(),
-                        req.path(),
-                        q,
-                        req.version()
-                    ))
-                };
+                    format!("{} {}?{} {:?}", req.method(), req.path(), q, req.version())
+                })
             }
-            FormatText::UrlPath => *self = FormatText::Str(req.path().to_string()),
-            FormatText::RequestTime => {
-                *self = FormatText::Str(httpdate::HttpDate::from(now).to_string());
-            }
+            FormatText::UrlPath => Some(req.path().to_string()),
+            FormatText::RequestTime => Some(httpdate::HttpDate::from(now).to_string()),
             FormatText::RequestHeader(ref name) => {
                 let s = if let Some(val) = req.headers().get(name) {
                     val.to_str().unwrap_or("-")
                 } else {
                     "-"
                 };
-                *self = FormatText::Str(s.to_string());
+                Some(s.to_string())
             }
-            FormatText::RemoteAddr => {
-                let s = if let Some(remote) = req.connection_info().remote() {
-                    FormatText::Str(remote.to_string())
-                } else {
-                    FormatText::Str("-".to_string())
-                };
-                *self = s;
-            }
-            _ => (),
+            FormatText::RemoteAddr => Some(
+                req.connection_info()
+                    .remote()
+                    .map_or_else(|| "-".to_string(), ToString::to_string),
+            ),
+            _ => None,
         }
     }
 }
 
-pub(crate) struct FormatDisplay<'a>(
-    &'a dyn Fn(&mut fmt::Formatter<'_>) -> Result<(), fmt::Error>,
-);
+pub(crate) struct FormatDisplay<'a>(&'a dyn Fn(&mut fmt::Formatter<'_>) -> Result<(), fmt::Error>);
 
 impl fmt::Display for FormatDisplay<'_> {
     fn fmt(&self, fmt: &mut fmt::Formatter<'_>) -> Result<(), fmt::Error> {
@@ -407,42 +414,35 @@ impl fmt::Display for FormatDisplay<'_> {
 
 #[cfg(test)]
 mod tests {
+    use std::convert::Infallible;
+
     use super::*;
     use crate::http::{StatusCode, header};
-    use crate::service::{IntoService, Pipeline};
-    use crate::util::lazy;
-    use crate::web::test::{self, TestRequest};
-    use crate::web::{DefaultError, Error};
+    use crate::web::{test, test::TestRequest};
+    use crate::{fn_service, service::Pipeline, util::lazy};
 
     #[crate::rt_test]
     async fn test_logger() {
-        let srv = |req: WebRequest<DefaultError>| async move {
-            Ok::<_, Error>(
+        let srv = fn_service(async move |req: WebRequest<()>| {
+            Ok::<_, Infallible>(
                 req.into_response(
-                    HttpResponse::build(StatusCode::OK)
+                    HttpResponse::builder(StatusCode::OK)
                         .header("X-Test", "ttt")
                         .body("TEST"),
                 ),
             )
-        };
+        });
         let _logger = Logger::default();
-        let logger = Logger::new("%% %{User-Agent}i %{X-Test}o %{HOME}e %D %% test")
-            .exclude("/test");
+        let logger =
+            Logger::new("%% %{User-Agent}i %{X-Test}o %{HOME}e %D %% test").exclude("/test");
 
-        let srv = Pipeline::new(Middleware::create(
-            &logger,
-            srv.into_service(),
-            SharedCfg::default(),
-        ))
-        .bind();
+        let srv = Pipeline::new((), Middleware::create(&logger, &(), srv));
         assert!(lazy(|cx| srv.poll_ready(cx).is_ready()).await);
         assert!(lazy(|cx| srv.poll_shutdown(cx).is_ready()).await);
 
-        let req = TestRequest::with_header(
-            header::USER_AGENT,
-            header::HeaderValue::from_static("NTEX"),
-        )
-        .to_srv_request();
+        let req =
+            TestRequest::with_header(header::USER_AGENT, header::HeaderValue::from_static("NTEX"))
+                .to_srv_request();
         let res = srv.call(req).await.unwrap();
         let body = test::read_body(res).await;
         assert_eq!(body, Bytes::from_static(b"TEST"));
@@ -457,91 +457,71 @@ mod tests {
 
     #[crate::rt_test]
     async fn test_request_line() {
-        let mut format = Format::new("%r");
-        let req = TestRequest::with_header(
-            header::USER_AGENT,
-            header::HeaderValue::from_static("NTEX"),
-        )
-        .uri("/test/route/yeah?q=test")
-        .to_srv_request();
+        let format = Format::new("%r");
+        let req =
+            TestRequest::with_header(header::USER_AGENT, header::HeaderValue::from_static("NTEX"))
+                .uri("/test/route/yeah?q=test")
+                .to_srv_request();
 
         let now = time::SystemTime::now();
-        for unit in &mut format.0 {
-            unit.render_request(now, &req);
-        }
+        let mut values = format.render_request(now, &req);
 
-        let resp = HttpResponse::build(StatusCode::OK).force_close().finish();
-        for unit in &mut format.0 {
-            unit.render_response(&resp);
-        }
+        let resp = HttpResponse::builder(StatusCode::OK).force_close().build();
+        format.render_response(&resp, &mut values);
 
-        let render = |fmt: &mut fmt::Formatter<'_>| {
-            for unit in &format.0 {
-                unit.render(fmt, 1024, now)?;
-            }
-            Ok(())
-        };
+        let render = |fmt: &mut fmt::Formatter<'_>| format.render(fmt, &values, 1024, now);
         let s = format!("{}", FormatDisplay(&render));
         assert_eq!(s, "GET /test/route/yeah?q=test HTTP/1.1");
     }
 
     #[crate::rt_test]
     async fn test_url_path() {
-        let mut format = Format::new("%T %U");
-        let req = TestRequest::with_header(
-            header::USER_AGENT,
-            header::HeaderValue::from_static("NTEX"),
-        )
-        .uri("/test/route/yeah?q=test")
-        .to_srv_request();
+        let format = Format::new("%T %U");
+        let req =
+            TestRequest::with_header(header::USER_AGENT, header::HeaderValue::from_static("NTEX"))
+                .uri("/test/route/yeah?q=test")
+                .to_srv_request();
 
         let now = time::SystemTime::now();
-        for unit in &mut format.0 {
-            unit.render_request(now, &req);
-        }
+        let mut values = format.render_request(now, &req);
 
-        let resp = HttpResponse::build(StatusCode::OK).force_close().finish();
-        for unit in &mut format.0 {
-            unit.render_response(&resp);
-        }
+        let resp = HttpResponse::builder(StatusCode::OK).force_close().build();
+        format.render_response(&resp, &mut values);
 
-        let render = |fmt: &mut fmt::Formatter<'_>| {
-            for unit in &format.0 {
-                unit.render(fmt, 1024, now)?;
-            }
-            Ok(())
-        };
+        let render = |fmt: &mut fmt::Formatter<'_>| format.render(fmt, &values, 1024, now);
         let s = format!("{}", FormatDisplay(&render));
         assert!(s.contains("/test/route/yeah"));
     }
 
     #[crate::rt_test]
-    async fn test_default_format() {
-        let mut format = Format::default();
-
-        let req = TestRequest::with_header(
-            header::USER_AGENT,
-            header::HeaderValue::from_static("NTEX"),
-        )
-        .to_srv_request();
+    async fn test_percent_format() {
+        let format = Format::new("100%% %U");
+        let req = TestRequest::default().uri("/test").to_srv_request();
 
         let now = time::SystemTime::now();
-        for unit in &mut format.0 {
-            unit.render_request(now, &req);
-        }
+        let values = format.render_request(now, &req);
 
-        let resp = HttpResponse::build(StatusCode::OK).force_close().finish();
-        for unit in &mut format.0 {
-            unit.render_response(&resp);
-        }
+        let render = |fmt: &mut fmt::Formatter<'_>| format.render(fmt, &values, 1024, now);
+        let s = format!("{}", FormatDisplay(&render));
+        assert_eq!(s, "100% /test");
+    }
+
+    #[crate::rt_test]
+    async fn test_default_format() {
+        let format = Format::default();
+
+        let req =
+            TestRequest::with_header(header::USER_AGENT, header::HeaderValue::from_static("NTEX"))
+                .to_srv_request();
+
+        let now = time::SystemTime::now();
+        let mut values = format.render_request(now, &req);
+
+        let resp = HttpResponse::builder(StatusCode::OK).force_close().build();
+        format.render_response(&resp, &mut values);
 
         let entry_time = time::SystemTime::now();
-        let render = |fmt: &mut fmt::Formatter<'_>| {
-            for unit in &format.0 {
-                unit.render(fmt, 1024, entry_time)?;
-            }
-            Ok(())
-        };
+        let render = |fmt: &mut fmt::Formatter<'_>| format.render(fmt, &values, 1024, entry_time);
         let s = format!("{}", FormatDisplay(&render));
         assert!(s.contains("GET / HTTP/1.1"));
         assert!(s.contains("200 1024"));
@@ -550,26 +530,48 @@ mod tests {
 
     #[crate::rt_test]
     async fn test_request_time_format() {
-        let mut format = Format::new("%t");
+        let format = Format::new("%t");
         let req = TestRequest::default().to_srv_request();
 
         let now = time::SystemTime::now();
-        for unit in &mut format.0 {
-            unit.render_request(now, &req);
-        }
+        let mut values = format.render_request(now, &req);
 
-        let resp = HttpResponse::build(StatusCode::OK).force_close().finish();
-        for unit in &mut format.0 {
-            unit.render_response(&resp);
-        }
+        let resp = HttpResponse::builder(StatusCode::OK).force_close().build();
+        format.render_response(&resp, &mut values);
 
-        let render = |fmt: &mut fmt::Formatter<'_>| {
-            for unit in &format.0 {
-                unit.render(fmt, 1024, now)?;
-            }
-            Ok(())
-        };
+        let render = |fmt: &mut fmt::Formatter<'_>| format.render(fmt, &values, 1024, now);
         let s = format!("{}", FormatDisplay(&render));
         assert!(s.contains(&httpdate::HttpDate::from(now).to_string()));
+    }
+
+    #[crate::rt_test]
+    async fn test_missing_values() {
+        let format = Format::new("%{NTEX_LOGGER_MISSING_VAR}e %{X-Missing}o %{X-Missing}i %b");
+        let req = TestRequest::default().to_srv_request();
+
+        let now = time::SystemTime::now();
+        let mut values = format.render_request(now, &req);
+        let resp = HttpResponse::builder(StatusCode::OK).build();
+        format.render_response(&resp, &mut values);
+
+        let render = |fmt: &mut fmt::Formatter<'_>| format.render(fmt, &values, 12, now);
+        assert_eq!(format!("{}", FormatDisplay(&render)), "- - - 12");
+    }
+
+    #[crate::rt_test]
+    async fn test_body_size() {
+        let srv = fn_service(async move |req: WebRequest<()>| {
+            Ok::<_, Infallible>(req.into_response(HttpResponse::Ok().body("TEST")))
+        });
+        let logger = Logger::new("%s %b");
+        let srv = Pipeline::new((), Middleware::create(&logger, &(), srv));
+
+        let mut res = srv
+            .call(TestRequest::default().to_srv_request())
+            .await
+            .unwrap();
+        assert_eq!(res.response_mut().body().size(), BodySize::Sized(4));
+        let body = test::read_body(res).await;
+        assert_eq!(body, Bytes::from_static(b"TEST"));
     }
 }

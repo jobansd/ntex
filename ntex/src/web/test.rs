@@ -1,50 +1,74 @@
 //! Various helpers for ntex applications to use during testing.
-use std::{fmt, net, net::SocketAddr, rc::Rc, sync::mpsc, thread, time};
+use std::sync::{Arc, Mutex, mpsc};
+use std::{convert::Infallible, fmt, future::Future, io, net, net::SocketAddr};
+use std::{pin::Pin, rc::Rc, thread, time};
 
 #[cfg(feature = "cookie")]
 use coo_kie::Cookie;
 use serde::{Serialize, de::DeserializeOwned};
+use urly::Url;
 use uuid::Uuid;
 
-use crate::client::{Client, ClientRequest, ClientResponse, Connector};
-use crate::http::body::MessageBody;
-use crate::http::error::{HttpError, PayloadError, ResponseError};
+use crate::client::error::ClientPayloadError;
+use crate::client::{Client, ClientConfig, ClientRequest, ClientResponse};
+use crate::error::Error;
+use crate::http::error::{HttpError, ResponseError};
 use crate::http::header::{CONTENT_TYPE, HeaderName, HeaderValue};
 use crate::http::test::TestRequest as HttpTestRequest;
-use crate::http::{
-    HttpService, HttpServiceConfig, Method, Payload, Request, StatusCode, Uri, Version,
-};
+use crate::http::{self, HttpService, Method, Payload, Request, Response, StatusCode, Version};
 #[cfg(feature = "ws")]
 use crate::io::Sealed;
 use crate::router::{Path, ResourceDef};
-use crate::service::{IntoService, IntoServiceFactory, Pipeline};
-use crate::time::{Millis, Seconds, sleep};
-use crate::util::{Bytes, BytesMut, Extensions, Ready, Stream, stream_recv};
+use crate::service::boxed::{self, BoxServiceFactory};
+use crate::service::{IntoServiceFactory, Pipeline, fn_service};
+use crate::time::{Millis, Seconds};
+use crate::util::{Bytes, BytesMut, Stream, stream_recv};
 #[cfg(feature = "ws")]
-use crate::ws::{WsClient, WsConnection, error::WsClientError};
+use crate::ws::{WsClient, WsClientConfig, WsConnection, error::WsClientError};
 use crate::{Service, ServiceFactory, SharedCfg, io::IoConfig, rt::System, server::Server};
 
-use crate::web::error::{DefaultError, ErrorRenderer};
+use crate::web::config::WebAppConfig;
 use crate::web::httprequest::HttpRequest;
 use crate::web::rmap::ResourceMap;
-use crate::web::{FromRequest, HttpResponse, Responder, WebRequest, WebResponse};
-use crate::web::{config::WebAppConfig, service::AppState};
+use crate::web::{FromRequest, HttpResponse, Responder, State, WebRequest, WebResponse};
+
+fn set_peer_addr(head: &mut http::Message<http::RequestHead>, addr: Option<SocketAddr>) {
+    #[derive(Debug)]
+    struct TestIo {
+        io: crate::io::Io,
+        _peer: crate::io::testing::IoTest,
+    }
+
+    impl http::IoAccess for TestIo {
+        fn get(&self) -> Option<&crate::io::IoRef> {
+            Some(self.io.as_ref())
+        }
+
+        fn take(&self) -> Option<(crate::io::IoBoxed, http::h1::Codec)> {
+            None
+        }
+    }
+
+    if let Some(addr) = addr {
+        let (client, server) = crate::io::testing::IoTest::create();
+        let io = crate::io::Io::new(server.set_peer_addr(addr), SharedCfg::default());
+        head.io = http::CurrentIo::new(Rc::new(TestIo { io, _peer: client }));
+    }
+}
 
 /// Create service that always responds with `HttpResponse::Ok()`
-pub fn ok_service<Err: ErrorRenderer>()
--> impl Service<WebRequest<Err>, Response = WebResponse, Error = std::convert::Infallible> {
-    default_service::<Err>(StatusCode::OK)
+pub fn ok_service<St: State, In>()
+-> impl Service<St, WebRequest<In>, Res = WebResponse, Error = std::convert::Infallible> {
+    default_service::<St, In>(StatusCode::OK)
 }
 
 /// Create service that responds with response with specified status code
-pub fn default_service<Err: ErrorRenderer>(
+pub fn default_service<St: State, In>(
     status_code: StatusCode,
-) -> impl Service<WebRequest<Err>, Response = WebResponse, Error = std::convert::Infallible>
-{
-    (move |req: WebRequest<Err>| {
-        Ready::Ok(req.into_response(HttpResponse::build(status_code).finish()))
+) -> impl Service<St, WebRequest<In>, Res = WebResponse, Error = Infallible> {
+    fn_service(async move |req: WebRequest<In>| {
+        Ok::<_, Infallible>(req.into_response(HttpResponse::builder(status_code).build()))
     })
-    .into_service()
 }
 
 /// This method accepts application builder instance, and constructs
@@ -59,7 +83,7 @@ pub fn default_service<Err: ErrorRenderer>(
 /// async fn test_init_service() {
 ///     let mut app = test::init_service(
 ///         App::new()
-///             .service(web::resource("/test").to(|| async { HttpResponse::Ok() }))
+///             .service(web::resource("/test").to(async || { HttpResponse::Ok() }))
 ///     ).await;
 ///
 ///     // Create request object
@@ -70,23 +94,49 @@ pub fn default_service<Err: ErrorRenderer>(
 ///     assert_eq!(resp.status(), StatusCode::OK);
 /// }
 /// ```
-pub async fn init_service<R, S, E>(
-    app: R,
-) -> Pipeline<impl Service<Request, Response = WebResponse, Error = E>>
+pub async fn init_service<R, S, E>(app: R) -> Pipeline<Request, Response, E>
 where
-    R: IntoServiceFactory<S, Request, SharedCfg>,
-    S: ServiceFactory<Request, SharedCfg, Response = WebResponse, Error = E>,
+    R: IntoServiceFactory<S, (), Request>,
+    S: ServiceFactory<(), Request, Res = Response, Error = E> + 'static,
     S::InitError: fmt::Debug,
 {
-    let srv = app.into_factory();
-    srv.pipeline(
-        SharedCfg::new("WEB")
-            .add(IoConfig::new())
-            .add(WebAppConfig::new())
-            .into(),
-    )
-    .await
-    .unwrap()
+    let srv = app.into_factory().map_init_err(|e| log::error!("{e:?}"));
+    srv.pipeline(()).await.unwrap()
+}
+
+/// This method accepts application builder instance, and constructs
+/// service with specified state.
+///
+/// ```rust
+/// use ntex::service::Service;
+/// use ntex::http::StatusCode;
+/// use ntex::web::{self, test, App, HttpResponse};
+///
+/// #[ntex::test]
+/// async fn test_init_service() {
+///     let mut app = test::init_service_st(
+///         (),
+///         App::new()
+///             .service(web::resource("/test").to(async || { HttpResponse::Ok() }))
+///     ).await;
+///
+///     // Create request object
+///     let req = test::TestRequest::with_uri("/test").to_request();
+///
+///     // Execute application
+///     let resp = app.call(req).await.unwrap();
+///     assert_eq!(resp.status(), StatusCode::OK);
+/// }
+/// ```
+pub async fn init_service_st<St, R, S, E>(st: St, app: R) -> Pipeline<Request, Response, E>
+where
+    St: 'static,
+    R: IntoServiceFactory<S, St, Request>,
+    S: ServiceFactory<St, Request, Res = Response, Error = E> + 'static,
+    S::InitError: fmt::Debug,
+{
+    let srv = app.into_factory().map_init_err(|e| log::error!("{e:?}"));
+    srv.pipeline(st).await.unwrap()
 }
 
 /// Calls service and waits for response future completion.
@@ -99,7 +149,7 @@ where
 /// async fn test_response() {
 ///     let mut app = test::init_service(
 ///         App::new()
-///             .service(web::resource("/test").to(|| async {
+///             .service(web::resource("/test").to(async || {
 ///                 HttpResponse::Ok()
 ///             }))
 ///     ).await;
@@ -112,10 +162,10 @@ where
 ///     assert_eq!(resp.status(), StatusCode::OK);
 /// }
 /// ```
-pub async fn call_service<S, R, E>(app: &Pipeline<S>, req: R) -> S::Response
+pub async fn call_service<R, E>(app: &Pipeline<R, Response, E>, req: R) -> Response
 where
-    S: Service<R, Response = WebResponse, Error = E>,
-    E: std::fmt::Debug,
+    R: 'static,
+    E: fmt::Debug + 'static,
 {
     app.call(req).await.unwrap()
 }
@@ -131,7 +181,7 @@ where
 ///     let mut app = test::init_service(
 ///         App::new().service(
 ///             web::resource("/index.html")
-///                 .route(web::post().to(|| async {
+///                 .route(web::post().to(async || {
 ///                     HttpResponse::Ok().body("welcome!")
 ///                 })))
 ///     ).await;
@@ -145,9 +195,9 @@ where
 ///     assert_eq!(result, Bytes::from_static(b"welcome!"));
 /// }
 /// ```
-pub async fn read_response<S>(app: &Pipeline<S>, req: Request) -> Bytes
+pub async fn read_response<E>(app: &Pipeline<Request, Response, E>, req: Request) -> Bytes
 where
-    S: Service<Request, Response = WebResponse>,
+    E: 'static,
 {
     let mut resp = app
         .call(req)
@@ -173,7 +223,7 @@ where
 ///     let mut app = test::init_service(
 ///         App::new().service(
 ///             web::resource("/index.html")
-///                 .route(web::post().to(|| async {
+///                 .route(web::post().to(async || {
 ///                     HttpResponse::Ok().body("welcome!")
 ///                 })))
 ///     ).await;
@@ -184,12 +234,12 @@ where
 ///         .to_request();
 ///
 ///     let resp = test::call_service(&mut app, req).await;
-///     let result = test::read_body(resp);
+///     let result = test::read_body(resp).await;
 ///     assert_eq!(result, Bytes::from_static(b"welcome!"));
 /// }
 /// ```
-pub async fn read_body(mut res: WebResponse) -> Bytes {
-    let mut body = res.take_body();
+pub async fn read_body(res: impl Into<Response>) -> Bytes {
+    let mut body = res.into().take_body();
     let mut bytes = BytesMut::new();
     while let Some(item) = stream_recv(&mut body).await {
         bytes.extend_from_slice(&item.unwrap());
@@ -227,9 +277,9 @@ where
 ///     let mut app = test::init_service(
 ///         App::new().service(
 ///             web::resource("/people")
-///                 .route(web::post().to(|person: web::Json<Person>| async {
+///                 .route(web::post().to(async |person: web::types::Json<Person>| {
 ///                     HttpResponse::Ok()
-///                         .json(person.into_inner())})
+///                         .json(&person.into_inner())})
 ///                     ))
 ///     ).await;
 ///
@@ -238,38 +288,35 @@ where
 ///     let req = test::TestRequest::post()
 ///         .uri("/people")
 ///         .header(header::CONTENT_TYPE, "application/json")
-///         .set_payload(payload)
+///         .payload(payload)
 ///         .to_request();
 ///
 ///     let result: Person = test::read_response_json(&mut app, req).await;
 /// }
 /// ```
-pub async fn read_response_json<S, T>(app: &Pipeline<S>, req: Request) -> T
+pub async fn read_response_json<T, E>(app: &Pipeline<Request, Response, E>, req: Request) -> T
 where
-    S: Service<Request, Response = WebResponse>,
     T: DeserializeOwned,
+    E: 'static,
 {
-    let body = read_response::<S>(app, req).await;
+    let body = read_response(app, req).await;
 
-    serde_json::from_slice(&body).unwrap_or_else(|e| {
-        panic!("read_response_json failed during deserialization, {e:?}")
-    })
+    serde_json::from_slice(&body)
+        .unwrap_or_else(|e| panic!("read_response_json failed during deserialization, {e:?}"))
 }
 
 /// Helper method for extractors testing
-pub async fn from_request<T: FromRequest<DefaultError>>(
+pub async fn from_request<St, T: FromRequest<St>>(
+    st: &St,
     req: &HttpRequest,
     payload: &mut Payload,
 ) -> Result<T, T::Error> {
-    T::from_request(req, payload).await
+    T::from_request(st, req, payload).await
 }
 
 /// Helper method for responders testing
-pub async fn respond_to<T: Responder<DefaultError>>(
-    slf: T,
-    req: &HttpRequest,
-) -> HttpResponse {
-    T::respond_to(slf, req).await
+pub async fn respond_to<T: Responder>(slf: T, req: &HttpRequest) -> HttpResponse {
+    T::respond_to(slf, &(), req).await
 }
 
 /// Test `Request` builder.
@@ -286,7 +333,7 @@ pub async fn respond_to<T: Responder<DefaultError>>(
 /// use ntex::web::{self, test, HttpRequest, HttpResponse};
 ///
 /// async fn index(req: HttpRequest) -> HttpResponse {
-///     if let Some(hdr) = req.headers().get(header::CONTENT_TYPE) {
+///     if req.headers().contains_key(header::CONTENT_TYPE) {
 ///         HttpResponse::Ok().into()
 ///     } else {
 ///         HttpResponse::BadRequest().into()
@@ -298,22 +345,22 @@ pub async fn respond_to<T: Responder<DefaultError>>(
 ///     let req = test::TestRequest::with_header("content-type", "text/plain")
 ///         .to_http_request();
 ///
-///     let resp = index(req).await.unwrap();
+///     let resp = index(req).await;
 ///     assert_eq!(resp.status(), StatusCode::OK);
 ///
 ///     let req = test::TestRequest::default().to_http_request();
-///     let resp = index(req).await.unwrap();
+///     let resp = index(req).await;
 ///     assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
 /// }
 /// ```
 #[derive(Debug)]
-pub struct TestRequest {
+pub struct TestRequest<St = ()> {
     req: HttpTestRequest,
     rmap: ResourceMap,
-    config: SharedCfg,
-    path: Path<Uri>,
+    path: Path<Url>,
     peer_addr: Option<SocketAddr>,
-    app_state: Extensions,
+    state: St,
+    config: WebAppConfig,
 }
 
 impl Default for TestRequest {
@@ -321,15 +368,14 @@ impl Default for TestRequest {
         TestRequest {
             req: HttpTestRequest::default(),
             rmap: ResourceMap::new(ResourceDef::new("")),
-            config: SharedCfg::default(),
-            path: Path::new(Uri::default()),
+            path: Path::new(Url::new()),
             peer_addr: None,
-            app_state: Extensions::new(),
+            state: (),
+            config: WebAppConfig::new(),
         }
     }
 }
 
-#[allow(clippy::wrong_self_convention)]
 impl TestRequest {
     #[must_use]
     /// Create `TestRequest` and set request uri.
@@ -377,7 +423,9 @@ impl TestRequest {
     pub fn delete() -> TestRequest {
         TestRequest::default().method(Method::DELETE)
     }
+}
 
+impl<St> TestRequest<St> {
     #[must_use]
     /// Set HTTP version of this request.
     pub fn version(mut self, ver: Version) -> Self {
@@ -431,6 +479,9 @@ impl TestRequest {
 
     #[must_use]
     /// Set peer addr.
+    ///
+    /// The address is returned by `peer_addr()` of the generated request.
+    /// Requests with a peer address must be created inside the ntex runtime.
     pub fn peer_addr(mut self, addr: SocketAddr) -> Self {
         self.peer_addr = Some(addr);
         self
@@ -438,7 +489,7 @@ impl TestRequest {
 
     #[must_use]
     /// Set request payload.
-    pub fn set_payload<B: Into<Bytes>>(mut self, data: B) -> Self {
+    pub fn payload<B: Into<Bytes>>(mut self, data: B) -> Self {
         self.req.set_payload(data);
         self
     }
@@ -447,7 +498,7 @@ impl TestRequest {
     /// Serialize `data` to a URL encoded form and set it as the request payload.
     ///
     /// The `Content-Type` header is set to `application/x-www-form-urlencoded`.
-    pub fn set_form<T: Serialize>(mut self, data: &T) -> Self {
+    pub fn form<T: Serialize>(mut self, data: &T) -> Self {
         let bytes = serde_urlencoded::to_string(data)
             .expect("Failed to serialize test data as a urlencoded form");
         self.req.set_payload(bytes);
@@ -460,20 +511,33 @@ impl TestRequest {
     /// Serialize `data` to JSON and set it as the request payload.
     ///
     /// The `Content-Type` header is set to `application/json`.
-    pub fn set_json<T: Serialize>(mut self, data: &T) -> Self {
-        let bytes =
-            serde_json::to_string(data).expect("Failed to serialize test data to json");
+    pub fn json<T: Serialize>(mut self, data: &T) -> Self {
+        let bytes = serde_json::to_string(data).expect("Failed to serialize test data to json");
         self.req.set_payload(bytes);
         self.req.header(CONTENT_TYPE, "application/json");
         self
     }
 
     #[must_use]
-    /// Set application data.
+    /// Set request state.
+    pub fn state<NewSt: 'static>(self, state: NewSt) -> TestRequest<NewSt> {
+        TestRequest {
+            state,
+            req: self.req,
+            rmap: self.rmap,
+            path: self.path,
+            peer_addr: self.peer_addr,
+            config: self.config,
+        }
+    }
+
+    #[must_use]
+    /// Set application state.
     ///
-    /// This is equivalent of `App::data()` method for testing purpose.
-    pub fn state<T: 'static>(mut self, data: T) -> Self {
-        self.app_state.insert(data);
+    /// This is equivalent of [`WebAppConfig::set_state()`] method for testing
+    /// purpose. The value is available via `HttpRequest::app_state()`.
+    pub fn app_state<T: Send + Sync + 'static>(mut self, data: T) -> Self {
+        self.config = self.config.set_state(data);
         self
     }
 
@@ -488,23 +552,22 @@ impl TestRequest {
     #[must_use]
     /// Complete request creation and generate `Request` instance.
     pub fn to_request(mut self) -> Request {
-        self.req.finish()
+        self.req.build()
     }
 
     #[must_use]
     /// Complete request creation and generate `WebRequest` instance.
-    pub fn to_srv_request(mut self) -> WebRequest<DefaultError> {
-        let (head, payload) = self.req.finish().into_parts();
+    pub fn to_srv_request(mut self) -> WebRequest<St> {
+        let (mut head, payload) = self.req.build().into_parts();
+        set_peer_addr(&mut head, self.peer_addr);
         *self.path.get_mut() = head.uri.clone();
-        let app_state = AppState::new(self.app_state, None, self.config.get());
+        let cfg = SharedCfg::new("TEST").add(self.config).build();
 
-        WebRequest::new(HttpRequest::new(
-            self.path,
-            head,
+        WebRequest::new(
+            HttpRequest::new(self.path, head, Rc::new(self.rmap), cfg.get()),
             payload,
-            Rc::new(self.rmap),
-            app_state,
-        ))
+            self.state,
+        )
     }
 
     #[must_use]
@@ -516,29 +579,25 @@ impl TestRequest {
     #[must_use]
     /// Complete request creation and generate `HttpRequest` instance.
     pub fn to_http_request(mut self) -> HttpRequest {
-        let (head, payload) = self.req.finish().into_parts();
+        let (mut head, _) = self.req.build().into_parts();
+        set_peer_addr(&mut head, self.peer_addr);
         *self.path.get_mut() = head.uri.clone();
-        let app_state = AppState::new(self.app_state, None, self.config.get());
+        let cfg = SharedCfg::new("TEST").add(self.config).build();
 
-        HttpRequest::new(self.path, head, payload, Rc::new(self.rmap), app_state)
+        HttpRequest::new(self.path, head, Rc::new(self.rmap), cfg.get())
     }
 
     #[must_use]
     /// Complete request creation and generate `HttpRequest` and `Payload` instances.
-    pub fn to_http_parts(mut self) -> (HttpRequest, Payload) {
-        let (head, payload) = self.req.finish().into_parts();
+    pub fn to_http_parts(mut self) -> (HttpRequest, Payload, St) {
+        let (mut head, payload) = self.req.build().into_parts();
+        set_peer_addr(&mut head, self.peer_addr);
         *self.path.get_mut() = head.uri.clone();
-        let app_state = AppState::new(self.app_state, None, self.config.get());
+        let cfg = SharedCfg::new("TEST").add(self.config).build();
 
-        let req = HttpRequest::new(
-            self.path,
-            head,
-            Payload::None,
-            Rc::new(self.rmap),
-            app_state,
-        );
+        let req = HttpRequest::new(self.path, head, Rc::new(self.rmap), cfg.get());
 
-        (req, payload)
+        (req, payload, self.state)
     }
 }
 
@@ -558,8 +617,8 @@ impl TestRequest {
 ///
 /// #[ntex::test]
 /// async fn test_example() {
-///     let mut srv = test::server(
-///         || App::new().service(
+///     let srv = test::server(
+///         async |_| App::new().service(
 ///                 web::resource("/").to(my_handler))
 ///     );
 ///
@@ -568,17 +627,16 @@ impl TestRequest {
 ///     assert!(response.status().is_success());
 /// }
 /// ```
-pub async fn server<F, I, S, B>(factory: F) -> TestServer
+pub fn server<F, I, Sf>(factory: F) -> TestServer
 where
-    F: AsyncFn() -> I + Send + Clone + 'static,
-    I: IntoServiceFactory<S, Request, SharedCfg>,
-    S: ServiceFactory<Request, SharedCfg> + 'static,
-    S::Error: ResponseError,
-    S::InitError: fmt::Debug,
-    S::Response: Into<HttpResponse<B>>,
-    B: MessageBody + 'static,
+    F: AsyncFn(&()) -> I + Send + Clone + 'static,
+    I: IntoServiceFactory<Sf, (), Request>,
+    Sf: ServiceFactory<(), Request> + 'static,
+    Sf::Res: Into<Response>,
+    Sf::Error: ResponseError,
+    Sf::InitError: fmt::Debug,
 {
-    server_with(TestServerConfig::default(), factory).await
+    server_with(TestServerConfig::default(), factory)
 }
 
 /// Start test server with custom configuration
@@ -597,7 +655,7 @@ where
 ///
 /// #[ntex::test]
 /// async fn test_example() {
-///     let mut srv = test::server_with(test::config().h1().port(4000), ||
+///     let srv = test::server_with(test::config().h1(), async |_|
 ///         App::new().service(web::resource("/").to(my_handler))
 ///     );
 ///
@@ -606,16 +664,75 @@ where
 ///     assert!(response.status().is_success());
 /// }
 /// ```
-pub async fn server_with<F, I, S, B>(cfg: TestServerConfig, factory: F) -> TestServer
+pub fn server_with<F, I, Sf>(cfg: TestServerConfig, factory: F) -> TestServer
 where
-    F: AsyncFn() -> I + Send + Clone + 'static,
-    I: IntoServiceFactory<S, Request, SharedCfg>,
-    S: ServiceFactory<Request, SharedCfg> + 'static,
-    S::Error: ResponseError,
-    S::InitError: fmt::Debug,
-    S::Response: Into<HttpResponse<B>>,
-    B: MessageBody + 'static,
+    F: AsyncFn(&()) -> I + Send + Clone + 'static,
+    I: IntoServiceFactory<Sf, (), Request>,
+    Sf: ServiceFactory<(), Request> + 'static,
+    Sf::Res: Into<Response>,
+    Sf::Error: ResponseError + 'static,
+    Sf::InitError: fmt::Debug,
 {
+    // Type-erase the application factory, so the HTTP server stacks below
+    // are compiled once instead of once per test application.
+    let factory = Mutex::new(factory);
+    let factory: AppFactory = Arc::new(move || {
+        let factory = factory.lock().unwrap().clone();
+        Box::pin(async move {
+            boxed::factory(
+                factory(&())
+                    .await
+                    .into_factory()
+                    .map(Into::into)
+                    .map_err(AppError::new)
+                    .map_init_err(|e| io::Error::other(format!("{e:?}"))),
+            )
+        })
+    });
+    start_server(cfg, factory)
+}
+
+type AppFactory = Arc<
+    dyn Fn() -> Pin<
+            Box<dyn Future<Output = BoxServiceFactory<(), Request, Response, AppError, io::Error>>>,
+        > + Send
+        + Sync,
+>;
+
+/// Type-erased application error
+struct AppError(Box<dyn ResponseError>);
+
+impl AppError {
+    fn new<E: ResponseError + 'static>(err: E) -> Self {
+        AppError(Box::new(err))
+    }
+}
+
+impl fmt::Debug for AppError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        fmt::Debug::fmt(&self.0, f)
+    }
+}
+
+impl fmt::Display for AppError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        fmt::Display::fmt(&self.0, f)
+    }
+}
+
+impl std::error::Error for AppError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        self.0.source()
+    }
+}
+
+impl ResponseError for AppError {
+    fn error_response(&self) -> Response {
+        self.0.error_response()
+    }
+}
+
+fn start_server(cfg: TestServerConfig, factory: AppFactory) -> TestServer {
     let sys = System::current().config();
     let name = System::current().name().to_string();
 
@@ -634,13 +751,13 @@ where
     // run server in separate thread
     thread::spawn(move || {
         let sys = System::with_config(&name, sys);
+        let factory = async move |&(): &()| factory().await;
 
-        let factory = factory.clone();
         let ctimeout = cfg.client_timeout;
         let port = cfg.port;
         let tcp = cfg
             .listener
-            .unwrap_or(net::TcpListener::bind(format!("127.0.0.1:{port}")).unwrap());
+            .unwrap_or_else(|| net::TcpListener::bind(format!("127.0.0.1:{port}")).unwrap());
         let local_addr = tcp.local_addr().unwrap();
 
         sys.run(move || {
@@ -652,50 +769,10 @@ where
                 #[cfg(feature = "rustls")]
                 StreamType::Rustls(_) => true,
             };
-
-            let srv = match cfg.stream {
-                StreamType::Tcp => match cfg.tp {
-                    HttpVer::Http1 => builder.listen("test", tcp, async move |_| {
-                        HttpService::h1(factory().await)
-                    }),
-                    HttpVer::Http2 => builder.listen("test", tcp, async move |_| {
-                        HttpService::h2(factory().await)
-                    }),
-                    HttpVer::Both => builder.listen("test", tcp, async move |_| {
-                        HttpService::new(factory().await)
-                    }),
-                },
-                #[cfg(feature = "openssl")]
-                StreamType::Openssl(acceptor) => match cfg.tp {
-                    HttpVer::Http1 => builder.listen("test", tcp, async move |_| {
-                        HttpService::h1(factory().await).openssl(acceptor.clone())
-                    }),
-                    HttpVer::Http2 => builder.listen("test", tcp, async move |_| {
-                        HttpService::h2(factory().await).openssl(acceptor.clone())
-                    }),
-                    HttpVer::Both => builder.listen("test", tcp, async move |_| {
-                        HttpService::new(factory().await).openssl(acceptor.clone())
-                    }),
-                },
-                #[cfg(feature = "rustls")]
-                StreamType::Rustls(config) => match cfg.tp {
-                    HttpVer::Http1 => builder.listen("test", tcp, async move |_| {
-                        HttpService::h1(factory().await).rustls(config.clone())
-                    }),
-                    HttpVer::Http2 => builder.listen("test", tcp, async move |_| {
-                        HttpService::h2(factory().await).rustls(config.clone())
-                    }),
-                    HttpVer::Both => builder.listen("test", tcp, async move |_| {
-                        HttpService::new(factory().await).rustls(config.clone())
-                    }),
-                },
-            }
-            .unwrap()
-            .config(
-                "test",
+            let c = cfg.srv_cfg.clone().unwrap_or_else(|| {
                 SharedCfg::new("WEB-SRV")
                     .add(IoConfig::new())
-                    .add(HttpServiceConfig::new().set_headers_read_rate(
+                    .add(http::HttpServiceConfig::new().set_headers_read_rate(
                         ctimeout,
                         Seconds::ZERO,
                         256,
@@ -705,8 +782,60 @@ where
                         secure,
                         local_addr,
                         format!("{local_addr}"),
-                    )),
-            )
+                    ))
+                    .into()
+            });
+
+            let srv = match cfg.stream {
+                StreamType::Tcp => match cfg.tp {
+                    HttpVer::Http1 => builder.listen("test", tcp, c, async move |st| {
+                        HttpService::h1(factory(st).await)
+                    }),
+                    HttpVer::Http2 => builder.listen("test", tcp, c, async move |st| {
+                        HttpService::h2(factory(st).await)
+                    }),
+                    HttpVer::Both => builder.listen("test", tcp, c, async move |st| {
+                        HttpService::new(factory(st).await)
+                    }),
+                },
+                #[cfg(feature = "openssl")]
+                StreamType::Openssl(acceptor) => match cfg.tp {
+                    HttpVer::Http1 => builder.listen("test", tcp, c, async move |st| {
+                        http::openssl(acceptor.clone(), HttpService::h1(factory(st).await))
+                    }),
+                    HttpVer::Http2 => builder.listen("test", tcp, c, async move |st| {
+                        http::openssl(acceptor.clone(), HttpService::h2(factory(st).await))
+                    }),
+                    HttpVer::Both => builder.listen("test", tcp, c, async move |st| {
+                        http::openssl(acceptor.clone(), HttpService::new(factory(st).await))
+                    }),
+                },
+                #[cfg(feature = "rustls")]
+                StreamType::Rustls(config) => match cfg.tp {
+                    HttpVer::Http1 => builder.listen("test", tcp, c, async move |st| {
+                        http::rustls(
+                            config.clone(),
+                            http::ALPN_PROTO_H1,
+                            HttpService::h1(factory(st).await),
+                        )
+                    }),
+                    HttpVer::Http2 => builder.listen("test", tcp, c, async move |st| {
+                        http::rustls(
+                            config.clone(),
+                            http::ALPN_PROTO_H2,
+                            HttpService::h2(factory(st).await),
+                        )
+                    }),
+                    HttpVer::Both => builder.listen("test", tcp, c, async move |st| {
+                        http::rustls(
+                            config.clone(),
+                            http::ALPN_PROTOS,
+                            HttpService::new(factory(st).await),
+                        )
+                    }),
+                },
+            }
+            .unwrap()
             .run();
 
             tx.send((System::current(), srv, local_addr)).unwrap();
@@ -714,44 +843,48 @@ where
         })
     });
     let (system, server, addr) = rx.recv().unwrap();
-    sleep(Millis(25)).await;
+    thread::sleep(Millis(25).into());
 
-    let cfg: SharedCfg = SharedCfg::new("TEST-CLIENT")
-        .add(IoConfig::new().set_connect_timeout(Millis(90_000)))
-        .add(ntex_tls::TlsConfig::new().set_handshake_timeout(Seconds(5)))
-        .add(
-            ntex_h2::ServiceConfig::new()
-                .set_max_header_list_size(256 * 1024)
-                .set_max_header_continuation_frames(96),
-        )
-        .into();
+    let cfg = cfg.client_cfg.clone().unwrap_or_else(|| {
+        SharedCfg::new("TEST-CLIENT")
+            .add(IoConfig::new().set_connect_timeout(Millis(90_000)))
+            .add(ntex_tls::TlsConfig::new().set_handshake_timeout(Seconds(5)))
+            .add(
+                ntex_h2::ServiceConfig::new()
+                    .set_max_header_list_size(256 * 1024)
+                    .set_max_header_continuation_frames(96),
+            )
+            .add(
+                ClientConfig::new()
+                    .set_response_timeout(Seconds(30))
+                    .set_response_payload_timeout(Seconds(30)),
+            )
+            .add(
+                WsClientConfig::new()
+                    .set_address(addr)
+                    .set_handshake_timeout(Seconds(60)),
+            )
+            .build()
+    });
 
     let client = {
-        let connector = {
-            #[cfg(feature = "openssl")]
-            {
-                use tls_openssl::ssl::{SslConnector, SslMethod, SslVerifyMode};
+        #[cfg(feature = "openssl")]
+        {
+            use tls_openssl::ssl::{SslConnector, SslMethod, SslVerifyMode};
 
-                let mut builder = SslConnector::builder(SslMethod::tls()).unwrap();
-                builder.set_verify(SslVerifyMode::NONE);
-                let _ = builder
-                    .set_alpn_protos(b"\x02h2\x08http/1.1")
-                    .map_err(|e| log::error!("Cannot set alpn protocol: {e:?}"));
-                Connector::default()
-                    .lifetime(Seconds::ZERO)
-                    .openssl(builder.build())
-            }
-            #[cfg(not(feature = "openssl"))]
-            {
-                Connector::default().lifetime(Seconds::ZERO)
-            }
-        };
-
-        Client::builder()
-            .connector::<&str>(connector)
-            .build(cfg.clone())
-            .await
-            .unwrap()
+            let mut builder = SslConnector::builder(SslMethod::tls()).unwrap();
+            builder.set_verify(SslVerifyMode::NONE);
+            let _ = builder
+                .set_alpn_protos(b"\x02h2\x08http/1.1")
+                .map_err(|e| log::error!("Cannot set alpn protocol: {e:?}"));
+            Client::builder()
+                .openssl(builder.build())
+                .build(cfg.clone())
+        }
+        #[cfg(not(feature = "openssl"))]
+        {
+            Client::builder().build(cfg.clone())
+        }
     };
 
     TestServer {
@@ -773,6 +906,8 @@ pub struct TestServerConfig {
     client_timeout: Seconds,
     port: u16,
     listener: Option<net::TcpListener>,
+    srv_cfg: Option<SharedCfg>,
+    client_cfg: Option<SharedCfg>,
 }
 
 #[derive(Clone, Debug)]
@@ -826,6 +961,8 @@ impl TestServerConfig {
             client_timeout: Seconds(5),
             port: 0,
             listener: None,
+            srv_cfg: None,
+            client_cfg: None,
         }
     }
 
@@ -874,8 +1011,25 @@ impl TestServerConfig {
     }
 
     #[must_use]
+    /// Use an already bound TCP listener for the test server.
+    ///
+    /// When set, the configured port is ignored.
     pub fn listener(mut self, listener: net::TcpListener) -> Self {
         self.listener = Some(listener);
+        self
+    }
+
+    #[must_use]
+    /// Use custom `SharedCfg` for test server.
+    pub fn server_cfg(mut self, cfg: impl Into<SharedCfg>) -> Self {
+        self.srv_cfg = Some(cfg.into());
+        self
+    }
+
+    #[must_use]
+    /// Use custom `SharedCfg` for client.
+    pub fn client_cfg(mut self, cfg: impl Into<SharedCfg>) -> Self {
+        self.client_cfg = Some(cfg.into());
         self
     }
 }
@@ -893,7 +1047,7 @@ pub struct TestServer {
 }
 
 impl TestServer {
-    /// Construct test server url
+    /// Returns the test server's socket address.
     pub fn addr(&self) -> net::SocketAddr {
         self.addr
     }
@@ -944,62 +1098,63 @@ impl TestServer {
         self.client.options(self.url(path.as_ref()).as_str())
     }
 
-    /// Connect to test http server
+    /// Create `QUERY` request
+    pub fn query<S: AsRef<str>>(&self, path: S) -> ClientRequest {
+        self.client.query(self.url(path.as_ref()).as_str())
+    }
+
+    /// Create client request with the specified method
+    ///
+    /// A relative `path` is resolved against the test server url, an absolute
+    /// url (containing `://`) is used as is.
     pub fn request<S: AsRef<str>>(&self, method: Method, path: S) -> ClientRequest {
-        self.client.request(method, path.as_ref())
+        let path = path.as_ref();
+        if path.contains("://") {
+            self.client.request(method, path)
+        } else {
+            self.client.request(method, self.url(path).as_str())
+        }
     }
 
     /// Load response's body
-    pub async fn load_body(&self, response: ClientResponse) -> Result<Bytes, PayloadError> {
+    pub async fn load_body(
+        &self,
+        response: ClientResponse,
+    ) -> Result<Bytes, Error<ClientPayloadError>> {
         response.body().limit(10_485_760).await
     }
 
     #[cfg(feature = "ws")]
     /// Connect to websocket server at a given path
-    pub async fn ws_at(&self, path: &str) -> Result<WsConnection<Sealed>, WsClientError> {
+    pub async fn ws_at(&self, path: &str) -> Result<WsConnection<Sealed>, Error<WsClientError>> {
+        #[cfg(feature = "openssl")]
         if self.ssl {
-            #[cfg(feature = "openssl")]
-            {
-                use tls_openssl::ssl::{SslConnector, SslMethod, SslVerifyMode};
+            use tls_openssl::ssl::{SslConnector, SslMethod, SslVerifyMode};
 
-                let mut builder = SslConnector::builder(SslMethod::tls()).unwrap();
-                builder.set_verify(SslVerifyMode::NONE);
-                let _ = builder
-                    .set_alpn_protos(b"\x08http/1.1")
-                    .map_err(|e| log::error!("Cannot set alpn protocol: {e:?}"));
+            let mut builder = SslConnector::builder(SslMethod::tls()).unwrap();
+            builder.set_verify(SslVerifyMode::NONE);
+            let _ = builder
+                .set_alpn_protos(b"\x08http/1.1")
+                .map_err(|e| log::error!("Cannot set alpn protocol: {e:?}"));
 
-                WsClient::builder(self.url(path))
-                    .address(self.addr)
-                    .timeout(Seconds(60))
-                    .openssl(builder.build())
-                    .take()
-                    .build(self.cfg.clone())
-                    .await
-                    .unwrap()
-                    .connect()
-                    .await
-                    .map(WsConnection::seal)
-            }
-            #[cfg(not(feature = "openssl"))]
-            {
-                panic!("openssl feature is required")
-            }
-        } else {
-            WsClient::builder(self.url(path))
-                .address(self.addr)
-                .timeout(Seconds(60))
-                .build(self.cfg.clone())
-                .await
-                .unwrap()
+            return WsClient::new(self.url(path), &self.cfg)
+                .openssl(builder.build())
                 .connect()
                 .await
-                .map(WsConnection::seal)
+                .map(WsConnection::seal);
         }
+        #[cfg(not(feature = "openssl"))]
+        assert!(!self.ssl, "openssl feature is required");
+
+        WsClient::new(self.url(path), &self.cfg)
+            .connect()
+            .await
+            .map(WsConnection::seal)
     }
 
     #[cfg(feature = "ws")]
     /// Connect to a websocket server
-    pub async fn ws(&self) -> Result<WsConnection<Sealed>, WsClientError> {
+    pub async fn ws(&self) -> Result<WsConnection<Sealed>, Error<WsClientError>> {
         self.ws_at("/").await
     }
 
@@ -1022,7 +1177,6 @@ impl Drop for TestServer {
 #[cfg(test)]
 mod tests {
     use serde::{Deserialize, Serialize};
-    use std::convert::Infallible;
 
     use super::*;
     use crate::http::{HttpMessage, header};
@@ -1034,21 +1188,21 @@ mod tests {
             .version(Version::HTTP_2)
             .header(header::DATE, "some date")
             .param("test", "123")
-            .state(20u64)
+            .app_state(20u64)
             .peer_addr("127.0.0.1:8081".parse().unwrap())
             .to_http_request();
         assert!(req.headers().contains_key(header::CONTENT_TYPE));
         assert!(req.headers().contains_key(header::DATE));
-        assert_eq!(req.peer_addr(), None);
+        assert_eq!(req.peer_addr(), Some("127.0.0.1:8081".parse().unwrap()));
         assert_eq!(&req.match_info()["test"], "123");
         assert_eq!(req.version(), Version::HTTP_2);
         let data = req.app_state::<u64>().unwrap();
         assert_eq!(*data, 20);
         assert_eq!(format!("{:?}", StreamType::Tcp), "StreamType::Tcp");
 
-        let mut req = TestRequest::with_header(header::CONTENT_TYPE, "application/json")
-            .to_srv_request();
-        let pl = req.take_payload();
+        let (_, pl, ()) = TestRequest::with_header(header::CONTENT_TYPE, "application/json")
+            .to_srv_request()
+            .into_parts();
         let res = load_stream(pl).await.unwrap();
         assert_eq!(res, &b""[..]);
     }
@@ -1058,11 +1212,9 @@ mod tests {
         let app = init_service(
             App::new().service(
                 web::resource("/index.html")
-                    .route(web::put().to(|| async { HttpResponse::Ok().body("put!") }))
-                    .route(web::patch().to(|| async { HttpResponse::Ok().body("patch!") }))
-                    .route(
-                        web::delete().to(|| async { HttpResponse::Ok().body("delete!") }),
-                    ),
+                    .route(web::put().to(async || HttpResponse::Ok().body("put!")))
+                    .route(web::patch().to(async || HttpResponse::Ok().body("patch!")))
+                    .route(web::delete().to(async || HttpResponse::Ok().body("delete!"))),
             ),
         )
         .await;
@@ -1090,13 +1242,13 @@ mod tests {
 
     #[crate::rt_test]
     async fn test_response() {
-        let app =
-            init_service(App::new().service(
-                web::resource("/index.html").route(
-                    web::post().to(|| async { HttpResponse::Ok().body("welcome!") }),
-                ),
-            ))
-            .await;
+        let app = init_service(
+            App::new().service(
+                web::resource("/index.html")
+                    .route(web::post().to(async || HttpResponse::Ok().body("welcome!"))),
+            ),
+        )
+        .await;
 
         let req = TestRequest::post()
             .uri("/index.html")
@@ -1115,11 +1267,13 @@ mod tests {
 
     #[crate::rt_test]
     async fn test_response_json() {
-        let app = init_service(App::new().service(web::resource("/people").route(
-            web::post().to(|person: web::types::Json<Person>| async {
-                HttpResponse::Ok().json(&person.into_inner())
-            }),
-        )))
+        let app = init_service(
+            App::new().service(web::resource("/people").route(web::post().to(
+                async |person: web::types::Json<Person>| {
+                    HttpResponse::Ok().json(&person.into_inner())
+                },
+            ))),
+        )
         .await;
 
         let payload = r#"{"id":"12345","name":"User name"}"#.as_bytes();
@@ -1127,7 +1281,7 @@ mod tests {
         let req = TestRequest::post()
             .uri("/people")
             .header(header::CONTENT_TYPE, "application/json")
-            .set_payload(payload)
+            .payload(payload)
             .to_request();
 
         let result: Person = read_response_json(&app, req).await;
@@ -1136,11 +1290,13 @@ mod tests {
 
     #[crate::rt_test]
     async fn test_request_response_form() {
-        let app = init_service(App::new().service(web::resource("/people").route(
-            web::post().to(|person: web::types::Form<Person>| async {
-                HttpResponse::Ok().json(&person.into_inner())
-            }),
-        )))
+        let app = init_service(
+            App::new().service(web::resource("/people").route(web::post().to(
+                async |person: web::types::Form<Person>| {
+                    HttpResponse::Ok().json(&person.into_inner())
+                },
+            ))),
+        )
         .await;
 
         let payload = Person {
@@ -1150,7 +1306,7 @@ mod tests {
 
         let req = TestRequest::post()
             .uri("/people")
-            .set_form(&payload)
+            .form(&payload)
             .to_request();
 
         assert_eq!(req.content_type(), "application/x-www-form-urlencoded");
@@ -1162,11 +1318,13 @@ mod tests {
 
     #[crate::rt_test]
     async fn test_request_response_json() {
-        let app = init_service(App::new().service(web::resource("/people").route(
-            web::post().to(|person: web::types::Json<Person>| async {
-                HttpResponse::Ok().json(&person.into_inner())
-            }),
-        )))
+        let app = init_service(
+            App::new().service(web::resource("/people").route(web::post().to(
+                async |person: web::types::Json<Person>| {
+                    HttpResponse::Ok().json(&person.into_inner())
+                },
+            ))),
+        )
         .await;
 
         let payload = Person {
@@ -1176,7 +1334,7 @@ mod tests {
 
         let req = TestRequest::post()
             .uri("/people")
-            .set_json(&payload)
+            .json(&payload)
             .to_request();
 
         assert_eq!(req.content_type(), "application/json");
@@ -1200,27 +1358,9 @@ mod tests {
             }
         }
 
-        let app = init_service(
-            App::new().service(web::resource("/index.html").to(async_with_block)),
-        )
-        .await;
-
-        let req = TestRequest::post().uri("/index.html").to_request();
-        let res = app.call(req).await.unwrap();
-        assert!(res.status().is_success());
-    }
-
-    #[crate::rt_test]
-    async fn test_server_state() {
-        async fn handler(data: web::types::State<usize>) -> crate::http::ResponseBuilder {
-            assert_eq!(*data, 10);
-            HttpResponse::Ok()
-        }
-
-        let app = init_service(App::new().state(10usize).service(
-            web::resource("/index.html").to(crate::web::dev::__assert_handler1(handler)),
-        ))
-        .await;
+        let app =
+            init_service(App::new().service(web::resource("/index.html").to(async_with_block)))
+                .await;
 
         let req = TestRequest::post().uri("/index.html").to_request();
         let res = app.call(req).await.unwrap();
@@ -1229,25 +1369,24 @@ mod tests {
 
     #[crate::rt_test]
     async fn test_test_methods() {
-        let srv = server(|| async {
+        let srv = server(async |()| {
             App::new().service(
                 web::resource("/").route((
                     web::route()
                         .method(Method::PUT)
-                        .to(|| async { HttpResponse::Ok() }),
+                        .to(async || HttpResponse::Ok()),
                     web::route()
                         .method(Method::PATCH)
-                        .to(|| async { HttpResponse::Ok() }),
+                        .to(async || HttpResponse::Ok()),
                     web::route()
                         .method(Method::DELETE)
-                        .to(|| async { HttpResponse::Ok() }),
+                        .to(async || HttpResponse::Ok()),
                     web::route()
                         .method(Method::OPTIONS)
-                        .to(|| async { HttpResponse::Ok() }),
+                        .to(async || HttpResponse::Ok()),
                 )),
             )
-        })
-        .await;
+        });
 
         assert_eq!(srv.put("/").send().await.unwrap().status(), StatusCode::OK);
         assert_eq!(
@@ -1265,6 +1404,126 @@ mod tests {
 
         let res = srv.put("").send().await.unwrap();
         assert_eq!(srv.load_body(res).await.unwrap(), Bytes::new());
+    }
+
+    #[crate::rt_test]
+    async fn test_request_state() {
+        let (_, _, st) = TestRequest::default().state(10usize).to_http_parts();
+        assert_eq!(st, 10);
+
+        let req = TestRequest::default()
+            .state(web::AppState::new(5usize))
+            .to_srv_request();
+        assert_eq!(**req.st(), 5);
+    }
+
+    #[crate::rt_test]
+    async fn test_server_config() {
+        let cfg = config()
+            .h1()
+            .port(0)
+            .client_cfg(SharedCfg::new("CUSTOM-CLIENT"));
+        let dbg = format!("{cfg:?}");
+        assert!(dbg.contains("StreamType::Tcp"), "{dbg}");
+
+        let srv = server_with(cfg, async |()| {
+            App::new().service(web::resource("/").to(async || HttpResponse::Ok()))
+        });
+        let res = srv.get("/").send().await.unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+        assert_eq!(res.version(), http::Version::HTTP_11);
+        srv.stop().await;
+    }
+
+    #[crate::rt_test]
+    async fn test_server_listener_ignores_port() {
+        // regression: the configured port was bound even if a listener is set
+        let lst = net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = lst.local_addr().unwrap();
+
+        let srv = server_with(config().port(addr.port()).listener(lst), async |()| {
+            App::new().service(web::resource("/").to(async || HttpResponse::Ok()))
+        });
+        assert_eq!(srv.addr(), addr);
+        let res = srv.get("/").send().await.unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+    }
+
+    #[cfg(feature = "openssl")]
+    fn ssl_acceptor(h2: bool) -> tls_openssl::ssl::SslAcceptor {
+        use tls_openssl::ssl::{SslAcceptor, SslFiletype, SslMethod};
+
+        let mut builder = SslAcceptor::mozilla_intermediate(SslMethod::tls()).unwrap();
+        builder
+            .set_private_key_file("./tests/key.pem", SslFiletype::PEM)
+            .unwrap();
+        builder
+            .set_certificate_chain_file("./tests/cert.pem")
+            .unwrap();
+        builder.set_alpn_select_callback(move |_, protos| {
+            if h2 && protos.windows(3).any(|w| w == b"\x02h2") {
+                Ok(b"h2")
+            } else {
+                Ok(b"http/1.1")
+            }
+        });
+        builder.build()
+    }
+
+    #[cfg(feature = "openssl")]
+    #[crate::rt_test]
+    async fn test_server_openssl() {
+        for (cfg, h2, version) in [
+            (config().h1(), false, http::Version::HTTP_11),
+            (config().h2(), true, http::Version::HTTP_2),
+            (config(), true, http::Version::HTTP_2),
+            (config(), false, http::Version::HTTP_11),
+        ] {
+            let cfg = cfg.openssl(ssl_acceptor(h2));
+            assert!(format!("{cfg:?}").contains("StreamType::Openssl"));
+
+            let srv = server_with(cfg, async |()| {
+                App::new().service(web::resource("/").to(async || HttpResponse::Ok()))
+            });
+            assert!(srv.url("/").starts_with("https://"));
+            let res = srv.get("/").send().await.unwrap();
+            assert_eq!(res.status(), StatusCode::OK);
+            assert_eq!(res.version(), version);
+        }
+    }
+
+    #[cfg(all(feature = "openssl", feature = "ws"))]
+    #[crate::rt_test]
+    async fn test_server_openssl_ws() {
+        let srv = server_with(config().h1().openssl(ssl_acceptor(false)), async |()| {
+            App::new().service(
+                web::resource("/").route(web::to(async |req: web::HttpRequest| {
+                    let _ = web::ws::start(&req, None, async |_: web::ws::Frame| {
+                        Ok::<_, io::Error>(None)
+                    })
+                    .await;
+                })),
+            )
+        });
+        assert!(srv.ws().await.is_ok());
+    }
+
+    #[cfg(feature = "rustls")]
+    #[test]
+    fn test_server_config_rustls_debug() {
+        use std::{fs::File, io::BufReader};
+
+        let cert_file = &mut BufReader::new(File::open("tests/cert.pem").unwrap());
+        let key_file = &mut BufReader::new(File::open("tests/key.pem").unwrap());
+        let cert_chain = rustls_pemfile::certs(cert_file)
+            .map(|r| r.unwrap())
+            .collect();
+        let key = rustls_pemfile::private_key(key_file).unwrap().unwrap();
+        let cfg = tls_rustls::ServerConfig::builder()
+            .with_no_client_auth()
+            .with_single_cert(cert_chain, key)
+            .unwrap();
+        assert!(format!("{:?}", config().rustls(cfg)).contains("StreamType::Rustls"));
     }
 
     #[cfg(feature = "cookie")]

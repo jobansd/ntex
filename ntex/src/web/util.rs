@@ -3,21 +3,21 @@ use std::fmt;
 
 use ntex_router::IntoPattern;
 
-use crate::http::body::MessageBody;
+use crate::error::IntoFailure;
 use crate::http::error::{BlockingError, ResponseError};
 use crate::http::header::ContentEncoding;
 use crate::http::{Method, Request, Response};
-use crate::service::{IntoServiceFactory, ServiceFactory, cfg::SharedCfg};
+use crate::server::{NoConfig, ServerAppConfig};
+use crate::service::{IntoServiceFactory, ServiceFactory};
 
-use super::error::ErrorRenderer;
 use super::extract::FromRequest;
-use super::handler::Handler;
+use super::handler::{Handler, HandlerSt};
 use super::resource::Resource;
 use super::route::Route;
 use super::scope::Scope;
 use super::server::HttpServer;
 use super::service::WebServiceAdapter;
-use super::{HttpResponse, HttpResponseBuilder};
+use super::{HttpResponse, HttpResponseBuilder, State, WebResponseError};
 
 /// Create resource for a specific path.
 ///
@@ -33,22 +33,30 @@ use super::{HttpResponse, HttpResponseBuilder};
 ///
 /// By default, each segment matches the regular expression `[^{}/]+`.
 ///
-/// You can also specify a custom regex in the form `{identifier:regex}`:
+/// You can also specify a custom regex in the form `{identifier:regex}`.
 ///
 /// For instance, to route `GET`-requests on any route matching
 /// `/users/{userid}/{friend}` and store `userid` and `friend` in
 /// the exposed `Params` object:
 ///
-/// ```rust
+/// ```rust,no_run
 /// use ntex::web;
 ///
-/// let app = web::App::new().service(
-///     web::resource("/users/{userid}/{friend}")
-///         .route(web::get().to(|| async { web::HttpResponse::Ok() }))
-///         .route(web::head().to(|| async { web::HttpResponse::MethodNotAllowed() }))
-/// );
+/// #[ntex::main]
+/// async fn main() -> std::io::Result<()> {
+///     web::server(async |_| {
+///         web::App::new().service(
+///             web::resource("/users/{userid}/{friend}")
+///                 .route(web::get().to(async || { web::HttpResponse::Ok() }))
+///                 .route(web::head().to(async || { web::HttpResponse::MethodNotAllowed() }))
+///         )
+///    })
+///    .bind("127.0.0.1:59090", ntex::SharedCfg::default())?
+///    .run()
+///    .await
+/// }
 /// ```
-pub fn resource<T: IntoPattern, Err: ErrorRenderer>(path: T) -> Resource<Err> {
+pub fn resource<St: State, In: 'static, T: IntoPattern>(path: T) -> Resource<St, In> {
     Resource::new(path)
 }
 
@@ -57,15 +65,23 @@ pub fn resource<T: IntoPattern, Err: ErrorRenderer>(path: T) -> Resource<Err> {
 /// Scopes collect multiple paths under a common path prefix.
 /// Scope path can contain variable path segments as resources.
 ///
-/// ```rust
+/// ```rust,no_run
 /// use ntex::web;
 ///
-/// let app = web::App::new().service(
-///     web::scope("/{project_id}")
-///         .service(web::resource("/path1").to(|| async { web::HttpResponse::Ok() }))
-///         .service(web::resource("/path2").to(|| async { web::HttpResponse::Ok() }))
-///         .service(web::resource("/path3").to(|| async { web::HttpResponse::MethodNotAllowed() }))
-/// );
+/// #[ntex::main]
+/// async fn main() -> std::io::Result<()> {
+///     web::server(async |_| {
+///         web::App::new().service(
+///             web::scope("/{project_id}")
+///                 .service(web::resource("/path1").to(async || { web::HttpResponse::Ok() }))
+///                 .service(web::resource("/path2").to(async || { web::HttpResponse::Ok() }))
+///                 .service(web::resource("/path3").to(async || { web::HttpResponse::MethodNotAllowed() }))
+///             )
+///    })
+///    .bind("127.0.0.1:59090", ntex::SharedCfg::default())?
+///    .run()
+///    .await
+/// }
 /// ```
 ///
 /// In the above example, three routes get added:
@@ -73,12 +89,12 @@ pub fn resource<T: IntoPattern, Err: ErrorRenderer>(path: T) -> Resource<Err> {
 ///  * `/{project_id}/path2`
 ///  * `/{project_id}/path3`
 ///
-pub fn scope<T: IntoPattern, Err: ErrorRenderer>(path: T) -> Scope<Err> {
+pub fn scope<St: State, In: 'static, T: IntoPattern>(path: T) -> Scope<St, In> {
     Scope::new(path)
 }
 
 /// Create *route* without configuration.
-pub fn route<Err: ErrorRenderer>() -> Route<Err> {
+pub fn route<St: State, U: 'static>() -> Route<St, U> {
     Route::new()
 }
 
@@ -87,16 +103,16 @@ pub fn route<Err: ErrorRenderer>() -> Route<Err> {
 /// ```rust
 /// use ntex::web;
 ///
-/// let app = web::App::new().service(
+/// let app = web::App::default().service(
 ///     web::resource("/{project_id}")
-///        .route(web::get().to(|| async { web::HttpResponse::Ok() }))
+///        .route(web::get().to(async || { web::HttpResponse::Ok() }))
 /// );
 /// ```
 ///
 /// In the above example, one `GET` route gets added:
 ///  * `/{project_id}`
 ///
-pub fn get<Err: ErrorRenderer>() -> Route<Err> {
+pub fn get<St: State, U: 'static>() -> Route<St, U> {
     method(Method::GET)
 }
 
@@ -105,16 +121,16 @@ pub fn get<Err: ErrorRenderer>() -> Route<Err> {
 /// ```rust
 /// use ntex::web;
 ///
-/// let app = web::App::new().service(
+/// let app = web::App::default().service(
 ///     web::resource("/{project_id}")
-///         .route(web::post().to(|| async { web::HttpResponse::Ok() }))
+///         .route(web::post().to(async || { web::HttpResponse::Ok() }))
 /// );
 /// ```
 ///
 /// In the above example, one `POST` route gets added:
 ///  * `/{project_id}`
 ///
-pub fn post<Err: ErrorRenderer>() -> Route<Err> {
+pub fn post<St: State, U: 'static>() -> Route<St, U> {
     method(Method::POST)
 }
 
@@ -123,16 +139,16 @@ pub fn post<Err: ErrorRenderer>() -> Route<Err> {
 /// ```rust
 /// use ntex::web;
 ///
-/// let app = web::App::new().service(
+/// let app = web::App::default().service(
 ///     web::resource("/{project_id}")
-///         .route(web::put().to(|| async { web::HttpResponse::Ok() }))
+///         .route(web::put().to(async || { web::HttpResponse::Ok() }))
 /// );
 /// ```
 ///
 /// In the above example, one `PUT` route gets added:
 ///  * `/{project_id}`
 ///
-pub fn put<Err: ErrorRenderer>() -> Route<Err> {
+pub fn put<St: State, U: 'static>() -> Route<St, U> {
     method(Method::PUT)
 }
 
@@ -141,16 +157,16 @@ pub fn put<Err: ErrorRenderer>() -> Route<Err> {
 /// ```rust
 /// use ntex::web;
 ///
-/// let app = web::App::new().service(
+/// let app = web::App::default().service(
 ///     web::resource("/{project_id}")
-///         .route(web::patch().to(|| async { web::HttpResponse::Ok() }))
+///         .route(web::patch().to(async || { web::HttpResponse::Ok() }))
 /// );
 /// ```
 ///
 /// In the above example, one `PATCH` route gets added:
 ///  * `/{project_id}`
 ///
-pub fn patch<Err: ErrorRenderer>() -> Route<Err> {
+pub fn patch<St: State, U: 'static>() -> Route<St, U> {
     method(Method::PATCH)
 }
 
@@ -159,16 +175,16 @@ pub fn patch<Err: ErrorRenderer>() -> Route<Err> {
 /// ```rust
 /// use ntex::web;
 ///
-/// let app = web::App::new().service(
+/// let app = web::App::default().service(
 ///     web::resource("/{project_id}")
-///         .route(web::delete().to(|| async { web::HttpResponse::Ok() }))
+///         .route(web::delete().to(async || { web::HttpResponse::Ok() }))
 /// );
 /// ```
 ///
 /// In the above example, one `DELETE` route gets added:
 ///  * `/{project_id}`
 ///
-pub fn delete<Err: ErrorRenderer>() -> Route<Err> {
+pub fn delete<St: State, U: 'static>() -> Route<St, U> {
     method(Method::DELETE)
 }
 
@@ -177,17 +193,35 @@ pub fn delete<Err: ErrorRenderer>() -> Route<Err> {
 /// ```rust
 /// use ntex::web;
 ///
-/// let app = web::App::new().service(
+/// let app = web::App::default().service(
 ///     web::resource("/{project_id}")
-///         .route(web::head().to(|| async { web::HttpResponse::Ok() }))
+///         .route(web::head().to(async || { web::HttpResponse::Ok() }))
 /// );
 /// ```
 ///
 /// In the above example, one `HEAD` route gets added:
 ///  * `/{project_id}`
 ///
-pub fn head<Err: ErrorRenderer>() -> Route<Err> {
+pub fn head<St: State, U: 'static>() -> Route<St, U> {
     method(Method::HEAD)
+}
+
+/// Create *route* with `QUERY` method guard.
+///
+/// ```rust
+/// use ntex::web;
+///
+/// let app = web::App::default().service(
+///     web::resource("/{project_id}")
+///         .route(web::query().to(async || { web::HttpResponse::Ok() }))
+/// );
+/// ```
+///
+/// In the above example, one `QUERY` route gets added:
+///  * `/{project_id}`
+///
+pub fn query<St: State, U: 'static>() -> Route<St, U> {
+    method(Method::QUERY)
 }
 
 /// Create *route* and add method guard.
@@ -195,55 +229,111 @@ pub fn head<Err: ErrorRenderer>() -> Route<Err> {
 /// ```rust
 /// use ntex::{http, web};
 ///
-/// let app = web::App::new().service(
+/// let app = web::App::default().service(
 ///     web::resource("/{project_id}")
-///         .route(web::method(http::Method::GET).to(|| async { web::HttpResponse::Ok() }))
+///         .route(web::method(http::Method::GET).to(async || { web::HttpResponse::Ok() }))
 /// );
 /// ```
 ///
 /// In the above example, one `GET` route gets added:
 ///  * `/{project_id}`
 ///
-pub fn method<Err: ErrorRenderer>(method: Method) -> Route<Err> {
+pub fn method<St: State, U: 'static>(method: Method) -> Route<St, U> {
     Route::default().method(method)
 }
 
-/// Create a new route and add handler.
+/// Create an unguarded route with a handler.
+///
+/// The handler receives values produced by request extractors and returns a
+/// type implementing [`Responder`](super::Responder). If extraction fails, the
+/// error is converted into a response and the handler is not called.
+///
+/// The returned route has no method or custom guards, so it matches every
+/// request considered by its resource. Add guards before the handler with
+/// helpers such as [`get()`] or with [`Route::guard()`].
 ///
 /// ```rust
 /// use ntex::web;
 ///
-/// async fn index() -> web::HttpResponse {
-///    web::HttpResponse::Ok().finish()
+/// async fn show_user(id: web::types::Path<u32>) -> String {
+///     format!("User {}", id.into_inner())
 /// }
 ///
-/// web::App::new().service(
-///     web::resource("/").route(web::to(index))
+/// web::App::default().service(
+///     web::resource("/users/{id}").route(web::to(show_user))
 /// );
 /// ```
-pub fn to<F, Args, Err>(handler: F) -> Route<Err>
+pub fn to<St, In, F, Args>(handler: F) -> Route<St, In>
 where
-    F: Handler<Args, Err> + 'static,
-    Args: FromRequest<Err> + 'static,
-    Err: ErrorRenderer,
-    Err::Container: From<Args::Error>,
+    St: State,
+    In: 'static,
+    F: Handler<St, Args> + 'static,
+    Args: FromRequest<St> + 'static,
+    Args::Error: WebResponseError<St, St::Error>,
 {
     Route::new().to(handler)
+}
+
+/// Create a new route with a state-aware handler.
+///
+/// The handler receives a shared reference to the application state, followed
+/// by the request state and any request extractors. Use [`to()`] when the
+/// handler only needs request extractors.
+///
+/// ```rust
+/// use std::convert::Infallible;
+/// use ntex::web::{self, WebRequest};
+///
+/// struct AppState {
+///     greeting: &'static str,
+/// }
+///
+/// impl web::State for AppState {
+///     type Error = web::DefaultError;
+/// }
+///
+/// async fn index(
+///     state: &AppState,
+///     request_state: usize,
+///     name: web::types::Path<String>,
+/// ) -> String {
+///     let _ = request_state;
+///     format!("{}, {}!", state.greeting, name.into_inner())
+/// }
+///
+/// web::App::<AppState>::new().service(
+///     web::resource("/{name}")
+///         .filter(async |req: WebRequest<()>| {
+///             Ok::<_, Infallible>(req.map_state(|_| 10usize))
+///         })
+///         .route(web::to_with_state(index))
+/// );
+/// ```
+pub fn to_with_state<St, In, F, Args>(handler: F) -> Route<St, In>
+where
+    St: State,
+    In: 'static,
+    F: HandlerSt<St, In, Args> + 'static,
+    Args: FromRequest<St> + 'static,
+    Args::Error: WebResponseError<St, St::Error>,
+{
+    Route::new().to_with_state(handler)
 }
 
 /// Create service adapter for a specific path.
 ///
 /// ```rust
-/// use ntex::web::{self, guard, App, HttpResponse, Error, DefaultError};
+/// use std::convert::Infallible;
+/// use ntex::web::{self, guard, App, HttpResponse, WebError};
 ///
-/// async fn my_service(req: web::WebRequest<DefaultError>) -> Result<web::WebResponse, Error> {
-///     Ok(req.into_response(HttpResponse::Ok().finish()))
+/// async fn my_service(req: web::WebRequest<()>) -> Result<web::WebResponse, Infallible> {
+///     Ok(req.into_response(HttpResponse::Ok().build()))
 /// }
 ///
-/// let app = App::new().service(
+/// let app = App::default().service(
 ///     web::service("/users/*")
 ///         .guard(guard::Header("content-type", "text/plain"))
-///         .finish(my_service)
+///         .build(my_service)
 /// );
 /// ```
 pub fn service<T: IntoPattern>(path: T) -> WebServiceAdapter {
@@ -267,29 +357,76 @@ where
 /// Create new http server with application factory.
 ///
 /// ```rust,no_run
-/// use ntex::web;
+/// use ntex::{web, SharedCfg};
 ///
 /// #[ntex::main]
 /// async fn main() -> std::io::Result<()> {
-///     web::server(
-///         async || web::App::new()
-///             .service(web::resource("/").to(|| async { web::HttpResponse::Ok() })))
-///         .bind("127.0.0.1:59090")?
+///     web::server(async |_| {
+///         web::App::new()
+///             .service(web::resource("/").to(async || { web::HttpResponse::Ok() }))
+///         })
+///         .bind("127.0.0.1:59090", SharedCfg::default())?
 ///         .run()
 ///         .await
 /// }
 /// ```
-pub fn server<F, I, S, B>(factory: F) -> HttpServer<F, I, S, B>
+pub fn server<F, I, Sf>(factory: F) -> HttpServer<NoConfig, F, I, Sf>
 where
-    F: AsyncFn() -> I + Send + Clone + 'static,
-    I: IntoServiceFactory<S, Request, SharedCfg>,
-    S: ServiceFactory<Request, SharedCfg> + 'static,
-    S::Error: ResponseError,
-    S::InitError: fmt::Debug,
-    S::Response: Into<Response<B>>,
-    B: MessageBody + 'static,
+    F: AsyncFn(&()) -> I + Send + Clone + 'static,
+    I: IntoServiceFactory<Sf, (), Request>,
+    Sf: ServiceFactory<(), Request> + 'static,
+    Sf::Res: Into<Response>,
+    Sf::Error: ResponseError,
+    Sf::InitError: IntoFailure,
 {
     HttpServer::new(factory)
+}
+
+/// Create new http server with application factory and configuration.
+///
+/// ```rust,no_run
+/// use std::io;
+/// use ntex::{web, SharedCfg};
+///
+/// #[derive(Clone)]
+/// struct AppState;
+///
+/// impl web::State for AppState {
+///     type Error = web::DefaultError;
+/// }
+///
+/// struct AppStateBuilder;
+///
+/// impl ntex::server::ServerAppConfig for AppStateBuilder {
+///     type State = AppState;
+///
+///     async fn create(&self) -> io::Result<Self::State> {
+///         Ok(AppState)
+///     }
+/// }
+///
+/// #[ntex::main]
+/// async fn main() -> io::Result<()> {
+///     web::server_with_config(AppStateBuilder, async |_| {
+///         web::App::new()
+///             .service(web::resource("/").to(async || { web::HttpResponse::Ok() }))
+///         })
+///         .bind("127.0.0.1:59090", SharedCfg::default())?
+///         .run()
+///         .await
+/// }
+/// ```
+pub fn server_with_config<Cfg, F, I, Sf>(cfg: Cfg, factory: F) -> HttpServer<Cfg, F, I, Sf>
+where
+    Cfg: ServerAppConfig,
+    F: AsyncFn(&Cfg::State) -> I + Send + Clone + 'static,
+    I: IntoServiceFactory<Sf, Cfg::State, Request>,
+    Sf: ServiceFactory<Cfg::State, Request> + 'static,
+    Sf::Res: Into<Response>,
+    Sf::Error: ResponseError,
+    Sf::InitError: IntoFailure,
+{
+    HttpServer::with_config(cfg, factory)
 }
 
 struct Enc(ContentEncoding);
@@ -322,5 +459,32 @@ impl<B> BodyEncoding for HttpResponse<B> {
     fn encoding(&mut self, encoding: ContentEncoding) -> &mut Self {
         self.extensions_mut().insert(Enc(encoding));
         self
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn body_encoding() {
+        let mut builder = HttpResponse::Ok();
+        assert_eq!(builder.get_encoding(), None);
+        builder.encoding(ContentEncoding::Gzip);
+        assert_eq!(builder.get_encoding(), Some(ContentEncoding::Gzip));
+
+        let mut res = builder.build();
+        assert_eq!(res.get_encoding(), Some(ContentEncoding::Gzip));
+        res.encoding(ContentEncoding::Identity);
+        assert_eq!(res.get_encoding(), Some(ContentEncoding::Identity));
+    }
+
+    #[crate::rt_test]
+    async fn block_canceled() {
+        let res = block(|| -> Result<(), ()> { panic!("blocking panic") }).await;
+        assert!(matches!(res, Err(BlockingError::Canceled)));
+
+        let res = block(|| Err::<(), _>("err")).await;
+        assert!(matches!(res, Err(BlockingError::Error("err"))));
     }
 }

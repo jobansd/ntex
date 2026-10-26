@@ -1,4 +1,21 @@
-//! Utility for async runtime abstraction
+//! Network transports and runtime reactor integration for ntex.
+//!
+//! This crate provides TCP and Unix domain socket connection helpers, DNS-aware
+//! connectors, and reactor implementations for native ntex, Tokio, and Compio
+//! runtimes. All transports are exposed as [`Io`] values.
+//!
+//! [`DefaultRuntime`] selects a reactor from the enabled Cargo features and the
+//! current platform.
+//!
+//! # Runtime features
+//!
+//! - `tokio` enables the Tokio reactor.
+//! - `compio` enables the Compio reactor.
+//! - `neon-polling` requires the native `polling` reactor on Unix.
+//! - `neon-uring` requires the native `io-uring` reactor on Linux.
+//!
+//! Without an explicit runtime feature, Linux tries `io-uring` and falls back to
+//! `polling`; other Unix platforms use polling and Windows always uses `IOCP`.
 #![deny(clippy::pedantic)]
 #![allow(
     clippy::clone_on_copy,
@@ -6,9 +23,10 @@
     clippy::missing_fields_in_debug,
     clippy::must_use_candidate,
     clippy::missing_errors_doc,
-    clippy::missing_panics_doc
+    clippy::missing_panics_doc,
+    clippy::unused_async_trait_impl
 )]
-use std::{io, net, net::SocketAddr, panic};
+use std::{any::Any, io, net, net::SocketAddr, panic};
 
 use ntex_io::Io;
 use ntex_rt::{BlockFuture, Driver, Runner};
@@ -23,35 +41,33 @@ pub mod polling;
 #[cfg(target_os = "linux")]
 pub mod uring;
 
-#[cfg(unix)]
+#[cfg(windows)]
+pub mod iocp;
+
+#[cfg(any(unix, windows))]
 mod helpers;
 
 #[cfg(feature = "tokio")]
 pub mod tokio;
 
 #[cfg(feature = "compio")]
-mod compio;
+pub mod compio;
 
+/// Runtime reactor used for network connection and transport operations.
 #[allow(clippy::wrong_self_convention)]
 pub trait Reactor: Driver {
+    /// Starts an asynchronous TCP connection.
     fn tcp_connect(&self, addr: net::SocketAddr, cfg: SharedCfg) -> channel::Receiver<Io>;
 
-    fn unix_connect(
-        &self,
-        addr: std::path::PathBuf,
-        cfg: SharedCfg,
-    ) -> channel::Receiver<Io>;
+    /// Starts an asynchronous Unix domain socket connection.
+    fn unix_connect(&self, addr: std::path::PathBuf, cfg: SharedCfg) -> channel::Receiver<Io>;
 
-    /// Convert std `TcpStream` to `Io`
+    /// Converts a standard-library TCP stream into an [`Io`] value.
     fn from_tcp_stream(&self, stream: net::TcpStream, cfg: SharedCfg) -> io::Result<Io>;
 
     #[cfg(unix)]
-    /// Convert std `UnixStream` to `Io`
-    fn from_unix_stream(
-        &self,
-        _: std::os::unix::net::UnixStream,
-        _: SharedCfg,
-    ) -> io::Result<Io>;
+    /// Converts a standard-library Unix stream into an [`Io`] value.
+    fn from_unix_stream(&self, _: std::os::unix::net::UnixStream, _: SharedCfg) -> io::Result<Io>;
 }
 
 #[inline]
@@ -61,7 +77,7 @@ pub async fn tcp_connect(addr: SocketAddr, cfg: SharedCfg) -> io::Result<Io> {
 }
 
 #[inline]
-/// Opens a unix stream connection.
+/// Opens a Unix domain socket connection.
 pub async fn unix_connect<'a, P>(addr: P, cfg: SharedCfg) -> io::Result<Io>
 where
     P: AsRef<std::path::Path> + 'a,
@@ -70,18 +86,15 @@ where
 }
 
 #[inline]
-/// Convert std `TcpStream` to `TcpStream`
+/// Converts a standard-library TCP stream into an [`Io`] value.
 pub fn from_tcp_stream(stream: net::TcpStream, cfg: SharedCfg) -> io::Result<Io> {
     with_current(|driver| driver.from_tcp_stream(stream, cfg))
 }
 
 #[cfg(unix)]
 #[inline]
-/// Convert std `UnixStream` to `UnixStream`
-pub fn from_unix_stream(
-    stream: std::os::unix::net::UnixStream,
-    cfg: SharedCfg,
-) -> io::Result<Io> {
+/// Converts a standard-library Unix stream into an [`Io`] value.
+pub fn from_unix_stream(stream: std::os::unix::net::UnixStream, cfg: SharedCfg) -> io::Result<Io> {
     with_current(|driver| driver.from_unix_stream(stream, cfg))
 }
 
@@ -98,108 +111,118 @@ fn with_current<T, F: FnOnce(&dyn Reactor) -> T>(f: F) -> T {
     }
 }
 
+#[allow(clippy::borrowed_box)]
+/// Sets the current reactor and runs the provided closure.
+///
+/// # Panics
+///
+/// Panics if a reactor is already active on the current thread.
+pub fn with_reactor<R, F: FnOnce() -> R>(r: &Box<dyn Reactor>, f: F) -> R {
+    #[cold]
+    fn reactor_is_set() -> ! {
+        panic!("reactor is already set");
+    }
+
+    if CURRENT_DRIVER.is_set() {
+        reactor_is_set()
+    }
+    CURRENT_DRIVER.set(r, f)
+}
+
 scoped_tls::scoped_thread_local!(static CURRENT_DRIVER: Box<dyn Reactor>);
 
-#[derive(Debug)]
+/// The default runtime.
+///
+/// Automatically selects the runtime implementation based on the
+/// configured features and the platform on which it runs.
+#[derive(Copy, Clone, Debug)]
 pub struct DefaultRuntime;
 
 impl Runner for DefaultRuntime {
-    #[allow(unused_variables)]
-    fn block_on(&self, fut: BlockFuture) {
+    #[allow(unused_variables, clippy::too_many_lines)]
+    fn block_on(&self, fut: BlockFuture) -> Result<(), Box<dyn Any + Send>> {
         #[cfg(feature = "tokio")]
         {
-            let driver: Box<dyn Reactor> = Box::new(self::tokio::TokioDriver);
+            let driver: Box<dyn Reactor> = Box::new(self::tokio::Reactor);
 
-            CURRENT_DRIVER.set(&driver, || {
-                crate::tokio::block_on(fut);
-                ntex_rt::remove_all_items();
-            });
+            with_reactor(&driver, || crate::tokio::block_on(fut));
+            Ok(())
         }
 
         #[cfg(all(feature = "compio", not(feature = "tokio")))]
         {
-            let driver: Box<dyn Reactor> = Box::new(self::compio::CompioDriver);
+            let driver: Box<dyn Reactor> = Box::new(self::compio::Reactor);
 
-            CURRENT_DRIVER.set(&driver, || {
-                crate::compio::block_on(fut);
-                ntex_rt::remove_all_items();
-            });
+            with_reactor(&driver, || crate::compio::block_on(fut));
+            Ok(())
+        }
+
+        #[cfg(all(windows, not(feature = "tokio"), not(feature = "compio")))]
+        {
+            let driver: Box<dyn Reactor> =
+                Box::new(crate::iocp::Reactor::new().expect("Cannot construct driver"));
+
+            with_reactor(&driver, || {
+                panic::catch_unwind(panic::AssertUnwindSafe(|| {
+                    let rt = ntex_rt::Runtime::new(driver.handle());
+                    rt.block_on(fut, &*driver);
+                }))
+            })
         }
 
         #[cfg(all(unix, not(feature = "tokio"), not(feature = "compio")))]
         {
             #[cfg(feature = "neon-polling")]
             {
-                let driver =
-                    crate::polling::Driver::new().expect("Cannot construct driver");
-                let driver: Box<dyn Reactor> = Box::new(driver);
+                let driver: Box<dyn Reactor> = Box::new(
+                    crate::polling::Reactor::new().expect("Cannot construct polling reactor"),
+                );
 
-                CURRENT_DRIVER.set(&driver, || {
-                    let res = panic::catch_unwind(panic::AssertUnwindSafe(|| {
+                with_reactor(&driver, || {
+                    panic::catch_unwind(panic::AssertUnwindSafe(|| {
                         let rt = ntex_rt::Runtime::new(driver.handle());
                         rt.block_on(fut, &*driver);
-                    }));
-                    if let Err(err) = res {
-                        ntex_rt::remove_all_items();
-                        panic::resume_unwind(err);
-                    } else {
-                        driver.clear();
-                        ntex_rt::remove_all_items();
-                    }
-                });
+                    }))
+                })
             }
 
             #[cfg(all(target_os = "linux", feature = "neon-uring"))]
             {
-                let driver =
-                    crate::uring::Driver::new(2048).expect("Cannot construct driver");
-                let driver: Box<dyn Reactor> = Box::new(driver);
+                let driver: Box<dyn Reactor> = Box::new(
+                    crate::uring::Reactor::new(2048).expect("Cannot construct io-uring reactor"),
+                );
 
-                CURRENT_DRIVER.set(&driver, || {
-                    let res = panic::catch_unwind(panic::AssertUnwindSafe(|| {
+                with_reactor(&driver, || {
+                    panic::catch_unwind(panic::AssertUnwindSafe(|| {
                         let rt = ntex_rt::Runtime::new(driver.handle());
                         rt.block_on(fut, &*driver);
-                    }));
-                    if let Err(err) = res {
-                        ntex_rt::remove_all_items();
-                        panic::resume_unwind(err);
-                    } else {
-                        driver.clear();
-                        ntex_rt::remove_all_items();
-                    }
-                });
+                    }))
+                })
             }
 
             #[cfg(all(not(feature = "neon-uring"), not(feature = "neon-polling")))]
             {
                 #[cfg(target_os = "linux")]
-                let driver: Box<dyn Reactor> =
-                    if let Ok(driver) = crate::uring::Driver::new(2048) {
-                        Box::new(driver)
-                    } else {
-                        Box::new(
-                            crate::polling::Driver::new().expect("Cannot construct driver"),
-                        )
-                    };
+                let driver: Box<dyn Reactor> = if let Ok(reactor) = crate::uring::Reactor::new(2048)
+                {
+                    Box::new(reactor)
+                } else {
+                    Box::new(
+                        crate::polling::Reactor::new().expect("Cannot construct io-uring reactor"),
+                    )
+                };
 
                 #[cfg(not(target_os = "linux"))]
                 let driver: Box<dyn Reactor> = Box::new(
-                    crate::polling::Driver::new().expect("Cannot construct driver"),
+                    crate::polling::Reactor::new().expect("Cannot construct polling reactor"),
                 );
 
-                CURRENT_DRIVER.set(&driver, || {
-                    let res = panic::catch_unwind(panic::AssertUnwindSafe(|| {
+                with_reactor(&driver, || {
+                    panic::catch_unwind(panic::AssertUnwindSafe(|| {
                         let rt = ntex_rt::Runtime::new(driver.handle());
                         rt.block_on(fut, &*driver);
-                    }));
-                    if let Err(err) = res {
-                        ntex_rt::remove_all_items();
-                        panic::resume_unwind(err);
-                    } else {
-                        driver.clear();
-                        ntex_rt::remove_all_items();
-                    }
-                });
+                    }))
+                })
             }
         }
     }

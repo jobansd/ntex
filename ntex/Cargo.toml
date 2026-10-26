@@ -1,6 +1,6 @@
 [package]
 name = "ntex"
-version = "3.9.6"
+version = "4.4.0"
 authors = ["ntex contributors <team@ntex.rs>"]
 description = "Framework for composable network services"
 readme = "README.md"
@@ -15,13 +15,11 @@ categories = [
 ]
 license = "MIT OR Apache-2.0"
 edition = "2024"
-rust-version = "1.88"
+rust-version = "1.97"
 
 [package.metadata.docs.rs]
-toolchain = "nightly"
-features = ["tokio", "openssl", "rustls", "compress", "cookie", "ws", "ntex-tls/rustls-ring"]
-rustc-args = ["--cfg", "docsrs_dep"]
 rustdoc-args = ["--cfg", "docsrs_dep"]
+features = ["tokio", "openssl", "rustls", "compress", "cookie", "ws", "tracker", "ntex-tls/rustls-ring"]
 
 [lib]
 name = "ntex"
@@ -39,14 +37,11 @@ openssl = ["tls_openssl", "ntex-tls/openssl"]
 # rustls support
 rustls = ["tls_rustls", "webpki-roots", "ntex-tls/rustls"]
 
-# enable compressison support
-compress = ["flate2"]
+# enable compression support
+compress = ["flate2", "zstd"]
 
 # enable cookie support
 cookie = ["coo-kie", "coo-kie/percent-encode"]
-
-# url support
-url = ["url-pkg"]
 
 # tokio runtime
 tokio = ["ntex-net/tokio"]
@@ -54,17 +49,17 @@ tokio = ["ntex-net/tokio"]
 # compio runtime
 compio = ["ntex-net/compio"]
 
-# neon runtime
-neon = []
-
 # neon polling runtime
 neon-polling = ["ntex-net/neon-polling"]
 
 # neon io-uring runtime
 neon-uring = ["ntex-net/neon-uring"]
 
+# read buffer memory attribution
+tracker = ["ntex-io/tracker", "ntex-net/tracker"]
+
 # websocket support
-ws = ["dep:sha1"]
+ws = []
 
 # disable [ntex::test] logging configuration
 no-test-logging = []
@@ -77,6 +72,7 @@ ntex-codec = { workspace = true }
 ntex-dispatcher = { workspace = true }
 ntex-error = { workspace = true }
 ntex-http = { workspace = true }
+ntex-httparse = { workspace = true }
 ntex-router = { workspace = true }
 ntex-service = { workspace = true }
 ntex-macros = { workspace = true }
@@ -88,6 +84,7 @@ ntex-io = { workspace = true }
 ntex-net = { workspace = true }
 ntex-tls = { workspace = true }
 
+atoi_simd = { workspace = true }
 base64 = { workspace = true }
 bitflags = { workspace = true }
 derive_more = { workspace = true, features = ["debug"] }
@@ -95,10 +92,9 @@ log = { workspace = true }
 pin-project-lite = { workspace = true }
 regex = { workspace = true }
 serde = { workspace = true }
-sha1 = { workspace = true, optional = true }
 env_logger = { workspace = true }
 thiserror = { workspace = true }
-nanorand = { workspace = true }
+fastrand = { workspace = true }
 variadics_please = { workspace = true }
 uuid = { workspace = true }
 
@@ -107,10 +103,9 @@ httparse = { workspace = true }
 httpdate = { workspace = true }
 encoding_rs = { workspace = true }
 mime = { workspace = true }
-percent-encoding = { workspace = true }
 serde_json = { workspace = true }
 serde_urlencoded = { workspace = true }
-url-pkg = { workspace = true, optional = true }
+urly = { workspace = true, features = ["http"] }
 coo-kie = { workspace = true, optional = true }
 
 # openssl
@@ -121,7 +116,8 @@ tls_rustls = { workspace = true, optional = true }
 webpki-roots = { workspace = true, optional = true }
 
 # compression
-flate2 = { version = "1.0", optional = true }
+flate2 = { workspace = true, optional = true }
+zstd = { workspace = true, optional = true }
 
 [dev-dependencies]
 rand = { workspace = true }
@@ -132,3 +128,6 @@ tls_openssl = { workspace = true }
 tls_rustls = { workspace = true, features = ["ring", "std"] }
 rustls-pemfile = { workspace = true }
 webpki-roots = { workspace = true }
+
+[target.'cfg(windows)'.dev-dependencies]
+ntex-tls = { workspace = true, features = ["schannel"] }

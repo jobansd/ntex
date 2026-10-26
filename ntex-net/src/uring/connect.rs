@@ -7,8 +7,8 @@ use ntex_service::cfg::SharedCfg;
 use slab::Slab;
 use socket2::{Domain, SockAddr, Socket};
 
-use super::{Driver, DriverApi, Handler, TcpStream, UnixStream, stream::StreamOps};
-use crate::channel::{self, Receiver, Sender};
+use super::{Handler, Reactor, ReactorApi, TcpStream, UnixStream, stream::StreamOps};
+use crate::channel::{self, Cancel, Receiver, Sender};
 
 #[derive(Clone)]
 pub(crate) struct ConnectOps(Rc<ConnectOpsInner>);
@@ -20,18 +20,18 @@ struct ConnectOpsHandler {
 type Operations = RefCell<Slab<(Box<SockAddr>, Socket, Sender<Io>, SharedCfg)>>;
 
 struct ConnectOpsInner {
-    api: DriverApi,
+    api: ReactorApi,
     streams: StreamOps,
     ops: Operations,
 }
 
 impl ConnectOps {
-    pub(crate) fn get(driver: &Driver) -> Self {
-        let streams = StreamOps::get(driver);
+    pub(crate) fn get(reactor: &Reactor) -> Self {
+        let streams = StreamOps::get(reactor);
 
         Arbiter::get_value(move || {
             let mut inner = None;
-            driver.register(|api| {
+            reactor.register(|api| {
                 assert!(
                     api.is_supported(opcode::Connect::CODE),
                     "opcode::Connect is required for io-uring support"
@@ -49,14 +49,7 @@ impl ConnectOps {
         })
     }
 
-    pub(crate) fn connect(
-        &self,
-        sock: Socket,
-        addr: SockAddr,
-        cfg: SharedCfg,
-    ) -> Receiver<Io> {
-        let (sender, rx) = channel::create();
-
+    pub(crate) fn connect(&self, sock: Socket, addr: SockAddr, cfg: SharedCfg) -> Receiver<Io> {
         let mut ops = self.0.ops.borrow_mut();
 
         // addr must be stable, neon submits ops at the end of rt turn
@@ -64,12 +57,22 @@ impl ConnectOps {
         let (addr_ptr, addr_len) = (addr.as_ref().as_ptr().cast(), addr.len());
 
         let fd = sock.as_raw_fd();
-        let id = ops.insert((addr, sock, sender, cfg));
-        self.0.api.submit(
-            id as u32,
-            opcode::Connect::new(Fd(fd), addr_ptr, addr_len).build(),
-        );
+        let entry = ops.vacant_entry();
+        let id = entry.key();
+        let (sender, rx) = channel::with_cancel(self.0.clone(), id as u32);
+        entry.insert((addr, sock, sender, cfg));
+        self.0.api.submit(id as u32, move |entry| {
+            opcode::Connect::new(entry, Fd(fd), addr_ptr, addr_len);
+        });
         rx
+    }
+}
+
+impl Cancel for ConnectOpsInner {
+    fn cancel(&self, id: u32) {
+        // the connect completes with a cancellation error, or is
+        // completed already and the socket is closed then
+        self.api.cancel(id);
     }
 }
 
@@ -88,6 +91,7 @@ impl Handler for ConnectOpsHandler {
         );
 
         match result {
+            Ok(_) if tx.is_canceled() => crate::helpers::close_socket(sock),
             Ok(_) => {
                 if sock.domain().is_ok_and(|d| d == Domain::UNIX) {
                     let _ = tx.send(Ok(Io::new(

@@ -1,15 +1,16 @@
-use std::{cmp, mem, ptr};
+use std::{cmp, mem};
 
 macro_rules! buf_get_impl {
     ($this:ident, $typ:tt::$conv:tt) => {{
         const SIZE: usize = mem::size_of::<$typ>();
         // try to convert directly from the bytes
         // this Option<ret> trick is to avoid keeping a borrow on self
-        // when advance() is called (mut borrow) and to call bytes() only once
+        // when advance() is called (mut borrow) and to call chunk() only once
         #[allow(clippy::ptr_as_ptr)]
-        let ret = $this.chunk().get(..SIZE).map(|src| unsafe {
-            $typ::$conv(*(std::ptr::from_ref(src) as *const [_; SIZE]))
-        });
+        let ret = $this
+            .chunk()
+            .get(..SIZE)
+            .map(|src| unsafe { $typ::$conv(*(std::ptr::from_ref(src) as *const [_; SIZE])) });
 
         if let Some(ret) = ret {
             // if the direct conversion was possible, advance and return
@@ -37,6 +38,16 @@ macro_rules! buf_get_impl {
         $this.copy_to_slice(&mut buf[mem::size_of::<$typ>() - ($len_to_read)..]);
         return $typ::from_be_bytes(buf);
     }};
+}
+
+/// Interprets the low `nbytes` bytes of `val` as a two's complement integer.
+fn sign_extend(val: u64, nbytes: usize) -> i64 {
+    if nbytes == 0 {
+        0
+    } else {
+        let shift = (8 - nbytes) * 8;
+        ((val << shift).cast_signed()) >> shift
+    }
 }
 
 /// Read bytes from a buffer.
@@ -68,7 +79,7 @@ pub trait Buf {
     /// the buffer.
     ///
     /// This value is greater than or equal to the length of the slice returned
-    /// by `bytes`.
+    /// by `chunk`.
     ///
     /// # Examples
     ///
@@ -121,7 +132,7 @@ pub trait Buf {
 
     /// Advance the internal cursor of the Buf
     ///
-    /// The next call to `bytes` will return a slice starting `cnt` bytes
+    /// The next call to `chunk` will return a slice starting `cnt` bytes
     /// further into the underlying buffer.
     ///
     /// # Examples
@@ -199,16 +210,10 @@ pub trait Buf {
         assert!(self.remaining() >= dst.len());
 
         while off < dst.len() {
-            let cnt;
-
-            unsafe {
-                let src = self.chunk();
-                cnt = cmp::min(src.len(), dst.len() - off);
-
-                ptr::copy_nonoverlapping(src.as_ptr(), dst[off..].as_mut_ptr(), cnt);
-
-                off += cnt;
-            }
+            let src = self.chunk();
+            let cnt = cmp::min(src.len(), dst.len() - off);
+            dst[off..off + cnt].copy_from_slice(&src[..cnt]);
+            off += cnt;
 
             self.advance(cnt);
         }
@@ -610,7 +615,8 @@ pub trait Buf {
     ///
     /// # Panics
     ///
-    /// This function panics if there is not enough remaining data in `self`.
+    /// This function panics if there is not enough remaining data in `self`,
+    /// or if `nbytes > 8`.
     #[inline]
     fn get_uint(&mut self, nbytes: usize) -> u64 {
         buf_get_impl!(be => self, u64, nbytes);
@@ -631,7 +637,8 @@ pub trait Buf {
     ///
     /// # Panics
     ///
-    /// This function panics if there is not enough remaining data in `self`.
+    /// This function panics if there is not enough remaining data in `self`,
+    /// or if `nbytes > 8`.
     #[inline]
     fn get_uint_le(&mut self, nbytes: usize) -> u64 {
         buf_get_impl!(le => self, u64, nbytes);
@@ -646,16 +653,18 @@ pub trait Buf {
     /// ```
     /// use ntex_bytes::Buf;
     ///
-    /// let mut buf = &b"\x01\x02\x03 hello"[..];
+    /// let mut buf = &b"\x01\x02\x03\xff\xfe"[..];
     /// assert_eq!(0x010203, buf.get_int(3));
+    /// assert_eq!(-2, buf.get_int(2));
     /// ```
     ///
     /// # Panics
     ///
-    /// This function panics if there is not enough remaining data in `self`.
+    /// This function panics if there is not enough remaining data in `self`,
+    /// or if `nbytes > 8`.
     #[inline]
     fn get_int(&mut self, nbytes: usize) -> i64 {
-        buf_get_impl!(be => self, i64, nbytes);
+        sign_extend(self.get_uint(nbytes), nbytes)
     }
 
     /// Gets a signed n-byte integer from `self` in little-endian byte order.
@@ -667,16 +676,18 @@ pub trait Buf {
     /// ```
     /// use ntex_bytes::Buf;
     ///
-    /// let mut buf = &b"\x03\x02\x01 hello"[..];
+    /// let mut buf = &b"\x03\x02\x01\xfe\xff"[..];
     /// assert_eq!(0x010203, buf.get_int_le(3));
+    /// assert_eq!(-2, buf.get_int_le(2));
     /// ```
     ///
     /// # Panics
     ///
-    /// This function panics if there is not enough remaining data in `self`.
+    /// This function panics if there is not enough remaining data in `self`,
+    /// or if `nbytes > 8`.
     #[inline]
     fn get_int_le(&mut self, nbytes: usize) -> i64 {
-        buf_get_impl!(le => self, i64, nbytes);
+        sign_extend(self.get_uint_le(nbytes), nbytes)
     }
 
     /// Gets an IEEE754 single-precision (4 bytes) floating point number from
@@ -774,7 +785,7 @@ pub trait Buf {
     /// ```
     /// use ntex_bytes::{Buf};
     ///
-    /// let bytes = "hello world".to_bytes();
+    /// let bytes = (&b"hello world"[..]).to_bytes();
     /// assert_eq!(&bytes[..], &b"hello world"[..]);
     /// ```
     #[inline]
@@ -844,30 +855,6 @@ impl Buf for &[u8] {
     }
 }
 
-impl Buf for &str {
-    #[inline]
-    fn remaining(&self) -> usize {
-        self.len()
-    }
-
-    #[inline]
-    fn chunk(&self) -> &[u8] {
-        self.as_bytes()
-    }
-
-    #[inline]
-    fn advance(&mut self, cnt: usize) {
-        *self = &self[cnt..];
-    }
-
-    #[inline]
-    fn get_u8(&mut self) -> u8 {
-        let ret = self.as_bytes()[0];
-        self.advance(1);
-        ret
-    }
-}
-
 impl<T: AsRef<[u8]>> Buf for std::io::Cursor<T> {
     fn remaining(&self) -> usize {
         let len = self.get_ref().as_ref().len();
@@ -892,12 +879,13 @@ impl<T: AsRef<[u8]>> Buf for std::io::Cursor<T> {
     }
 
     fn advance(&mut self, cnt: usize) {
-        let pos = (self.position() as usize)
-            .checked_add(cnt)
-            .expect("overflow");
+        if cnt == 0 {
+            return;
+        }
+        let pos = self.position().checked_add(cnt as u64).expect("overflow");
 
-        assert!(pos <= self.get_ref().as_ref().len());
-        self.set_position(pos as u64);
+        assert!(pos <= self.get_ref().as_ref().len() as u64);
+        self.set_position(pos);
     }
 }
 
@@ -1026,11 +1014,58 @@ mod tests {
         let mut buf = &b"\x33\x33\x33\x33\x33\x33\xF3\x3F hello"[..];
         assert_eq!(1.2f64, buf.get_f64_le());
 
-        let bytes = "hello world".to_bytes();
+        let bytes = (&b"hello world"[..]).to_bytes();
         assert_eq!(&bytes[..], &b"hello world"[..]);
+    }
 
-        let mut s = "hello world";
-        assert_eq!(s.get_u8(), b'h');
-        assert_eq!(Buf::chunk(&s), b"ello world");
+    #[test]
+    fn cursor_advance_past_end() {
+        let mut buf = std::io::Cursor::new(b"abc");
+        buf.set_position(10);
+        assert_eq!(buf.remaining(), 0);
+        assert_eq!(buf.chunk(), b"");
+        buf.advance(0);
+        assert_eq!(buf.position(), 10);
+    }
+
+    #[test]
+    #[should_panic(expected = "assertion failed")]
+    fn cursor_advance_high_position() {
+        // must not wrap to a valid offset on 32-bit targets
+        let mut buf = std::io::Cursor::new(b"abc");
+        buf.set_position((1u64 << 32) + 1);
+        buf.advance(1);
+    }
+
+    struct Chunks(Vec<&'static [u8]>);
+
+    impl Buf for Chunks {
+        fn remaining(&self) -> usize {
+            self.0.iter().map(|c| c.len()).sum()
+        }
+
+        fn chunk(&self) -> &[u8] {
+            self.0.first().copied().unwrap_or_default()
+        }
+
+        fn advance(&mut self, mut cnt: usize) {
+            while cnt > 0 {
+                let n = cnt.min(self.0[0].len());
+                self.0[0] = &self.0[0][n..];
+                if self.0[0].is_empty() {
+                    self.0.remove(0);
+                }
+                cnt -= n;
+            }
+        }
+    }
+
+    #[test]
+    fn default_methods() {
+        let mut buf = Chunks(vec![b"a", b"bc"]);
+        assert_eq!(buf.get_u8(), b'a');
+        assert_eq!(buf.get_u8(), b'b');
+        assert_eq!(buf.get_u8(), b'c');
+        assert!(!buf.has_remaining());
     }
 }

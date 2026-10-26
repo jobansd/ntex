@@ -1,10 +1,10 @@
-pub(crate) mod connect;
-mod driver;
+mod connect;
 mod io;
+mod reactor;
 mod stream;
 
-pub use self::driver::{Driver, DriverApi, Handler};
-pub use ntex_polling::{Event, PollMode};
+pub use self::reactor::{Handler, Reactor, ReactorApi};
+pub use ::ntex_polling::{Event, PollMode};
 
 #[cfg(not(target_pointer_width = "64"))]
 compile_error!("Only 64bit platforms are supported");

@@ -5,23 +5,26 @@ use std::{net, str::FromStr, sync::mpsc, thread, time};
 use coo_kie::{Cookie, CookieJar};
 
 use ntex_tls::TlsConfig;
+use urly::Url;
 use uuid::Uuid;
 
 use crate::channel::bstream;
-use crate::client::{Client, ClientRequest, ClientResponse, Connector};
+use crate::client::{
+    Client, ClientConfig, ClientRequest, ClientResponse, error::ClientPayloadError,
+};
+use crate::error::Error;
 #[cfg(feature = "ws")]
 use crate::io::Filter;
 use crate::io::{Io, IoConfig};
-use crate::server::Server;
-use crate::service::{ServiceFactory, cfg::SharedCfg};
+use crate::server::{NoConfig, Server};
+use crate::service::{IntoService, Service, cfg::SharedCfg};
 #[cfg(feature = "ws")]
-use crate::ws::{WsClient, WsConnection, error::WsClientError};
-use crate::{rt::System, time::Millis, time::Seconds, time::sleep, util::Bytes};
+use crate::ws::{WsClient, WsClientConfig, WsConnection, error::WsClientError};
+use crate::{rt::System, time::Millis, time::Seconds, util::Bytes};
 
-use super::error::{HttpError, PayloadError};
 use super::header::{self, HeaderMap, HeaderName, HeaderValue};
-use super::payload::Payload;
-use super::{Method, Request, Uri, Version};
+
+use super::{Method, Request, Version, error::HttpError, payload::Payload};
 
 #[derive(Debug)]
 /// Test `Request` builder
@@ -39,11 +42,13 @@ use super::{Method, Request, Uri, Version};
 /// }
 ///
 /// let resp = index(
-///     TestRequest::with_header("content-type", "text/plain").finish());
+///     TestRequest::with_header("content-type", "text/plain").build()
+/// );
 /// assert_eq!(resp.status(), StatusCode::OK);
 ///
 /// let resp = index(
-///     TestRequest::default().finish());
+///     TestRequest::default().build()
+/// );
 /// assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
 /// ```
 pub struct TestRequest(Option<Inner>);
@@ -52,7 +57,7 @@ pub struct TestRequest(Option<Inner>);
 struct Inner {
     version: Version,
     method: Method,
-    uri: Uri,
+    uri: Url,
     headers: HeaderMap,
     #[cfg(feature = "cookie")]
     cookies: CookieJar,
@@ -61,9 +66,16 @@ struct Inner {
 
 impl Default for TestRequest {
     fn default() -> TestRequest {
+        Self::builder()
+    }
+}
+
+impl TestRequest {
+    /// Creates a test request builder with a `GET /` request.
+    pub fn builder() -> TestRequest {
         TestRequest(Some(Inner {
             method: Method::GET,
-            uri: Uri::from_str("/").unwrap(),
+            uri: Url::new(),
             version: Version::HTTP_11,
             headers: HeaderMap::new(),
             #[cfg(feature = "cookie")]
@@ -71,9 +83,7 @@ impl Default for TestRequest {
             payload: None,
         }))
     }
-}
 
-impl TestRequest {
     #[must_use]
     /// Create `TestRequest` and set request uri.
     pub fn with_uri(path: &str) -> TestRequest {
@@ -81,7 +91,7 @@ impl TestRequest {
     }
 
     #[must_use]
-    /// Create `TestRequest` and set header.
+    /// Create `TestRequest` and append header.
     pub fn with_header<K, V>(key: K, value: V) -> TestRequest
     where
         HeaderName: TryFrom<K>,
@@ -105,11 +115,13 @@ impl TestRequest {
 
     /// Set HTTP Uri of this request.
     pub fn uri(&mut self, path: &str) -> &mut Self {
-        parts(&mut self.0).uri = Uri::from_str(path).unwrap();
+        parts(&mut self.0).uri = Url::from_str(path).unwrap();
         self
     }
 
-    /// Set a header.
+    /// Append a header.
+    ///
+    /// Existing values for the same header name are kept.
     pub fn header<K, V>(&mut self, key: K, value: V) -> &mut Self
     where
         HeaderName: TryFrom<K>,
@@ -150,7 +162,7 @@ impl TestRequest {
 
     #[must_use]
     /// Complete request creation and generate `Request` instance.
-    pub fn finish(&mut self) -> Request {
+    pub fn build(&mut self) -> Request {
         let inner = self.0.take().expect("cannot reuse test request builder");
 
         let mut req = if let Some(pl) = inner.payload {
@@ -174,19 +186,14 @@ impl TestRequest {
 
         #[cfg(feature = "cookie")]
         {
-            use percent_encoding::percent_encode;
-            use std::fmt::Write as FmtWrite;
-
-            let mut cookie = String::new();
+            let mut cookie = Vec::new();
             for c in inner.cookies.delta() {
-                let name = percent_encode(c.name().as_bytes(), super::helpers::USERINFO);
-                let value = percent_encode(c.value().as_bytes(), super::helpers::USERINFO);
-                let _ = write!(cookie, "; {name}={value}");
+                super::helpers::push_cookie(&mut cookie, c.name(), c.value());
             }
             if !cookie.is_empty() {
                 head.headers.insert(
                     super::header::COOKIE,
-                    HeaderValue::from_str(&cookie.as_str()[2..]).unwrap(),
+                    HeaderValue::from_bytes(&cookie).unwrap(),
                 );
             }
         }
@@ -208,76 +215,66 @@ fn parts(parts: &mut Option<Inner>) -> &mut Inner {
 /// # Examples
 ///
 /// ```rust
-/// use ntex::http;
-/// use ntex::web::{self, App, HttpResponse};
-///
-/// async fn my_handler() -> Result<HttpResponse, std::io::Error> {
-///     Ok(HttpResponse::Ok().into())
-/// }
+/// use ntex::http::{self, Method, Response};
 ///
 /// #[ntex::test]
 /// async fn test_example() {
-///     let mut srv = http::test::server(
-///         || http::HttpService::new(
-///             App::new().service(
-///                 web::resource("/").to(my_handler))
-///         )
-///     );
+///     let srv = http::test::server(async |_| {
+///         http::HttpService::h1(async |_| Ok::<_, std::io::Error>(Response::Ok().build()))
+///     });
 ///
-///     let req = srv.get("/");
+///     let req = srv.request(Method::GET, "/");
 ///     let response = req.send().await.unwrap();
 ///     assert!(response.status().is_success());
 /// }
 /// ```
-pub async fn server<F, R>(factory: F) -> TestServer
+pub fn server<F, S, I>(factory: F) -> TestServer
 where
-    F: AsyncFn() -> R + Send + Clone + 'static,
-    R: ServiceFactory<Io, SharedCfg> + 'static,
+    F: AsyncFn(&()) -> I + Send + Clone + 'static,
+    S: Service<(), Io> + 'static,
+    I: IntoService<S, (), Io> + 'static,
 {
-    server_with_config(
+    server_with_config::<_, _, _>(
         factory,
         SharedCfg::new("HTTP-TEST-SRV")
             .add(IoConfig::new())
             .add(TlsConfig::new())
             .add(ntex_h2::ServiceConfig::new()),
     )
-    .await
 }
 
-/// Start test server
+/// Start test server with custom configuration
 ///
-/// `TestServer` is very simple test server that simplify process of writing
-/// integration tests cases for ntex web applications.
+/// Same as [`server()`], but the server uses the provided shared configuration.
 ///
 /// # Examples
 ///
 /// ```rust
-/// use ntex::http;
-/// use ntex::web::{self, App, HttpResponse};
-///
-/// async fn my_handler() -> Result<HttpResponse, std::io::Error> {
-///     Ok(HttpResponse::Ok().into())
-/// }
+/// use ntex::http::{self, Method, Response};
+/// use ntex::{SharedCfg, io::IoConfig, time::Seconds};
 ///
 /// #[ntex::test]
 /// async fn test_example() {
-///     let mut srv = http::test::server(
-///         || http::HttpService::new(
-///             App::new().service(
-///                 web::resource("/").to(my_handler))
-///         )
+///     let srv = http::test::server_with_config(
+///         async |_| {
+///             http::HttpService::h1(async |_| {
+///                 Ok::<_, std::io::Error>(Response::Ok().build())
+///             })
+///         },
+///         SharedCfg::new("TEST-SRV")
+///             .add(IoConfig::new().set_shutdown_timeout(Seconds(1))),
 ///     );
 ///
-///     let req = srv.get("/");
+///     let req = srv.request(Method::GET, "/");
 ///     let response = req.send().await.unwrap();
 ///     assert!(response.status().is_success());
 /// }
 /// ```
-pub async fn server_with_config<F, R, U>(factory: F, cfg: U) -> TestServer
+pub fn server_with_config<F, S, I>(f: F, cfg: impl Into<SharedCfg>) -> TestServer
 where
-    F: AsyncFn() -> R + Send + Clone + 'static,
-    R: ServiceFactory<Io, SharedCfg> + 'static,
-    U: Into<SharedCfg>,
+    F: AsyncFn(&()) -> I + Send + Clone + 'static,
+    S: Service<(), Io> + 'static,
+    I: IntoService<S, (), Io> + 'static,
 {
     let sys = System::current().config();
     let name = System::current().name().to_string();
@@ -294,23 +291,22 @@ where
         let local_addr = tcp.local_addr().unwrap();
 
         sys.run(move || {
-            let srv = crate::server::build()
-                .listen("test", tcp, async move |_| factory().await)?
-                .config("test", cfg)
+            let srv = crate::server::ServerBuilder::new(NoConfig)
+                .listen("test", tcp, cfg, async move |st| f(st).await)?
                 .workers(1)
                 .disable_signals()
                 .run();
 
-            crate::rt::spawn(async move {
+            crate::rt::spawn_detached(async move {
                 tx.send((System::current(), srv, local_addr)).unwrap();
             });
             Ok(())
         })
     });
     let (system, server, addr) = rx.recv().unwrap();
-    sleep(Millis(25)).await;
+    thread::sleep(Millis(25).into());
 
-    TestServer::create(id, system, server, addr, Seconds(90), Millis(90_000)).await
+    TestServer::create(id, system, server, addr, Seconds(90), Millis(90_000))
 }
 
 #[derive(Debug)]
@@ -325,7 +321,9 @@ pub struct TestServer {
 }
 
 impl TestServer {
-    pub async fn create(
+    /// Creates a test-server controller from a running server and its client
+    /// connection settings.
+    pub fn create(
         id: Uuid,
         system: System,
         server: Server,
@@ -333,17 +331,27 @@ impl TestServer {
         timeout: Seconds,
         connect_timeout: Millis,
     ) -> Self {
-        let cfg: SharedCfg = SharedCfg::new("TEST-CLIENT")
+        let cfg = SharedCfg::new("TEST-CLIENT")
             .add(IoConfig::new().set_connect_timeout(connect_timeout))
             .add(TlsConfig::new().set_handshake_timeout(timeout))
+            .add(
+                ClientConfig::new()
+                    .set_response_timeout(Seconds(30))
+                    .set_response_payload_timeout(Seconds(30)),
+            )
             .add(
                 ntex_h2::ServiceConfig::new()
                     .set_max_header_list_size(256 * 1024)
                     .set_max_header_continuation_frames(96),
             )
-            .into();
+            .add(
+                WsClientConfig::new()
+                    .set_address(addr)
+                    .set_handshake_timeout(Seconds(30)),
+            )
+            .build();
 
-        let client = Self::create_client(cfg.clone()).await;
+        let client = Self::create_client(cfg.clone());
 
         TestServer {
             id,
@@ -355,53 +363,57 @@ impl TestServer {
         }
     }
 
-    /// Set client timeout
-    pub async fn set_client_timeout(
-        mut self,
-        timeout: Seconds,
-        connect_timeout: Millis,
-    ) -> Self {
+    #[must_use]
+    /// Sets the client timeouts.
+    ///
+    /// `timeout` controls the TLS handshake, response-header and response
+    /// payload timeouts, while `connect_timeout` controls how long the client
+    /// waits to establish a connection. By default the response timeouts are
+    /// 30 seconds.
+    pub fn set_client_timeout(mut self, timeout: Seconds, connect_timeout: Millis) -> Self {
         self.cfg = SharedCfg::new("TEST-CLIENT")
             .add(IoConfig::new().set_connect_timeout(connect_timeout))
             .add(TlsConfig::new().set_handshake_timeout(timeout))
+            .add(
+                ClientConfig::new()
+                    .set_response_timeout(timeout)
+                    .set_response_payload_timeout(timeout),
+            )
             .add(
                 ntex_h2::ServiceConfig::new()
                     .set_max_header_list_size(256 * 1024)
                     .set_max_header_continuation_frames(96),
             )
-            .into();
-        self.client = Self::create_client(self.cfg.clone()).await;
+            .add(
+                WsClientConfig::new()
+                    .set_address(self.addr)
+                    .set_handshake_timeout(Seconds(30)),
+            )
+            .build();
+        self.client = Self::create_client(self.cfg.clone());
         self
     }
 
     /// Set client timeout
-    async fn create_client(cfg: SharedCfg) -> Client {
-        let connector = {
-            #[cfg(feature = "openssl")]
-            {
-                use tls_openssl::ssl::{SslConnector, SslMethod, SslVerifyMode};
+    fn create_client(cfg: SharedCfg) -> Client {
+        #[cfg(feature = "openssl")]
+        {
+            use tls_openssl::ssl::{SslConnector, SslMethod, SslVerifyMode};
 
-                let mut builder = SslConnector::builder(SslMethod::tls()).unwrap();
-                builder.set_verify(SslVerifyMode::NONE);
-                let _ = builder
-                    .set_alpn_protos(b"\x02h2\x08http/1.1")
-                    .map_err(|e| log::error!("Cannot set alpn protocol: {e:?}"));
-                Connector::default().openssl(builder.build())
-            }
-            #[cfg(not(feature = "openssl"))]
-            {
-                Connector::default()
-            }
-        };
-
-        Client::builder()
-            .connector::<&str>(connector)
-            .build(cfg)
-            .await
-            .unwrap()
+            let mut builder = SslConnector::builder(SslMethod::tls()).unwrap();
+            builder.set_verify(SslVerifyMode::NONE);
+            let _ = builder
+                .set_alpn_protos(b"\x02h2\x08http/1.1")
+                .map_err(|e| log::error!("Cannot set alpn protocol: {e:?}"));
+            Client::builder().openssl(builder.build()).build(cfg)
+        }
+        #[cfg(not(feature = "openssl"))]
+        {
+            Client::builder().build(cfg)
+        }
     }
 
-    /// Construct test server url
+    /// Returns the test server's socket address.
     pub fn addr(&self) -> net::SocketAddr {
         self.addr
     }
@@ -437,13 +449,16 @@ impl TestServer {
     }
 
     /// Load response's body
-    pub async fn load_body(&self, response: ClientResponse) -> Result<Bytes, PayloadError> {
+    pub async fn load_body(
+        &self,
+        response: ClientResponse,
+    ) -> Result<Bytes, Error<ClientPayloadError>> {
         response.body().limit(10_485_760).await
     }
 
     #[cfg(feature = "ws")]
     /// Connect to a websocket server
-    pub async fn ws(&self) -> Result<WsConnection<impl Filter>, WsClientError> {
+    pub async fn ws(&self) -> Result<WsConnection<impl Filter>, Error<WsClientError>> {
         self.ws_at("/").await
     }
 
@@ -452,15 +467,8 @@ impl TestServer {
     pub async fn ws_at(
         &self,
         path: &str,
-    ) -> Result<WsConnection<impl Filter>, WsClientError> {
-        WsClient::builder(self.url(path))
-            .address(self.addr)
-            .timeout(Seconds(30))
-            .build(self.cfg.clone())
-            .await
-            .unwrap()
-            .connect()
-            .await
+    ) -> Result<WsConnection<impl Filter>, Error<WsClientError>> {
+        WsClient::new(self.url(path), &self.cfg).connect().await
     }
 
     #[cfg(all(feature = "openssl", feature = "ws"))]
@@ -469,7 +477,7 @@ impl TestServer {
         &self,
     ) -> Result<
         WsConnection<crate::io::Layer<crate::connect::openssl::SslFilter>>,
-        WsClientError,
+        Error<WsClientError>,
     > {
         self.wss_at("/").await
     }
@@ -481,7 +489,7 @@ impl TestServer {
         path: &str,
     ) -> Result<
         WsConnection<crate::io::Layer<crate::connect::openssl::SslFilter>>,
-        WsClientError,
+        Error<WsClientError>,
     > {
         use tls_openssl::ssl::{SslConnector, SslMethod, SslVerifyMode};
 
@@ -491,21 +499,15 @@ impl TestServer {
             .set_alpn_protos(b"\x08http/1.1")
             .map_err(|e| log::error!("Cannot set alpn protocol: {e:?}"));
 
-        WsClient::builder(self.url(path))
-            .address(self.addr)
-            .timeout(Seconds(30))
+        WsClient::new(self.url(path), &self.cfg)
             .openssl(builder.build())
-            .take()
-            .build(self.cfg.clone())
-            .await
-            .unwrap()
             .connect()
             .await
     }
 
     /// Stop http server
-    pub async fn stop(self) {
-        self.server.stop(true).await;
+    pub async fn stop(self, graceful: bool) {
+        self.server.stop(graceful).await;
     }
 }
 

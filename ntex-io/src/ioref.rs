@@ -5,8 +5,12 @@ use ntex_codec::{Decoder, Encoder};
 use ntex_service::cfg::SharedCfg;
 use ntex_util::time::Seconds;
 
+use crate::io::Close;
 use crate::ops::{Id, Iops, TimerHandle};
-use crate::{Decoded, Filter, FilterBuf, Flags, IoConfig, IoContext, IoRef, types};
+use crate::waiters::{TAG_DISCONNECT, TAG_WRITE, Waiter};
+use crate::{
+    CloseReason, Decoded, Filter, FilterBuf, Flags, Handle, IoConfig, IoContext, IoRef, types,
+};
 
 impl IoRef {
     #[inline]
@@ -22,7 +26,7 @@ impl IoRef {
     }
 
     #[doc(hidden)]
-    /// Gets the current state flags.
+    /// Gets the state flags. (for debug purpose only)
     pub fn flags(&self) -> Flags {
         self.0.flags.clone()
     }
@@ -45,16 +49,145 @@ impl IoRef {
         self.0.cfg.shared()
     }
 
+    /// Returns the tracker charged with the read buffers of the connection.
+    ///
+    /// Returns `None` if [`BufTracker::Disabled`](crate::BufTracker)
+    /// is configured. A per-connection tracker is created on first use.
+    ///
+    /// Other buffers can be attributed to the connection by charging them
+    /// to the tracker, see
+    /// [`BytesMut::with_page_size_in`](ntex_bytes::BytesMut::with_page_size_in)
+    /// and [`BytesMut::set_tracker`](ntex_bytes::BytesMut::set_tracker).
+    ///
+    /// The reference must not be used after
+    /// [`Io::set_config`](crate::Io::set_config).
+    #[cfg(feature = "tracker")]
+    #[cfg_attr(docsrs, doc(cfg(feature = "tracker")))]
+    #[must_use]
+    pub fn buf_tracker(&self) -> Option<&ntex_bytes::BytesTracker> {
+        self.0.buf_tracker()
+    }
+
+    #[inline]
+    /// Checks whether the I/O stream is active.
+    ///
+    /// This becomes `false` as soon as the connection leaves its active
+    /// state, whether it was closed locally, force-terminated, or the
+    /// transport reported the peer as gone. Closing is not instantaneous, so
+    /// buffered output may still be flushing and buffered input stays
+    /// readable after this goes `false`; use
+    /// [`is_closed`](Self::is_closed) to ask whether closing has finished.
+    pub fn is_active(&self) -> bool {
+        self.0.flags.is_active()
+    }
+
+    #[inline]
+    /// Checks whether the transport read half reached clean EOF.
+    ///
+    /// Buffered input remains available and the write half may still be used.
+    pub fn is_read_eof(&self) -> bool {
+        self.0.flags.is_read_eof()
+    }
+
     #[inline]
     /// Checks whether the I/O stream is closed.
+    ///
+    /// This becomes `true` once the backend released the underlying socket
+    /// and transport teardown has finished, so nothing further can be read
+    /// from or delivered to the peer. Every way a connection can end reaches
+    /// this state, whether it closed gracefully, was force-terminated or the
+    /// peer disappeared. Use [`is_active`](Self::is_active) to also cover a
+    /// close that is still in progress.
+    ///
+    /// Buffered input that was already received stays readable.
     pub fn is_closed(&self) -> bool {
         self.0.flags.is_closed()
     }
 
     #[inline]
+    /// Checks whether read back-pressure is enabled.
+    ///
+    /// This becomes `true` once unread data in the application-facing read
+    /// buffer reaches the configured high watermark, which parks the transport
+    /// read task.
+    ///
+    /// Two different paths release it. Consuming through
+    /// [`decode`](Self::decode), [`with_buf`](Self::with_buf),
+    /// [`with_read_src`](Self::with_read_src) or
+    /// [`with_read_dst`](Self::with_read_dst) releases it once the buffer has
+    /// fallen to at most half the high watermark. Asking for more input through
+    /// [`Io::poll_read_more`](crate::Io::poll_read_more), and the methods built
+    /// on it, releases it immediately however much data is still buffered.
+    pub fn is_rd_backpressure(&self) -> bool {
+        self.0.flags.is_rd_backpressure()
+    }
+
+    #[inline]
     /// Checks whether write back-pressure is enabled.
+    ///
+    /// This becomes `true` once outstanding output reaches the configured high
+    /// watermark. Outstanding output includes buffered data and data that the
+    /// transport owns but has not yet written to the peer. It is released once
+    /// the outstanding size falls to half the high watermark.
+    ///
+    /// Nothing enforces the signal: encoding continues to succeed while it is
+    /// set. Producers that are not driven by a dispatcher should check this
+    /// before encoding more, or the write buffer grows without bound. See
+    /// [`encode`](Self::encode) and [`write_ready`](Self::write_ready).
     pub fn is_wr_backpressure(&self) -> bool {
         self.0.flags.is_wr_backpressure()
+    }
+
+    /// Reports why the connection is closing.
+    ///
+    /// Only the first reported reason is kept. It is counted in
+    /// [`IoMetrics`](crate::IoMetrics) when the connection state is released.
+    /// A connection closed without a reason counts as an I/O error if the
+    /// transport failed, and as `other` otherwise.
+    pub fn set_close_reason(&self, reason: CloseReason) {
+        if let Close::Unset = self.0.close.get() {
+            self.0.close.set(Close::Reason(reason));
+        }
+    }
+
+    /// Returns the reason reported with [`set_close_reason`](Self::set_close_reason).
+    pub fn close_reason(&self) -> Option<CloseReason> {
+        if let Close::Reason(reason) = self.0.close.get() {
+            Some(reason)
+        } else {
+            None
+        }
+    }
+
+    #[inline]
+    /// Checks whether the filter chain is not ready, see
+    /// [`Filter::poll_ready`](crate::Filter::poll_ready).
+    ///
+    /// Transport reads are paused and output the chain holds does not reach
+    /// the transport during the pause. It is not caused by the peer, so read
+    /// and write timeouts should not run. The dispatcher is notified when the
+    /// pause starts and when it ends.
+    pub fn is_filter_paused(&self) -> bool {
+        self.0.flags.is_filter_paused()
+    }
+
+    /// Waits until the write buffer can accept more output.
+    ///
+    /// Completes immediately unless write back-pressure is enabled. While it
+    /// is, waits until the outstanding output falls to the release threshold
+    /// (half of the high watermark), the level at which the dispatcher
+    /// releases back-pressure. Any number of tasks can wait at once, the
+    /// write task wakes them without involving the dispatcher.
+    ///
+    /// Producers that are not driven by a dispatcher can await this before
+    /// encoding more, so the write buffer does not grow without bound.
+    ///
+    /// Fails once the connection is closing or closed, and with
+    /// [`io::ErrorKind::TimedOut`] if the
+    /// [write timeout](crate::IoConfig::set_write_timeout) is set and expires
+    /// first.
+    pub async fn write_ready(&self) -> io::Result<()> {
+        self.0.write_ready().await
     }
 
     /// Gracefully closes the connection.
@@ -67,60 +200,94 @@ impl IoRef {
     /// Force-closes the connection.
     ///
     /// The dispatcher does not wait for incomplete responses. The I/O stream is
-    /// terminated without any graceful period.
+    /// terminated without any graceful period, and whatever is still buffered
+    /// is discarded.
+    ///
+    /// The transport aborts the connection instead of closing it gracefully, so
+    /// the peer most likely observes an `RST` rather than a clean end of
+    /// stream, and output that has not been acknowledged yet is lost. That is
+    /// what keeps a truncated response distinguishable from a complete one, but
+    /// it also means this must not be used to end a connection normally. Use
+    /// [`close`](Self::close) for that.
     pub fn terminate(&self) {
         log::trace!("{}: Terminate io stream object", self.tag());
-        self.0.terminate_connection(None);
-    }
-
-    #[doc(hidden)]
-    #[deprecated(since = "3.10.0", note = "use IoRef::terminate() instead")]
-    /// Force close connection
-    ///
-    /// Dispatcher does not wait for uncompleted responses. Io stream get terminated
-    /// without any graceful period.
-    pub fn force_close(&self) {
-        self.terminate();
-    }
-
-    #[doc(hidden)]
-    #[deprecated(since = "3.11.0", note = "use IoRef::close() instead")]
-    /// Gracefully shuts down the I/O stream.
-    pub fn wants_shutdown(&self) {
-        self.0.start_shutdown();
+        self.0.force_close_connection();
     }
 
     /// Queries filter-specific data.
     pub fn query<T: 'static>(&self) -> types::QueryItem<T> {
+        let _borrow = self.0.buffer.borrow();
         types::QueryItem::new(self.filter().query(any::TypeId::of::<T>()))
     }
 
     #[inline]
-    /// Encodes the item into the write buffer.
+    /// Encodes an item into the write buffer.
+    ///
+    /// This method reports codec errors only. Any `io::Error` produced while
+    /// buffering is discarded: if the connection is already closing or closed
+    /// the item is not encoded, and a transport or filter error raised by an
+    /// eager backend write is dropped. Such errors remain observable later
+    /// through [`crate::Io::poll_flush`] or [`crate::Io::poll_recv`]. Use
+    /// [`encode_slice`](Self::encode_slice) or
+    /// [`encode_bytes`](Self::encode_bytes) when they must be observed at the
+    /// call site.
+    ///
+    /// # Back-pressure is advisory
+    ///
+    /// Encoding never blocks and never refuses. Once buffered output reaches
+    /// the configured high watermark this arms write back-pressure and wakes
+    /// the dispatch task, but the item is still buffered and `Ok` is still
+    /// returned. A caller that keeps encoding without consulting
+    /// [`is_wr_backpressure`](Self::is_wr_backpressure), or awaiting
+    /// [`Io::poll_status_update`](crate::Io::poll_status_update) or
+    /// [`Io::poll_flush`](crate::Io::poll_flush), will grow the write buffer
+    /// without bound, because a slow peer cannot slow the producer down on its
+    /// own. Honouring the signal is the caller's responsibility.
     pub fn encode<U>(&self, item: U::Item, codec: &U) -> Result<(), <U as Encoder>::Error>
     where
         U: Encoder,
     {
-        self.with_write_buf(|buf| codec.encodev(item, buf))
+        self.with_write_src(|buf| codec.encode(item, buf))
             .unwrap_or_else(|_| Ok(()))
     }
 
     #[inline]
     /// Encodes the slice into the write buffer.
+    ///
+    /// If this triggers an eager backend write, any transport or filter error
+    /// from that write is returned immediately.
+    ///
+    /// Write back-pressure is advisory here too; see [`encode`](Self::encode).
     pub fn encode_slice(&self, src: &[u8]) -> io::Result<()> {
-        self.with_write_buf(|buf| buf.extend_from_slice(src))
+        self.with_write_src(|buf| buf.extend_from_slice(src))
     }
 
     #[inline]
     /// Writes bytes to the write buffer.
+    ///
+    /// If this triggers an eager backend write, any transport or filter error
+    /// from that write is returned immediately.
+    ///
+    /// Write back-pressure is advisory here too; see [`encode`](Self::encode).
     pub fn encode_bytes<B>(&self, src: B) -> io::Result<()>
     where
         BytePage: From<B>,
     {
-        self.with_write_buf(|buf| buf.append(src))
+        self.with_write_src(|buf| buf.append(src))
     }
 
     /// Attempts to decode a frame from the read buffer.
+    ///
+    /// Once the transport reached eof this uses [`Decoder::decode_eof`]
+    /// instead of [`Decoder::decode`].
+    ///
+    /// This mutates the read state: it clears read readiness, and consuming
+    /// enough bytes may release read backpressure. It also cancels a pause
+    /// installed by [`Io::poll_read_pause`](crate::Io::poll_read_pause) and wakes the transport
+    /// read task.
+    ///
+    /// Decoded frames that share the read buffer's allocation keep the whole
+    /// buffer alive, see [`IoConfig::set_read_size`](crate::IoConfig::set_read_size).
     pub fn decode<U>(
         &self,
         codec: &U,
@@ -128,15 +295,26 @@ impl IoRef {
     where
         U: Decoder,
     {
-        self.0.buffer.with_read_dst(self, |buf| {
-            let res = codec.decode(buf);
+        let res = self.0.buffer.with_read_dst(self, |buf| {
+            let res = self.decode_buf(codec, buf);
             self.0.flags.unset_read_ready();
             self.update_read_destination(buf);
             res
-        })
+        });
+        self.0.sync_read_buffered();
+        res
     }
 
     /// Attempts to decode a frame from the read buffer.
+    ///
+    /// `Decoded::consumed` reports the bytes taken by this attempt and
+    /// `Decoded::remains` the bytes left in the application-facing read
+    /// buffer. Once the transport reached eof this uses
+    /// [`Decoder::decode_eof`] instead of [`Decoder::decode`].
+    ///
+    /// Like [`decode`](Self::decode), this mutates the read state: it clears
+    /// read readiness, may release read backpressure, and cancels a pause
+    /// installed by [`Io::poll_read_pause`](crate::Io::poll_read_pause).
     pub fn decode_item<U>(
         &self,
         codec: &U,
@@ -144,9 +322,9 @@ impl IoRef {
     where
         U: Decoder,
     {
-        self.0.buffer.with_read_dst(self, |buf| {
+        let res = self.0.buffer.with_read_dst(self, |buf| {
             let len = buf.len();
-            let res = codec.decode(buf).map(|item| Decoded {
+            let res = self.decode_buf(codec, buf).map(|item| Decoded {
                 item,
                 remains: buf.len(),
                 consumed: len - buf.len(),
@@ -154,7 +332,21 @@ impl IoRef {
             self.0.flags.unset_read_ready();
             self.update_read_destination(buf);
             res
-        })
+        });
+        self.0.sync_read_buffered();
+        res
+    }
+
+    fn decode_buf<U: Decoder>(
+        &self,
+        codec: &U,
+        buf: &mut BytesMut,
+    ) -> Result<Option<U::Item>, U::Error> {
+        if self.0.flags.is_read_eof() {
+            codec.decode_eof(buf)
+        } else {
+            codec.decode(buf)
+        }
     }
 
     /// Sends the write buffer to the I/O layer.
@@ -162,16 +354,7 @@ impl IoRef {
     /// Requires the underlying runtime to implement `.write()`;
     /// otherwise, no action is taken.
     pub fn send_buf(&self) -> io::Result<()> {
-        // try send bytes
-        self.consolidate_write_state(true);
-
-        if self.0.flags.is_stopping_any()
-            && let Some(err) = self.0.error.take()
-        {
-            Err(err)
-        } else {
-            Ok(())
-        }
+        self.consolidate_write_state(true)
     }
 
     pub(crate) fn ops_send_buf(&self) {
@@ -201,49 +384,199 @@ impl IoRef {
         }
     }
 
-    /// Get access to filter buffer
+    /// Provides temporary access to the outermost filter buffers.
+    ///
+    /// Filter callbacks run before and after `f`, and any produced write data
+    /// is scheduled for delivery after the closure returns. Errors from an
+    /// eager backend write are returned to the caller.
+    ///
+    /// The destination exposed by
+    /// [`FilterBuf::with_read_buffers`](crate::FilterBuf::with_read_buffers) is
+    /// the application-facing read destination, so consuming enough of it
+    /// releases read backpressure and cancels an installed read pause.
+    ///
+    /// Buffer access is not reentrant. The closure must not use this
+    /// connection to access an overlapping read or write buffer, or change the
+    /// filter chain.
     pub fn with_buf<F, R>(&self, f: F) -> io::Result<R>
     where
         F: FnOnce(&mut FilterBuf<'_>) -> R,
     {
+        self.with_callbacks(|cb| cb.before_processing(self));
         let result = self.0.buffer.with_filter(self, |ctx| ctx.with_buffer(f));
-        self.consolidate_write_state(false);
+        self.with_callbacks(|cb| cb.after_processing(self));
+        self.release_read_destination();
+        self.0.sync_read_buffered();
+
+        self.consolidate_write_state(false)?;
         Ok(result)
     }
 
-    /// Get mut access to read buffer
-    pub fn with_read_buf<F, R>(&self, f: F) -> R
+    /// Provides mutable access to the application-facing read destination.
+    ///
+    /// This holds the decoded bytes the application consumes; see
+    /// [`with_read_src`](Self::with_read_src) for the transport-facing source.
+    ///
+    /// This mutates the read state whether or not `f` consumes anything. While
+    /// read back-pressure is active nothing is released until the buffer has
+    /// fallen to at most half the high watermark, so until then read readiness
+    /// and any installed read pause are left in place. Once it has, or when
+    /// back-pressure was not active, read readiness is cleared and a pause
+    /// installed by [`Io::poll_read_pause`](crate::Io::poll_read_pause) is
+    /// cancelled, waking the transport read task.
+    ///
+    /// Use [`crate::Io::poll_read_more`] rather than this method to check
+    /// whether data is available.
+    ///
+    /// The closure must not access this connection's application-facing read
+    /// destination again. Nested access is unsupported and may terminate the
+    /// connection or lose nested buffer changes.
+    pub fn with_read_dst<F, R>(&self, f: F) -> R
     where
         F: FnOnce(&mut BytesMut) -> R,
     {
-        self.0.buffer.with_read_dst(self, |buf| {
+        let res = self.0.buffer.with_read_dst(self, |buf| {
             let res = f(buf);
             self.update_read_destination(buf);
             res
-        })
+        });
+        self.0.sync_read_buffered();
+        res
     }
 
-    /// Get mut access to source write buffer
-    pub fn with_write_buf<F, R>(&self, f: F) -> io::Result<R>
+    #[inline]
+    /// Returns the size of the application-facing read destination.
+    ///
+    /// Unlike [`with_read_dst`](Self::with_read_dst) this does not change the
+    /// read state, read readiness, read back-pressure and an installed read
+    /// pause are left in place, and no buffer is allocated. Returns `0` when
+    /// called from inside [`with_read_dst`](Self::with_read_dst).
+    pub fn read_dst_size(&self) -> usize {
+        self.0.buffer.read_dst_size()
+    }
+
+    /// Provides mutable access to the application-facing write source.
+    ///
+    /// This holds the bytes the application produces; see
+    /// [`with_write_dst`](Self::with_write_dst) for the transport-facing
+    /// destination.
+    ///
+    /// Returns an error without invoking `f` if the connection is closing or
+    /// closed. Data appended by `f` is scheduled for delivery. If that starts
+    /// an eager backend write, its transport or filter error is returned.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the closure accesses the same application-facing write
+    /// buffer again.
+    pub fn with_write_src<F, R>(&self, f: F) -> io::Result<R>
     where
         F: FnOnce(&mut BytePages) -> R,
     {
         let st = &self.0;
 
-        if st.flags.is_stopping_any() {
-            if st.flags.is_closed() {
-                Err(st.error_or_disconnected())
-            } else {
-                Err(io::Error::other("I/O stream is closing"))
-            }
-        } else {
-            let result = st.buffer.with_write_src(f);
-            self.consolidate_write_state(false);
+        if st.flags.is_active() {
+            let result = st.buffer.with_write_src(self, f);
+            self.consolidate_write_state(false)?;
             Ok(result)
+        } else if st.flags.is_peer_gone() {
+            Err(st.error_or_disconnected())
+        } else {
+            Err(io::Error::other("I/O stream is closing"))
         }
     }
 
-    pub(crate) fn consolidate_write_state(&self, force: bool) {
+    #[inline]
+    /// Provides mutable access to the transport-facing read source.
+    ///
+    /// This is the buffer the transport fills; it is the counterpart of the
+    /// application-facing destination exposed by
+    /// [`with_read_dst`](Self::with_read_dst). Primarily intended for transport
+    /// and filter implementations.
+    ///
+    /// Without a filter installed this is the same buffer as the
+    /// application-facing destination, so consuming enough of it releases read
+    /// backpressure and cancels an installed read pause. Unlike
+    /// [`with_read_dst`](Self::with_read_dst) it never clears read readiness.
+    ///
+    /// The closure must not access this connection's transport-facing read
+    /// source again. Nested access is unsupported and may terminate the
+    /// connection or lose nested buffer changes.
+    pub fn with_read_src<F, R>(&self, f: F) -> R
+    where
+        F: FnOnce(&mut BytesMut) -> R,
+    {
+        let result = self.0.buffer.with_read_src(self, f);
+        self.release_read_destination();
+        self.0.sync_read_buffered();
+        result
+    }
+
+    #[inline]
+    /// Provides mutable access to the transport-facing write destination.
+    ///
+    /// This is the buffer the transport drains; it is the counterpart of the
+    /// application-facing source exposed by
+    /// [`with_write_src`](Self::with_write_src). Primarily intended for
+    /// transport and filter implementations.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the closure accesses the same transport-facing write buffer
+    /// again.
+    pub fn with_write_dst<F, R>(&self, f: F) -> R
+    where
+        F: FnOnce(&mut BytePages) -> R,
+    {
+        self.0.buffer.with_write_dst(self, f)
+    }
+
+    /// Schedules buffered output for delivery and updates write state.
+    ///
+    /// When output is buffered and the write task is paused, this either
+    /// performs an eager in-place write through the transport handle or
+    /// schedules a write operation. An eager write requires direct writes to be
+    /// enabled and, unless `force` is set, at least
+    /// [`IoConfig::write_buf_threshold`](crate::IoConfig::write_buf_threshold)
+    /// bytes to be buffered; `force` makes any non-empty buffer eligible. A
+    /// write operation is scheduled when an eager write leaves data behind, or
+    /// when no eager write was attempted.
+    ///
+    /// Returns the connection error once the connection is stopping or
+    /// terminating with an error set. This is how a failed eager write or
+    /// filter reaches the caller, and it also prevents further eager writes on
+    /// a connection that is already gone.
+    ///
+    /// Finally enables write back-pressure and wakes the dispatcher if buffered
+    /// output has reached the configured high watermark. The size is re-read
+    /// first because an eager write may have drained it.
+    /// Ends the connection after the filter chain failed.
+    ///
+    /// Output the application queued can not be encoded anymore and is
+    /// discarded. The chain gets one last write pass, so that output it
+    /// produced before the failure, for example a TLS alert, moves toward
+    /// the transport; any error from that pass is the same failure. After
+    /// that the chain is not called again, output it still holds is
+    /// discarded, and the connection skips filter shutdown: the transport
+    /// shutdown phase delivers the transport-facing output, bounded by the
+    /// shutdown deadline.
+    pub(crate) fn fail_filters(&self, err: io::Error) {
+        let st = &self.0;
+        st.set_shutdown_error(err);
+        if st.flags.is_aborted() || st.flags.is_filter_failed() {
+            return;
+        }
+        log::trace!("{}: Filter chain failed, flags:{:?}", st.tag(), st.flags);
+
+        st.buffer.discard_app_output();
+        let _ = st.buffer.process_write_buf_force(self);
+        st.flags.set_filter_failed();
+        st.buffer.discard_filter_output();
+        st.sync_write_buffered();
+        st.filters_stopped();
+    }
+
+    pub(crate) fn consolidate_write_state(&self, force: bool) -> io::Result<()> {
         let st = &self.0;
 
         // wake write task if needsed
@@ -263,11 +596,11 @@ impl IoRef {
             // which introduces latency. To prevent this behavior and
             // flatten data delivery to the peer, IoRef can initiate
             // out-of-order writes based on a configured threshold.
-            if st.flags.is_direct_wr_enabled()
-                && (force || size >= st.cfg.write_buf_threshold())
-            {
+            if st.flags.is_direct_wr_enabled() && (force || size >= st.cfg.write_buf_threshold()) {
                 // Send data in-place
-                if self.call_write() == WakeWriteTask::Yes {
+                let partial = self.call_write() == WakeWriteTask::Yes;
+                st.metrics().eager_write(partial);
+                if partial {
                     #[cfg(feature = "trace")]
                     log::trace!(
                         "{}: write-upd == schedule(more):{} flags:{:?}",
@@ -286,17 +619,41 @@ impl IoRef {
             } else if !st.flags.is_wr_send_scheduled() {
                 #[cfg(feature = "trace")]
                 log::trace!("{}: write-upd == schedule(too small)", st.tag());
+                st.metrics().scheduled_write();
                 st.flags.set_wr_send_scheduled();
                 Iops::schedule_write(st.id());
             }
         }
-        // Enable backpressure
-        if !st.flags.is_wr_backpressure() && st.is_wr_backpressure_needed(size) {
-            st.flags.set_wr_backpressure();
-            st.wake_dispatch_task();
+
+        if !st.flags.is_active()
+            && let Some(err) = st.error()
+        {
+            return Err(err);
         }
+
+        // A direct write may have changed the amount of buffered data.
+        // In-flight output counts too: it has not reached the peer yet.
+        st.enable_wr_backpressure_if_needed();
+        st.sync_write_buffered();
+        Ok(())
     }
 
+    /// Updates read state after the application-facing destination was accessed.
+    ///
+    /// While read back-pressure is active nothing is released until `buf` has
+    /// fallen to at most half the high watermark. Until then read readiness and
+    /// any installed read pause are deliberately left in place, keeping the
+    /// transport read task parked. Once it has, read readiness and
+    /// back-pressure are cleared together; without back-pressure only read
+    /// readiness is cleared.
+    ///
+    /// Whenever something is released, a pause installed by
+    /// [`Io::poll_read_pause`](crate::Io::poll_read_pause) is cancelled and the
+    /// transport read task is woken.
+    ///
+    /// See [`release_read_destination`](Self::release_read_destination) for the
+    /// variant used when the caller may have drained a different buffer of the
+    /// filter chain.
     fn update_read_destination(&self, buf: &mut BytesMut) {
         let st = &self.0;
 
@@ -309,31 +666,41 @@ impl IoRef {
         );
 
         if st.flags.is_rd_backpressure() {
-            // back-pressure is still eanbled
-            if st.is_rd_backpressure_needed(buf.len()) {
+            // Keep reads paused until enough buffered data has been consumed.
+            if !st.should_disable_rd_backpressure(buf.len()) {
                 return;
             }
-            st.flags.unset_all_read_flags();
+            st.unset_read_ready_and_backpressure();
         } else {
             st.flags.unset_read_ready();
         }
 
         if st.flags.is_read_paused() {
-            st.wake_read_task();
-            st.flags.unset_read_paused();
+            st.resume_read_task();
         }
     }
 
-    /// Make sure buffer has enough free space
-    pub fn resize_read_buf(&self, buf: &mut BytesMut) {
-        self.0.cfg.read_buf().resize(buf);
-    }
+    /// Releases read backpressure and any installed read pause.
+    ///
+    /// Used by the accessors that can drain the application-facing read
+    /// destination without going through
+    /// [`with_read_dst`](Self::with_read_dst). Unlike
+    /// `update_read_destination()` this never clears read readiness, because
+    /// the caller may have touched a different buffer of the chain. It only
+    /// removes a stale pause, so it can never suppress a wakeup.
+    fn release_read_destination(&self) {
+        let st = &self.0;
 
-    #[doc(hidden)]
-    #[deprecated(since = "3.10.3", note = "Use .notify_disapatcher()")]
-    /// Wakeup dispatcher
-    pub fn wake(&self) {
-        self.notify_dispatcher();
+        if st.flags.is_rd_backpressure() {
+            if !st.should_disable_rd_backpressure(st.buffer.read_dst_size()) {
+                return;
+            }
+            st.unset_read_ready_and_backpressure();
+        }
+
+        if st.flags.is_read_paused() {
+            st.resume_read_task();
+        }
     }
 
     /// Wakeup dispatcher
@@ -342,17 +709,28 @@ impl IoRef {
         self.0.wake_dispatch_task();
     }
 
-    /// Wakeup dispatcher and send keep-alive error
+    /// Wakeup dispatcher and send Timeout error
     pub fn notify_timeout(&self) {
         self.0.notify_timeout();
     }
 
-    /// Current timer handle
+    /// Returns the currently registered dispatcher timer handle.
+    ///
+    /// [`TimerHandle::ZERO`] is returned when no timer is registered.
     pub fn timer_handle(&self) -> TimerHandle {
         self.0.timeout.get()
     }
 
-    /// Start timer
+    /// Starts or updates the dispatcher timer.
+    ///
+    /// The timer uses second-granularity deadlines. When it expires,
+    /// [`poll_status_update`](crate::Io::poll_status_update) reports
+    /// [`IoStatusUpdate::Timeout`](crate::IoStatusUpdate::Timeout).
+    ///
+    /// A zero timeout cancels the current timer but does not consume a timeout
+    /// notification that has already been delivered. Use
+    /// [`stop_timer`](Self::stop_timer) when leaving a protocol phase to also
+    /// clear such a notification.
     pub fn start_timer(&self, timeout: Seconds) -> TimerHandle {
         let cur_hnd = self.0.timeout.get();
 
@@ -377,8 +755,10 @@ impl IoRef {
         }
     }
 
-    /// Stop timer
+    /// Stops the timer and clears any pending timeout notification.
     pub fn stop_timer(&self) {
+        self.0.flags.check_dispatcher_timeout();
+
         let hnd = self.0.timeout.get();
         if hnd.is_set() {
             log::trace!("{}: Stop timer", self.tag());
@@ -387,13 +767,52 @@ impl IoRef {
         }
     }
 
-    /// Notify when io stream get disconnected
-    pub fn on_disconnect(&self) -> crate::OnDisconnect {
-        crate::OnDisconnect::new(self.0.clone())
+    /// Returns a future that resolves when the complete I/O stream disconnects.
+    ///
+    /// A clean peer read EOF does not resolve this future because the write
+    /// half remains usable. It resolves once the transport backend reports
+    /// that teardown has finished, which happens after local shutdown or
+    /// force termination. [`terminate`](Self::terminate) requests that
+    /// teardown but does not itself resolve the future.
+    pub fn on_disconnect(&self) -> Waiter<'static> {
+        Waiter::new_static(self.clone(), TAG_DISCONNECT)
     }
 
-    /// Call handle write method, returns true if
-    /// `write-paused` is still set
+    /// Wakes all [`Waiter`](crate::Waiter) waiters of the tag.
+    ///
+    /// Tags reserved for internal use are ignored.
+    pub fn wake(&self, tag: usize) {
+        if tag < TAG_WRITE {
+            self.0.extensions.wake(tag);
+        }
+    }
+
+    /// Creates a [`Waiter`](crate::Waiter) for the tag.
+    ///
+    /// The waiter registers on its first poll.
+    ///
+    /// # Panics
+    ///
+    /// Panics in debug builds if the tag is reserved for internal use,
+    /// `usize::MAX - 1` and `usize::MAX - 2` are reserved.
+    pub fn waiter(&self, tag: usize) -> Waiter<'_> {
+        Waiter::new(self, tag)
+    }
+
+    #[doc(hidden)]
+    /// Register filter callbacks
+    ///
+    /// The callbacks are discarded once the connection is closed or its `Io`
+    /// has been dropped. They are released together with the `Io`, so storing
+    /// them afterwards could keep the connection state alive through an
+    /// `IoRef` they hold.
+    pub fn register_filter_callbacks<F: crate::IoCallbacks + 'static>(&self, f: F) {
+        if !self.0.flags.is_closed() && !self.0.is_io_dropped() {
+            self.0.extensions.register_filter_callbacks(f);
+        }
+    }
+
+    /// Call handle write method, returns true if `write-paused` is still set
     fn call_write(&self) -> WakeWriteTask {
         if let Some(hnd) = self.0.handle.take() {
             self.0.flags.unset_write_paused();
@@ -406,7 +825,7 @@ impl IoRef {
             );
             let ctx = unsafe { &*(ptr::from_ref(self).cast::<IoContext>()) };
             hnd.write(ctx);
-            self.0.handle.set(Some(hnd));
+            self.restore_handle(hnd);
         }
         if self.0.flags.is_write_paused() {
             WakeWriteTask::No
@@ -415,12 +834,28 @@ impl IoRef {
         }
     }
 
-    pub(crate) fn call_notify(&self) {
-        if let Some(hnd) = self.0.handle.take() {
-            let ctx = unsafe { &*(ptr::from_ref(self).cast::<IoContext>()) };
-            hnd.notify(ctx);
+    /// Reinstalls the transport handle after a reentrant transport callback.
+    ///
+    /// The handle is taken for the duration of the call so that a nested
+    /// `call_write()` or query cannot reenter the transport. If the
+    /// callback terminated the connection, `terminate_connection()` and
+    /// `stop_connection()` found the slot empty and could not release the
+    /// transport, so the handle is dropped here instead of being reinstalled.
+    /// A graceful shutdown keeps it: the write task still needs the transport
+    /// to shut it down.
+    pub(crate) fn restore_handle(&self, hnd: Box<dyn Handle>) {
+        if self.0.flags.is_terminating() || self.0.flags.is_closed() {
+            drop(hnd);
+        } else {
             self.0.handle.set(Some(hnd));
         }
+    }
+
+    pub(crate) fn with_callbacks<F>(&self, f: F)
+    where
+        F: FnOnce(&dyn crate::IoCallbacks),
+    {
+        self.0.extensions.with_callbacks(f);
     }
 }
 
@@ -461,9 +896,39 @@ mod tests {
 
     use ntex_bytes::Bytes;
     use ntex_codec::BytesCodec;
-    use ntex_util::{future::lazy, time::Millis, time::sleep};
+    use ntex_util::future::{Either, lazy};
+    use ntex_util::time::{Millis, sleep, timeout};
 
     use super::*;
+
+    /// The three public lifecycle predicates answer different questions and
+    /// must not be read as stages of one another.
+    #[ntex::test]
+    async fn lifecycle_predicates_are_independent() {
+        // a force termination starts: it ends abnormally and is closing, but
+        // the backend still holds the socket
+        let (_client, server) = IoTest::create();
+        let io = Io::from(server);
+        assert!(io.is_active() && !io.flags().is_terminating() && !io.is_closed());
+
+        io.terminate();
+        assert!(!io.is_active());
+        assert!(io.flags().is_terminating());
+        assert!(!io.is_closed(), "socket released before teardown ran");
+
+        // a graceful shutdown also releases the socket, without ever being an
+        // abnormal ending
+        let (client, server) = IoTest::create();
+        client.remote_buffer_cap(1024);
+        let io = Io::from(server);
+        io.shutdown().await.unwrap();
+        assert!(io.is_closed());
+        assert!(!io.is_active());
+        assert!(
+            !io.flags().is_terminating(),
+            "a graceful shutdown reported as an abort"
+        );
+    }
     use crate::{FilterCtx, Io, testing::IoTest};
 
     const BIN: &[u8] = b"GET /test HTTP/1\r\n\r\n";
@@ -496,7 +961,7 @@ mod tests {
         client.read_error(io::Error::other("err"));
         let msg = state.recv(&BytesCodec).await;
         assert!(msg.is_err());
-        assert!(state.flags().is_terminated());
+        assert!(state.flags().is_closed());
 
         let (client, server) = IoTest::create();
         client.remote_buffer_cap(1024);
@@ -506,27 +971,34 @@ mod tests {
         let res = poll_fn(|cx| Poll::Ready(state.poll_recv(&BytesCodec, cx))).await;
         if let Poll::Ready(msg) = res {
             assert!(msg.is_err());
-            assert!(state.flags().is_terminated());
+            assert!(state.flags().is_closed());
         }
 
         let (client, server) = IoTest::create();
         client.remote_buffer_cap(1024);
         let state = Io::from(server);
+        assert_eq!(0, state.with_write_dst(|b| b.len()));
         state.encode_slice(b"test").unwrap();
+        assert_eq!(4, state.with_write_dst(|b| b.len()));
         let buf = client.read().await.unwrap();
         assert_eq!(buf, Bytes::from_static(b"test"));
 
         client.write(b"test");
-        state.read_ready().await.unwrap();
+        state.read_more().await.unwrap();
         let buf = state.decode(&BytesCodec).unwrap().unwrap();
         assert_eq!(buf, Bytes::from_static(b"test"));
 
         client.write_error(io::Error::other("err"));
-        state
+        let err = state
             .send(Bytes::from_static(b"test"), &BytesCodec)
             .await
-            .unwrap();
-        assert!(state.flags().is_terminated());
+            .unwrap_err();
+        assert!(matches!(
+            err,
+            Either::Right(ref err)
+                if err.kind() == io::ErrorKind::Other && err.to_string() == "err"
+        ));
+        assert!(state.flags().is_closed());
 
         let res = state.send(Bytes::from_static(b"test"), &BytesCodec).await;
         assert!(res.is_err());
@@ -535,8 +1007,30 @@ mod tests {
         client.remote_buffer_cap(1024);
         let state = Io::from(server);
         state.terminate();
-        assert!(state.flags().is_stopping());
-        assert!(state.flags().is_terminated());
+        assert!(state.flags().is_terminating());
+        assert!(!state.flags().is_stopping());
+        assert!(!state.flags().is_closed());
+        state.shutdown().await.unwrap();
+        assert!(state.flags().is_closed());
+    }
+
+    #[ntex::test]
+    async fn zero_byte_write_reports_write_zero() {
+        let (client, server) = IoTest::create();
+        client.remote_buffer_cap(1024);
+        let state = Io::from(server);
+
+        client.write_zero();
+        let err = state
+            .send(Bytes::from_static(b"test"), &BytesCodec)
+            .await
+            .unwrap_err();
+
+        assert!(matches!(
+            err,
+            Either::Right(ref err) if err.kind() == io::ErrorKind::WriteZero
+        ));
+        assert!(state.flags().is_closed());
     }
 
     #[ntex::test]
@@ -555,8 +1049,27 @@ mod tests {
             Poll::Pending
         );
         client.close().await;
-        assert_eq!(waiter.await, ());
-        assert_eq!(waiter2.await, ());
+        assert!(state.is_read_eof());
+        assert!(state.is_active());
+        assert_eq!(
+            lazy(|cx| Pin::new(&mut waiter).poll(cx)).await,
+            Poll::Pending
+        );
+        assert_eq!(
+            lazy(|cx| Pin::new(&mut waiter2).poll(cx)).await,
+            Poll::Pending
+        );
+
+        timeout(Millis(1000), state.shutdown())
+            .await
+            .expect("stream shutdown did not complete")
+            .unwrap();
+        timeout(Millis(1000), waiter)
+            .await
+            .expect("disconnect waiter was not notified");
+        timeout(Millis(1000), waiter2)
+            .await
+            .expect("cloned disconnect waiter was not notified");
 
         let mut waiter = state.on_disconnect();
         assert_eq!(
@@ -573,20 +1086,26 @@ mod tests {
         );
         client.read_error(io::Error::other("err"));
         assert_eq!(waiter.await, ());
+
+        let mut waiter = state.on_disconnect();
+        assert_eq!(
+            lazy(|cx| Pin::new(&mut waiter).poll(cx)).await,
+            Poll::Ready(())
+        );
     }
 
     #[ntex::test]
     async fn write_to_closed_io() {
-        let (client, server) = IoTest::create();
+        let (_client, server) = IoTest::create();
         let state = Io::from(server);
-        client.close().await;
+        state.terminate();
 
-        assert!(state.is_closed());
+        assert!(!state.is_active());
         assert!(state.encode_slice(TEXT.as_bytes()).is_err());
         assert!(state.encode_bytes(Bytes::from_static(BIN)).is_err());
         assert!(
             state
-                .with_write_buf(|buf| buf.extend_from_slice(BIN))
+                .with_write_src(|buf| buf.extend_from_slice(BIN))
                 .is_err()
         );
     }
@@ -595,7 +1114,6 @@ mod tests {
     struct Counter<F> {
         layer: F,
         idx: usize,
-        in_bytes: Rc<Cell<usize>>,
         out_bytes: Rc<Cell<usize>>,
         read_order: Rc<RefCell<Vec<usize>>>,
         write_order: Rc<RefCell<Vec<usize>>>,
@@ -604,10 +1122,7 @@ mod tests {
     impl<F: Filter> Filter for Counter<F> {
         fn process_read_buf(&self, ctx: &mut FilterCtx<'_>) -> io::Result<()> {
             self.read_order.borrow_mut().push(self.idx);
-            let result = self.layer.process_read_buf(ctx);
-            self.in_bytes
-                .set(self.in_bytes.get() + ctx.new_read_bytes());
-            result
+            self.layer.process_read_buf(ctx)
         }
 
         fn process_write_buf(&self, ctx: &mut FilterCtx<'_>) -> io::Result<()> {
@@ -627,7 +1142,6 @@ mod tests {
 
     #[ntex::test]
     async fn filter() {
-        let in_bytes = Rc::new(Cell::new(0));
         let out_bytes = Rc::new(Cell::new(0));
         let read_order = Rc::new(RefCell::new(Vec::new()));
         let write_order = Rc::new(RefCell::new(Vec::new()));
@@ -637,7 +1151,6 @@ mod tests {
             .map_filter(|layer| Counter {
                 layer,
                 idx: 1,
-                in_bytes: in_bytes.clone(),
                 out_bytes: out_bytes.clone(),
                 read_order: read_order.clone(),
                 write_order: write_order.clone(),
@@ -659,13 +1172,15 @@ mod tests {
         let msg = io.recv(&BytesCodec).await.unwrap().unwrap();
         assert_eq!(msg, Bytes::from_static(BIN));
 
-        assert_eq!(in_bytes.get(), BIN.len() * 2);
-        assert_eq!(out_bytes.get(), 8);
+        // the number of write passes depends on how often the runtime polls
+        // `send()`, each pass sees the 4 queued bytes until the transport
+        // writes them, at least once from `send()` and once from the transport
+        assert!(out_bytes.get() >= 8, "{}", out_bytes.get());
+        assert_eq!(out_bytes.get() % 4, 0, "{}", out_bytes.get());
     }
 
     #[ntex::test]
     async fn boxed_filter() {
-        let in_bytes = Rc::new(Cell::new(0));
         let out_bytes = Rc::new(Cell::new(0));
         let read_order = Rc::new(RefCell::new(Vec::new()));
         let write_order = Rc::new(RefCell::new(Vec::new()));
@@ -675,7 +1190,6 @@ mod tests {
             .map_filter(|layer| Counter {
                 layer,
                 idx: 2,
-                in_bytes: in_bytes.clone(),
                 out_bytes: out_bytes.clone(),
                 read_order: read_order.clone(),
                 write_order: write_order.clone(),
@@ -683,7 +1197,6 @@ mod tests {
             .map_filter(|layer| Counter {
                 layer,
                 idx: 1,
-                in_bytes: in_bytes.clone(),
                 out_bytes: out_bytes.clone(),
                 read_order: read_order.clone(),
                 write_order: write_order.clone(),
@@ -702,15 +1215,111 @@ mod tests {
         let buf = client.read().await.unwrap();
         assert_eq!(buf, Bytes::from_static(b"test"));
 
-        assert_eq!(in_bytes.get(), BIN.len() * 2);
-        assert_eq!(out_bytes.get(), 16);
-        assert_eq!(state.0.buffer.with_write_dst(|b| b.len()), 0);
+        // the number of write passes depends on how often the runtime polls
+        // `send()`, each pass sees the 4 queued bytes in both layers until the
+        // transport writes them, at least once from `send()` and once from the
+        // transport
+        assert!(out_bytes.get() >= 16, "{}", out_bytes.get());
+        assert_eq!(out_bytes.get() % 8, 0, "{}", out_bytes.get());
+        assert_eq!(state.0.buffer.with_write_dst(&state, |b| b.len()), 0);
 
         // refs
-        assert_eq!(Rc::strong_count(&in_bytes), 3);
+        assert_eq!(Rc::strong_count(&out_bytes), 3);
         drop(state);
-        assert_eq!(Rc::strong_count(&in_bytes), 1);
+        assert_eq!(Rc::strong_count(&out_bytes), 1);
         assert_eq!(*read_order.borrow(), &[1, 2][..]);
-        assert_eq!(*write_order.borrow(), &[1, 2, 1, 2, 1, 2][..]);
+        let write_order = write_order.borrow();
+        assert!(write_order.len() >= 6, "{write_order:?}");
+        assert!(
+            write_order.chunks(2).all(|c| c == [1, 2]),
+            "{write_order:?}"
+        );
+    }
+
+    #[ntex::test]
+    async fn timer_start_update_and_stop() {
+        let (_client, server) = IoTest::create();
+        let io = Io::new(server, SharedCfg::new("TIMER"));
+        assert_eq!(io.shared().tag(), "TIMER");
+        assert_eq!(io.timer_handle(), TimerHandle::ZERO);
+
+        let hnd = io.start_timer(Seconds(5));
+        assert!(hnd.is_set());
+        assert_eq!(io.timer_handle(), hnd);
+        assert!(hnd.remains() >= Seconds(4) && hnd.remains() <= Seconds(5));
+        assert!(hnd.instant() > TimerHandle::ZERO.instant());
+
+        // the same timeout keeps the registration
+        assert_eq!(io.start_timer(Seconds(5)), hnd);
+        assert_eq!(io.timer_handle(), hnd);
+
+        // a different timeout moves it
+        let hnd2 = io.start_timer(Seconds(30));
+        assert_ne!(hnd2, hnd);
+        assert_eq!(io.timer_handle(), hnd2);
+        assert!(hnd2.remains() >= Seconds(29));
+
+        // a second io can share the deadline slot
+        let (_client2, server2) = IoTest::create();
+        let io2 = Io::from(server2);
+        assert!(io2.start_timer(Seconds(30)).is_set());
+
+        // zero timeout cancels the timer
+        assert_eq!(io.start_timer(Seconds::ZERO), TimerHandle::ZERO);
+        assert_eq!(io.timer_handle(), TimerHandle::ZERO);
+        assert_eq!(io.start_timer(Seconds::ZERO), TimerHandle::ZERO);
+        io2.stop_timer();
+
+        let hnd = TimerHandle::ZERO + Seconds(3);
+        assert!(hnd.is_set());
+        assert_eq!(
+            hnd.instant() - TimerHandle::ZERO.instant(),
+            std::time::Duration::from_secs(3)
+        );
+    }
+
+    #[ntex::test]
+    async fn notify_dispatcher_wakes_status_poll() {
+        use std::sync::{Arc, atomic::AtomicBool, atomic::Ordering};
+
+        struct Flag(AtomicBool);
+
+        impl std::task::Wake for Flag {
+            fn wake(self: Arc<Self>) {
+                self.0.store(true, Ordering::Relaxed);
+            }
+        }
+
+        let (_client, server) = IoTest::create();
+        let io = Io::from(server);
+
+        let flag = Arc::new(Flag(AtomicBool::new(false)));
+        let waker = std::task::Waker::from(flag.clone());
+        let mut cx = std::task::Context::from_waker(&waker);
+        assert!(io.poll_status_update(&mut cx).is_pending());
+
+        io.notify_dispatcher();
+        assert!(flag.0.load(Ordering::Relaxed));
+        // a plain wakeup reports no status update
+        assert!(lazy(|cx| io.poll_status_update(cx)).await.is_pending());
+    }
+
+    #[ntex::test]
+    #[allow(clippy::mutable_key_type)]
+    async fn io_ref_hash() {
+        let (_client, server) = IoTest::create();
+        let io = Io::from(server);
+        let (_client2, server2) = IoTest::create();
+        let io2 = Io::from(server2);
+
+        let mut set = std::collections::HashSet::new();
+        assert!(set.insert(io.get_ref()));
+        assert!(!set.insert(io.get_ref()));
+        assert!(set.insert(io2.get_ref()));
+
+        let mut set = std::collections::HashSet::new();
+        assert!(set.insert(&io));
+        assert!(!set.insert(&io));
+        assert!(set.insert(&io2));
     }
 }

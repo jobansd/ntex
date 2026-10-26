@@ -1,246 +1,256 @@
-#![allow(clippy::type_complexity)]
 use std::{fmt, marker};
 
-use crate::ctx::WaitersRef;
-use crate::dev::{ServiceChain, ServiceChainFactory};
-use crate::{IntoService, IntoServiceFactory, Service, ServiceCtx, ServiceFactory};
+use crate::Ctx;
+use crate::{IntoService, IntoServiceFactory, Service, ServiceFactory};
+use crate::{ServiceCaller, ServiceChain, ServiceChainFactory};
 
-/// Apply transform function to a service.
-pub fn apply_fn<T, Req, F, In, Out, Err, U>(
-    service: U,
+/// Applies an asynchronous middleware function to a service.
+///
+/// The function receives an input request and an [`ApplyCtx`] that can call the
+/// wrapped service.
+pub fn apply_fn<S, St, Req, F, In, Out, Err>(
+    service: impl IntoService<S, St, Req>,
     f: F,
-) -> ServiceChain<Apply<T, Req, F, In, Out, Err>, In>
+) -> ServiceChain<Apply<S, St, Req, F, In, Out, Err>, St, In>
 where
-    T: Service<Req>,
-    F: AsyncFn(In, &ApplyCtx<'_, T>) -> Result<Out, Err>,
-    U: IntoService<T, Req>,
-    Err: From<T::Error>,
+    S: Service<St, Req>,
+    F: AsyncFn(In, &ApplyCtx<'_, S, St, Req>) -> Result<Out, Err>,
+    Err: From<S::Error>,
 {
-    crate::chain(Apply::new(service.into_service(), f))
+    crate::service(Apply::new(service.into_service(), f))
 }
 
-/// Service factory that produces `apply_fn` service.
-pub fn apply_fn_factory<T, Req, Cfg, F, In, Out, Err, U>(
-    service: U,
+/// Applies an asynchronous middleware function to every service from a factory.
+pub fn apply_fn_factory<Sf, St, Req, F, In, Out, Err>(
+    service: impl IntoServiceFactory<Sf, St, Req>,
     f: F,
-) -> ServiceChainFactory<ApplyFactory<T, Req, Cfg, F, In, Out, Err>, In, Cfg>
+) -> ServiceChainFactory<ApplyFactory<F, Sf, St, Req, In, Out, Err>, St, In>
 where
-    T: ServiceFactory<Req, Cfg>,
-    F: AsyncFn(In, &ApplyCtx<'_, T::Service>) -> Result<Out, Err> + Clone,
-    U: IntoServiceFactory<T, Req, Cfg>,
-    Err: From<T::Error>,
+    Sf: ServiceFactory<St, Req>,
+    F: AsyncFn(In, &ApplyCtx<'_, Sf::Service, St, Req>) -> Result<Out, Err> + Clone,
+    Err: From<Sf::Error>,
 {
-    crate::chain_factory(ApplyFactory::new(service.into_factory(), f))
+    crate::factory(ApplyFactory::new(service.into_factory(), f))
 }
 
 #[derive(Debug)]
-pub struct ApplyCtx<'a, S> {
-    idx: u32,
-    waiters: &'a WaitersRef,
+/// Context passed to middleware functions created by [`apply_fn`].
+///
+/// Calls forward directly to the inner service. Wrap it with [`crate::ready`]
+/// to check its independent readiness on each call, including after middleware
+/// awaits or makes another call.
+pub struct ApplyCtx<'a, S, St, Req> {
+    ctx: Ctx<'a, S, St>,
     service: &'a S,
+    r: marker::PhantomData<Req>,
 }
 
-impl<'a, S> ApplyCtx<'a, S> {
+impl<S: Service<St, Req>, St, Req> ApplyCtx<'_, S, St, Req> {
+    /// Returns the pipeline state.
     #[inline]
-    /// Wait for service readiness and then call service.
-    pub async fn call<R>(&self, req: R) -> Result<S::Response, S::Error>
-    where
-        S: Service<R>,
-        R: 'a,
-    {
-        let ctx = ServiceCtx::new(self.idx, self.waiters);
+    pub fn st(&self) -> &St {
+        self.ctx.st()
+    }
 
-        self.service.ready(ctx).await?;
-        self.service.call(req, ctx).await
+    /// Calls the inner service, preserving any explicit readiness wrapper.
+    #[inline]
+    pub async fn call(&self, req: Req) -> Result<S::Res, S::Error> {
+        self.service
+            .call(req, self.ctx.without_bypass().cast())
+            .await
     }
 }
 
-/// `Apply` service combinator
-pub struct Apply<T, Req, F, In, Out, Err> {
-    service: T,
-    f: F,
-    r: marker::PhantomData<fn(Req) -> (In, Out, Err)>,
+impl<S: Service<St, Req>, St, Req> ServiceCaller<Req, S::Res, S::Error>
+    for ApplyCtx<'_, S, St, Req>
+{
+    #[inline]
+    async fn call_service(&self, req: Req) -> Result<S::Res, S::Error> {
+        self.call(req).await
+    }
 }
 
-impl<T, Req, F, In, Out, Err> Apply<T, Req, F, In, Out, Err>
+/// Service produced by [`apply_fn`].
+///
+/// Shares the enclosing readiness scope with its child unless the child is
+/// explicitly wrapped with [`crate::ready`].
+pub struct Apply<S, St, Req, F, In, Out, Err> {
+    svc: S,
+    f: F,
+    r: marker::PhantomData<fn(St, Req) -> (In, Out, Err)>,
+}
+
+impl<S, St, Req, F, In, Out, Err> Apply<S, St, Req, F, In, Out, Err>
 where
-    T: Service<Req>,
-    F: AsyncFn(In, &ApplyCtx<'_, T>) -> Result<Out, Err>,
-    Err: From<T::Error>,
+    F: AsyncFn(In, &ApplyCtx<'_, S, St, Req>) -> Result<Out, Err>,
 {
-    pub(crate) fn new(service: T, f: F) -> Self {
+    pub(crate) fn new(svc: S, f: F) -> Self {
         Apply {
             f,
-            service,
+            svc,
             r: marker::PhantomData,
         }
     }
 }
 
-impl<T, Req, F, In, Out, Err> Clone for Apply<T, Req, F, In, Out, Err>
+impl<S, St, Req, F, In, Out, Err> Clone for Apply<S, St, Req, F, In, Out, Err>
 where
-    T: Clone,
+    S: Clone,
     F: Clone,
 {
     fn clone(&self) -> Self {
         Apply {
-            service: self.service.clone(),
+            svc: self.svc.clone(),
             f: self.f.clone(),
             r: marker::PhantomData,
         }
     }
 }
 
-impl<T, Req, F, In, Out, Err> fmt::Debug for Apply<T, Req, F, In, Out, Err>
+impl<S, St, Req, F, In, Out, Err> fmt::Debug for Apply<S, St, Req, F, In, Out, Err>
 where
-    T: fmt::Debug,
+    S: fmt::Debug,
 {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("Apply")
-            .field("service", &self.service)
+            .field("svc", &self.svc)
             .field("map", &std::any::type_name::<F>())
             .finish()
     }
 }
 
-impl<T, Req, F, In, Out, Err> Service<In> for Apply<T, Req, F, In, Out, Err>
+impl<S, St, Req, F, In, Out, Err> Service<St, In> for Apply<S, St, Req, F, In, Out, Err>
 where
-    T: Service<Req>,
-    F: AsyncFn(In, &ApplyCtx<'_, T>) -> Result<Out, Err>,
-    Err: From<T::Error>,
+    S: Service<St, Req>,
+    F: AsyncFn(In, &ApplyCtx<'_, S, St, Req>) -> Result<Out, Err>,
+    Err: From<S::Error>,
 {
-    type Response = Out;
+    type Res = Out;
     type Error = Err;
 
+    crate::forward_bind!(St, svc);
+
     #[inline]
-    async fn ready(&self, ctx: ServiceCtx<'_, Self>) -> Result<(), Err> {
-        ctx.ready(&self.service).await.map_err(From::from)
+    async fn ready(&self, ctx: Ctx<'_, Self, St>) -> Result<(), Err> {
+        ctx.ready(&self.svc).await.map_err(From::from)
     }
 
     #[inline]
-    async fn call(
-        &self,
-        req: In,
-        ctx: ServiceCtx<'_, Self>,
-    ) -> Result<Self::Response, Self::Error> {
-        let (idx, waiters) = ctx.inner();
-
+    async fn call(&self, req: In, ctx: Ctx<'_, Self, St>) -> Result<Out, Err> {
         let ctx = ApplyCtx {
-            idx,
-            waiters,
-            service: &self.service,
+            ctx: ctx.cast(),
+            service: &self.svc,
+            r: marker::PhantomData,
         };
         (self.f)(req, &ctx).await
     }
 
-    crate::forward_poll!(service);
-    crate::forward_shutdown!(service);
+    crate::forward_shutdown!(St, svc);
 }
 
-/// `apply()` service factory
-pub struct ApplyFactory<T, Req, Cfg, F, In, Out, Err>
+/// Service factory produced by [`apply_fn_factory`].
+pub struct ApplyFactory<F, Sf, St, Req, In, Out, Err>
 where
-    T: ServiceFactory<Req, Cfg>,
-    F: AsyncFn(In, &ApplyCtx<'_, T::Service>) -> Result<Out, Err> + Clone,
+    F: AsyncFn(In, &ApplyCtx<'_, Sf::Service, St, Req>) -> Result<Out, Err> + Clone,
+    Sf: ServiceFactory<St, Req>,
 {
-    service: T,
     f: F,
-    r: marker::PhantomData<fn(Req, Cfg) -> (In, Out)>,
+    sf: Sf,
+    r: marker::PhantomData<fn(St, Req) -> (In, Out)>,
 }
 
-impl<T, Req, Cfg, F, In, Out, Err> ApplyFactory<T, Req, Cfg, F, In, Out, Err>
+impl<F, Sf, St, Req, In, Out, Err> ApplyFactory<F, Sf, St, Req, In, Out, Err>
 where
-    T: ServiceFactory<Req, Cfg>,
-    F: AsyncFn(In, &ApplyCtx<'_, T::Service>) -> Result<Out, Err> + Clone,
-    Err: From<T::Error>,
+    F: AsyncFn(In, &ApplyCtx<'_, Sf::Service, St, Req>) -> Result<Out, Err> + Clone,
+    Sf: ServiceFactory<St, Req>,
 {
-    /// Create new `ApplyNewService` new service instance
-    pub(crate) fn new(service: T, f: F) -> Self {
+    /// Creates a new `ApplyFactory`.
+    pub(crate) fn new(sf: Sf, f: F) -> Self
+    where
+        Sf: ServiceFactory<St, Req>,
+        Err: From<Sf::Error>,
+    {
         Self {
             f,
-            service,
+            sf,
             r: marker::PhantomData,
         }
     }
 }
 
-impl<T, Req, Cfg, F, In, Out, Err> Clone for ApplyFactory<T, Req, Cfg, F, In, Out, Err>
+impl<F, Sf, St, Req, In, Out, Err> Clone for ApplyFactory<F, Sf, St, Req, In, Out, Err>
 where
-    T: ServiceFactory<Req, Cfg> + Clone,
-    F: AsyncFn(In, &ApplyCtx<'_, T::Service>) -> Result<Out, Err> + Clone,
-    Err: From<T::Error>,
+    F: AsyncFn(In, &ApplyCtx<'_, Sf::Service, St, Req>) -> Result<Out, Err> + Clone,
+    Sf: ServiceFactory<St, Req> + Clone,
 {
     fn clone(&self) -> Self {
         Self {
-            service: self.service.clone(),
             f: self.f.clone(),
+            sf: self.sf.clone(),
             r: marker::PhantomData,
         }
     }
 }
 
-impl<T, Req, Cfg, F, In, Out, Err> fmt::Debug for ApplyFactory<T, Req, Cfg, F, In, Out, Err>
+impl<F, Sf, St, Req, In, Out, Err> fmt::Debug for ApplyFactory<F, Sf, St, Req, In, Out, Err>
 where
-    T: ServiceFactory<Req, Cfg> + fmt::Debug,
-    F: AsyncFn(In, &ApplyCtx<'_, T::Service>) -> Result<Out, Err> + Clone,
-    Err: From<T::Error>,
+    F: AsyncFn(In, &ApplyCtx<'_, Sf::Service, St, Req>) -> Result<Out, Err> + Clone,
+    Sf: ServiceFactory<St, Req> + fmt::Debug,
 {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("ApplyFactory")
-            .field("factory", &self.service)
+            .field("factory", &self.sf)
             .field("map", &std::any::type_name::<F>())
             .finish()
     }
 }
 
-impl<T, Req, Cfg, F, In, Out, Err> ServiceFactory<In, Cfg>
-    for ApplyFactory<T, Req, Cfg, F, In, Out, Err>
+impl<F, Sf, St, Req, In, Out, Err> ServiceFactory<St, In>
+    for ApplyFactory<F, Sf, St, Req, In, Out, Err>
 where
-    T: ServiceFactory<Req, Cfg>,
-    F: AsyncFn(In, &ApplyCtx<'_, T::Service>) -> Result<Out, Err> + Clone,
-    Err: From<T::Error>,
+    F: AsyncFn(In, &ApplyCtx<'_, Sf::Service, St, Req>) -> Result<Out, Err> + Clone,
+    Sf: ServiceFactory<St, Req>,
+    Err: From<Sf::Error>,
 {
-    type Response = Out;
+    type Res = Out;
     type Error = Err;
 
-    type Service = Apply<T::Service, Req, F, In, Out, Err>;
-    type InitError = T::InitError;
+    type Service = Apply<Sf::Service, St, Req, F, In, Out, Err>;
+    type InitError = Sf::InitError;
 
     #[inline]
-    async fn create(&self, cfg: Cfg) -> Result<Self::Service, Self::InitError> {
-        self.service.create(cfg).await.map(|service| Apply {
-            service,
-            f: self.f.clone(),
-            r: marker::PhantomData,
-        })
+    async fn create(&self, st: &St) -> Result<Self::Service, Self::InitError> {
+        self.sf
+            .create(st)
+            .await
+            .map(|svc| Apply::new(svc, self.f.clone()))
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use ntex::util::lazy;
-    use std::{cell::Cell, rc::Rc, task::Context};
+    use std::{cell::Cell, rc::Rc};
 
     use super::*;
-    use crate::{chain, chain_factory, fn_factory};
+    use crate::{factory, fn_factory, service};
 
     #[derive(Debug, Default, Clone)]
     struct Srv(Rc<Cell<usize>>);
 
-    impl Service<()> for Srv {
-        type Response = ();
+    impl Service<(), ()> for Srv {
+        type Res = ();
         type Error = ();
 
-        async fn call(&self, _r: (), _: ServiceCtx<'_, Self>) -> Result<(), ()> {
+        async fn call(&self, _r: (), _: Ctx<'_, Self>) -> Result<(), ()> {
             Ok(())
         }
 
-        fn poll(&self, _: &mut Context<'_>) -> Result<(), Self::Error> {
+        async fn ready(&self, _: Ctx<'_, Self>) -> Result<(), ()> {
             self.0.set(self.0.get() + 1);
             Ok(())
         }
 
-        async fn shutdown(&self) {
+        async fn shutdown(&self, _: Ctx<'_, Self, ()>) {
             self.0.set(self.0.get() + 1);
         }
     }
@@ -257,19 +267,16 @@ mod tests {
     #[ntex::test]
     async fn test_call() {
         let cnt_sht = Rc::new(Cell::new(0));
-        let srv = chain(
+        let srv = service(
             apply_fn(Srv(cnt_sht.clone()), async move |req: &'static str, svc| {
                 svc.call(()).await.unwrap();
                 Ok((req, ()))
             })
             .clone(),
         )
-        .into_pipeline();
+        .pipeline(());
 
         assert_eq!(srv.ready().await, Ok::<_, Err>(()));
-
-        lazy(|cx| srv.poll(cx)).await.unwrap();
-        assert_eq!(cnt_sht.get(), 1);
 
         srv.shutdown().await;
         assert_eq!(cnt_sht.get(), 2);
@@ -280,20 +287,23 @@ mod tests {
     }
 
     #[ntex::test]
-    async fn test_call_chain() {
+    async fn test_call_svc() {
         let cnt_sht = Rc::new(Cell::new(0));
-        let srv = chain(Srv(cnt_sht.clone()))
+        let srv = service(Srv(cnt_sht.clone()))
             .apply_fn(async move |req: &'static str, svc| {
+                svc.st();
                 svc.call(()).await.unwrap();
                 Ok((req, ()))
             })
-            .clone()
-            .into_pipeline();
+            .clone();
+        let s = format!("{srv:?}");
+        assert!(s.contains("Apply"), "{}", s);
 
+        let srv = srv.pipeline(());
         assert_eq!(srv.ready().await, Ok::<_, Err>(()));
 
         srv.shutdown().await;
-        assert_eq!(cnt_sht.get(), 1);
+        assert_eq!(cnt_sht.get(), 2);
 
         let res = srv.call("srv").await;
         assert!(res.is_ok());
@@ -303,45 +313,72 @@ mod tests {
 
     #[ntex::test]
     async fn test_create() {
-        let new_srv = chain_factory(
-            apply_fn_factory(
-                fn_factory(|| async { Ok::<_, ()>(Srv::default()) }),
-                async move |req: &'static str, srv| {
-                    srv.call(()).await.unwrap();
-                    Ok((req, ()))
-                },
-            )
-            .clone(),
-        );
+        let new_srv = factory(apply_fn_factory(
+            fn_factory(|(): &()| async { Ok::<_, ()>(Srv::default()) }),
+            async move |req: &'static str, srv| {
+                srv.call(()).await.unwrap();
+                Ok((req, ()))
+            },
+        ));
 
-        let srv = new_srv.pipeline(&()).await.unwrap();
+        let srv = new_srv.pipeline(()).await.unwrap();
 
         assert_eq!(srv.ready().await, Ok::<_, Err>(()));
 
         let res = srv.call("srv").await;
         assert!(res.is_ok());
         assert_eq!(res.unwrap(), ("srv", ()));
-        let _ = format!("{new_srv:?}");
-
-        assert!(Err == Err::from(()));
+        assert_eq!(Err, Err::from(()));
     }
 
     #[ntex::test]
     async fn test_create_chain() {
-        let new_srv = chain_factory(fn_factory(|| async { Ok::<_, ()>(Srv::default()) }))
-            .apply_fn(async move |req: &'static str, srv| {
-                srv.call(()).await.unwrap();
-                Ok((req, ()))
-            })
-            .clone();
+        let checks = Rc::new(Cell::new(0));
+        let created = checks.clone();
+        let new_srv = factory(fn_factory(move |(): &()| {
+            let created = created.clone();
+            async move { Ok::<_, ()>(Srv(created)) }
+        }))
+        .apply_fn(async move |req: &'static str, srv| {
+            srv.call(()).await.unwrap();
+            Ok((req, ()))
+        })
+        .clone();
 
-        let srv = new_srv.pipeline(&()).await.unwrap();
+        let srv = new_srv.pipeline(()).await.unwrap();
 
         assert_eq!(srv.ready().await, Ok::<_, Err>(()));
 
         let res = srv.call("srv").await;
         assert!(res.is_ok());
         assert_eq!(res.unwrap(), ("srv", ()));
+        assert_eq!(checks.get(), 1);
+        let other = new_srv.pipeline(()).await.unwrap();
+        assert!(other.call("fresh").await.is_ok());
+        assert_eq!(checks.get(), 2);
         let _ = format!("{new_srv:?}");
+    }
+
+    mod readiness {
+        use std::rc::Rc;
+
+        use crate::util::tests::{Req, Single, State, concurrent_entry};
+        use crate::{Pipeline, apply::Apply};
+
+        #[ntex::test]
+        async fn concurrent_entry_after_await() {
+            let st = Rc::new(State::default());
+            let pl = Pipeline::new(
+                (),
+                Apply::new(
+                    crate::ready(Single(st.clone())),
+                    async |(rx1, rx2): Req, svc| {
+                        let _ = rx1.await;
+                        svc.call(rx2).await
+                    },
+                ),
+            );
+            concurrent_entry(&pl, &st).await;
+        }
     }
 }

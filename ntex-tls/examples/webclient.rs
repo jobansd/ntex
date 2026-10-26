@@ -1,9 +1,9 @@
-use ntex::SharedCfg;
-use ntex::client::{Client, Connector, error::ClientError};
+use ntex::client::{Client, ClientConfig, error::ClientError};
+use ntex::{SharedCfg, error::Error, time::Seconds};
 use tls_openssl::ssl::{self, SslMethod, SslVerifyMode};
 
 #[ntex::main]
-async fn main() -> Result<(), ClientError> {
+async fn main() -> Result<(), Error<ClientError>> {
     env_logger::init();
     println!("Connecting to openssl webserver: 127.0.0.1:8443");
 
@@ -12,22 +12,12 @@ async fn main() -> Result<(), ClientError> {
     builder.set_verify(SslVerifyMode::NONE);
 
     // h2 alpn config
-    builder.set_alpn_select_callback(|_, protos| {
-        const H2: &[u8] = b"\x02h2";
-        if protos.windows(3).any(|window| window == H2) {
-            Ok(b"h2")
-        } else {
-            Err(ssl::AlpnError::NOACK)
-        }
-    });
     builder.set_alpn_protos(b"\x02h2").unwrap();
 
     // create client
     let client = Client::builder()
-        .connector::<&str>(Connector::default().openssl(builder.build()))
-        .build(SharedCfg::default())
-        .await
-        .unwrap();
+        .openssl(builder.build())
+        .build(SharedCfg::new("H").add(ClientConfig::new().set_response_timeout(Seconds(5))));
 
     // Create request builder, configure request and send
     let response = client

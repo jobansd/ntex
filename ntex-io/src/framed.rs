@@ -5,7 +5,7 @@ use ntex_util::future::Either;
 
 use crate::IoBoxed;
 
-/// A unified interface to an underlying I/O stream.
+/// A codec-driven interface to an underlying I/O stream.
 ///
 /// Uses the `Encoder` and `Decoder` traits to encode and decode frames.
 pub struct Framed<U> {
@@ -14,8 +14,7 @@ pub struct Framed<U> {
 }
 
 impl<U> Framed<U> {
-    /// Provides an interface for reading from and writing to an `Io` object,
-    /// using the `Decode` and `Encode` traits of the codec.
+    /// Wraps an I/O object with a codec.
     pub fn new<Io>(io: Io, codec: U) -> Framed<U>
     where
         IoBoxed: From<Io>,
@@ -39,7 +38,7 @@ impl<U> Framed<U> {
     }
 
     #[inline]
-    /// Return inner types of framed object.
+    /// Returns the underlying I/O object and codec.
     pub fn into_inner(self) -> (IoBoxed, U) {
         (self.io, self.codec)
     }
@@ -49,15 +48,15 @@ impl<U> Framed<U>
 where
     U: Decoder + Encoder,
 {
-    /// Wake write task and instruct to flush data.
+    /// Flushes encoded data to the transport.
     ///
-    /// This is async version of `poll_flush()` method.
-    pub async fn flush(&self, full: bool) -> Result<(), io::Error> {
+    /// If `full` is `true`, waits until all buffered data has been written.
+    pub async fn flush(&self, full: bool) -> io::Result<()> {
         self.io.flush(full).await
     }
 
-    /// Shut down io stream.
-    pub async fn shutdown(&self) -> Result<(), io::Error> {
+    /// Gracefully shuts down the I/O stream.
+    pub async fn shutdown(&self) -> io::Result<()> {
         self.io.shutdown().await
     }
 }
@@ -67,7 +66,12 @@ where
     U: Decoder,
 {
     #[inline]
-    /// Read incoming io stream and decode codec item.
+    /// Reads and decodes the next item.
+    ///
+    /// Returns `Ok(None)` when the connection can no longer produce another
+    /// complete item and no error was recorded. Codec errors are returned in
+    /// `Either::Left`; dispatcher timeouts and connection errors from the
+    /// transport, a filter, or shutdown are returned in `Either::Right`.
     pub async fn recv(&self) -> Result<Option<U::Item>, Either<U::Error, io::Error>> {
         self.io.recv(&self.codec).await
     }
@@ -78,7 +82,11 @@ where
     U: Encoder,
 {
     #[inline]
-    /// Serialize item and write to the inner buffer
+    /// Encodes an item and fully flushes it to the transport.
+    ///
+    /// Codec errors are returned in `Either::Left`; connection errors from the
+    /// transport, a filter, or shutdown, including an expired write timeout,
+    /// are returned in `Either::Right`.
     pub async fn send(
         &self,
         item: <U as Encoder>::Item,
@@ -127,5 +135,8 @@ mod tests {
 
         server.shutdown().await.unwrap();
         assert!(client.is_closed());
+
+        let (io, _codec) = server.into_inner();
+        assert!(io.is_closed());
     }
 }

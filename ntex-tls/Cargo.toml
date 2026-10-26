@@ -1,6 +1,6 @@
 [package]
 name = "ntex-tls"
-version = "3.6.2"
+version = "4.4.0"
 authors = ["ntex contributors <team@ntex.rs>"]
 description = "An implementation of SSL streams for ntex backed by OpenSSL"
 keywords = ["network", "framework", "async", "futures"]
@@ -10,7 +10,7 @@ documentation = "https://docs.rs/ntex-tls/"
 categories = ["network-programming", "asynchronous"]
 license = "MIT OR Apache-2.0"
 edition = "2024"
-rust-version = "1.88"
+rust-version = "1.97"
 
 [lib]
 name = "ntex_tls"
@@ -23,11 +23,14 @@ workspace = true
 default = []
 
 # openssl
-openssl = ["tls_openssl"]
+openssl = ["tls_openssl", "openssl-sys", "foreign-types-shared"]
 
 # rustls support
 rustls = ["tls_rustls", "tls_rustls/std"]
 rustls-ring = ["tls_rustls", "tls_rustls/ring", "tls_rustls/std"]
+
+# Windows Schannel support
+schannel = ["windows-sys"]
 
 [dependencies]
 ntex-bytes = { workspace = true }
@@ -38,16 +41,37 @@ ntex-service = { workspace = true }
 ntex-net = { workspace = true }
 
 log = { workspace = true }
+thiserror = { workspace = true }
 
 # openssl
 tls_openssl = { workspace = true, optional = true }
+openssl-sys = { workspace = true, optional = true }
+foreign-types-shared = { workspace = true, optional = true }
 
 # rustls
 tls_rustls = { workspace = true, optional = true }
+
+# Windows Schannel
+windows-sys = { workspace = true, optional = true, features = [
+    "Win32_Foundation",
+    "Win32_Security_Authentication_Identity",
+    "Win32_Security_Credentials",
+    "Win32_Security_Cryptography",
+    "Win32_System_SystemInformation",
+    "Wdk_System_SystemServices",
+] }
 
 [dev-dependencies]
 ntex = { workspace = true, features = ["openssl", "rustls"] }
 env_logger = { workspace = true }
 rustls-pemfile = { workspace = true }
 webpki-roots = { workspace = true }
-tls_rustls = { workspace = true, features = ["ring", "std"] }
+tls_rustls = { workspace = true, features = ["ring", "std", "tls12"] }
+
+[[example]]
+name = "schannel-client"
+required-features = ["schannel"]
+
+[[example]]
+name = "schannel-server"
+required-features = ["schannel"]

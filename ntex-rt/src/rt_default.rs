@@ -1,4 +1,4 @@
-use std::{fmt, future::Future, future::poll_fn};
+use std::{fmt, future::Future, time::Instant};
 
 pub use crate::{handle::JoinHandle, rt::Handle, rt::Runtime};
 
@@ -13,18 +13,39 @@ impl fmt::Display for JoinError {
 
 impl std::error::Error for JoinError {}
 
+/// Returns the start of the current runtime turn.
+///
+/// Tasks polled in the same turn observe the same instant, see
+/// [`Runtime::now`]. Returns [`Instant::now()`] outside of a runtime.
+#[inline]
+pub fn now() -> Instant {
+    crate::rt::Runtime::current_now()
+}
+
+#[track_caller]
 pub fn spawn<F>(fut: F) -> JoinHandle<F::Output>
 where
     F: Future + 'static,
 {
-    if let Some(mut data) = crate::task::Data::load() {
-        crate::rt::Runtime::with_current(|rt| {
-            rt.spawn(async move {
-                let mut f = std::pin::pin!(fut);
-                poll_fn(|cx| data.run(|| f.as_mut().poll(cx))).await
-            })
-        })
-    } else {
-        crate::rt::Runtime::with_current(|rt| rt.spawn(fut))
-    }
+    let location = std::panic::Location::caller();
+    let fut = crate::task::wrap(fut);
+    crate::rt::Runtime::with_current(|rt| unsafe { rt.spawn_at(fut, location) })
+}
+
+/// Spawns a future on the current thread without a join handle.
+///
+/// The output is dropped when the task completes. Unlike dropping the
+/// [`JoinHandle`] returned by [`spawn()`], this does not allocate a handle.
+///
+/// # Panics
+///
+/// This function panics if ntex system is not running.
+#[track_caller]
+pub fn spawn_detached<F>(fut: F)
+where
+    F: Future + 'static,
+{
+    let location = std::panic::Location::caller();
+    let fut = crate::task::wrap(fut);
+    crate::rt::Runtime::with_current(|rt| unsafe { rt.spawn_detached_at(fut, location) });
 }

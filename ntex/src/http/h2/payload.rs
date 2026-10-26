@@ -5,6 +5,7 @@ use std::{cell::Cell, cell::RefCell, fmt, future::poll_fn, pin::Pin, rc::Rc, rc:
 
 use ntex_h2::{self as h2};
 
+use crate::http::HeaderMap;
 use crate::util::{Bytes, Stream};
 use crate::{http::error::PayloadError, task::LocalWaker};
 
@@ -13,16 +14,18 @@ bitflags::bitflags! {
     struct Flags: u8 {
         const EOF = 0b0000_0001;
         const DROPPED = 0b0000_0010;
+        const ERROR = 0b0000_0100;
     }
 }
 
-/// Buffered stream of byte chunks
+/// Buffered HTTP/2 payload stream.
 ///
-/// Payload stores chunks in a vector. First chunk can be received with
-/// `.readany()` method. Payload stream is not thread safe. Payload does not
-/// notify current task when new data is available.
+/// Use [`Payload::read`] to receive the next chunk asynchronously, or consume
+/// the payload through its [`Stream`] implementation. Waiting tasks are woken
+/// when data, end-of-stream, or an error becomes available.
 ///
-/// Payload stream can be used as `Response` body stream.
+/// This type is not thread-safe and can also be used as a
+/// [`Response`](crate::http::Response) body stream.
 #[derive(Debug)]
 pub struct Payload {
     inner: Rc<Inner>,
@@ -49,16 +52,29 @@ impl Payload {
     }
 
     #[inline]
+    /// Receives the next payload chunk.
+    ///
+    /// Returns `None` after the complete payload has been received.
     pub async fn read(&self) -> Option<Result<Bytes, PayloadError>> {
         poll_fn(|cx| self.poll_read(cx)).await
     }
 
     #[inline]
-    pub fn poll_read(
-        &self,
-        cx: &mut Context<'_>,
-    ) -> Poll<Option<Result<Bytes, PayloadError>>> {
+    /// Polls for the next payload chunk.
+    pub fn poll_read(&self, cx: &mut Context<'_>) -> Poll<Option<Result<Bytes, PayloadError>>> {
         self.inner.readany(cx)
+    }
+
+    /// Returns the trailer fields received at the end of the payload.
+    ///
+    /// Trailers are available after the payload is complete, None is
+    /// returned if the payload is not complete or has no trailers.
+    pub fn trailers(&self) -> Option<HeaderMap> {
+        if self.inner.items.borrow().is_empty() {
+            self.inner.trailers.borrow().clone()
+        } else {
+            None
+        }
     }
 }
 
@@ -66,6 +82,9 @@ impl Drop for Payload {
     fn drop(&mut self) {
         self.inner.io_task.wake();
         self.inner.insert_flags(Flags::DROPPED);
+        if let Some(f) = self.inner.on_drop.take() {
+            f();
+        }
     }
 }
 
@@ -88,36 +107,51 @@ pub struct PayloadSender {
 
 impl Drop for PayloadSender {
     fn drop(&mut self) {
-        if let Some(shared) = self.inner.upgrade()
-            && !shared.flags.get().contains(Flags::EOF)
-        {
-            self.set_error(PayloadError::Incomplete(None));
+        if let Some(shared) = self.inner.upgrade() {
+            drop(shared.on_drop.take());
+            shared.set_error(PayloadError::Incomplete(None));
         }
     }
 }
 
 impl PayloadSender {
+    /// Checks if the payload stream is dropped.
+    pub(crate) fn is_dropped(&self) -> bool {
+        self.inner.strong_count() == 0
+    }
+
+    /// Closes the payload stream with an error.
     pub fn set_error(&self, err: PayloadError) {
         if let Some(shared) = self.inner.upgrade() {
             shared.set_error(err);
         }
     }
 
-    pub fn feed_eof(&self, data: Bytes) {
+    /// Sends the final payload chunk and closes the stream.
+    pub fn feed_eof(&self, data: Bytes, cap: Option<h2::Capacity>) {
         if let Some(shared) = self.inner.upgrade() {
-            shared.feed_eof(data);
+            shared.feed_eof(data, cap);
         }
     }
 
+    /// Sends the trailer fields and closes the stream.
+    pub fn feed_trailers(&self, trailers: HeaderMap) {
+        if let Some(shared) = self.inner.upgrade() {
+            shared.feed_trailers(trailers);
+        }
+    }
+
+    /// Sends a payload chunk and updates the HTTP/2 flow-control capacity.
     pub fn feed_data(&self, data: Bytes, cap: h2::Capacity) {
         if let Some(shared) = self.inner.upgrade() {
             shared.feed_data(data, cap);
         }
     }
 
-    pub fn set_stream(&self, stream: Option<h2::Stream>) {
+    /// Registers a callback that runs if the payload is dropped while the sender is alive.
+    pub(crate) fn on_drop(&self, f: impl FnOnce() + 'static) {
         if let Some(shared) = self.inner.upgrade() {
-            shared.stream.set(stream);
+            shared.on_drop.set(Some(Box::new(f)));
         }
     }
 
@@ -140,9 +174,10 @@ struct Inner {
     cap: Cell<Option<h2::Capacity>>,
     err: Cell<Option<PayloadError>>,
     items: RefCell<VecDeque<Bytes>>,
+    trailers: RefCell<Option<HeaderMap>>,
     task: LocalWaker,
     io_task: LocalWaker,
-    stream: Cell<Option<h2::Stream>>,
+    on_drop: Cell<Option<Box<dyn FnOnce()>>>,
 }
 
 impl Inner {
@@ -151,10 +186,11 @@ impl Inner {
             cap: Cell::new(Some(cap)),
             flags: Cell::new(Flags::empty()),
             err: Cell::new(None),
-            stream: Cell::new(None),
             items: RefCell::new(VecDeque::new()),
+            trailers: RefCell::new(None),
             task: LocalWaker::new(),
             io_task: LocalWaker::new(),
+            on_drop: Cell::new(None),
         }
     }
 
@@ -165,11 +201,18 @@ impl Inner {
     }
 
     fn set_error(&self, err: PayloadError) {
-        self.err.set(Some(err));
-        self.task.wake();
+        // the first error is kept, a finished payload is not failed
+        if !self.flags.get().intersects(Flags::EOF | Flags::ERROR) {
+            self.insert_flags(Flags::ERROR);
+            self.err.set(Some(err));
+            self.task.wake();
+        }
     }
 
-    fn feed_eof(&self, data: Bytes) {
+    fn feed_eof(&self, data: Bytes, cap: Option<h2::Capacity>) {
+        if let Some(cap) = cap {
+            self.cap.set(Some(self.cap.take().unwrap() + cap));
+        }
         self.insert_flags(Flags::EOF);
         if !data.is_empty() {
             self.items.borrow_mut().push_back(data);
@@ -177,32 +220,37 @@ impl Inner {
         self.task.wake();
     }
 
+    fn feed_trailers(&self, trailers: HeaderMap) {
+        if !self.flags.get().intersects(Flags::EOF | Flags::ERROR) {
+            *self.trailers.borrow_mut() = Some(trailers);
+            self.insert_flags(Flags::EOF);
+            self.task.wake();
+        }
+    }
+
     fn feed_data(&self, data: Bytes, cap: h2::Capacity) {
         self.cap.set(Some(self.cap.take().unwrap() + cap));
-        self.items.borrow_mut().push_back(data);
-        self.task.wake();
+        // empty DATA frames are not flow controlled, queueing them is unbounded
+        if !data.is_empty() {
+            self.items.borrow_mut().push_back(data);
+            self.task.wake();
+        }
     }
 
     fn readany(&self, cx: &mut Context<'_>) -> Poll<Option<Result<Bytes, PayloadError>>> {
         if let Some(data) = self.items.borrow_mut().pop_front() {
-            if !self.flags.get().contains(Flags::EOF) {
-                let cap = self.cap.take().unwrap();
-                cap.consume(data.len() as u32);
-                let size = cap.size();
-                self.cap.set(Some(cap));
-
-                if size == 0 {
-                    self.task.register(cx.waker());
-                }
-            }
+            let cap = self.cap.take().unwrap();
+            cap.consume(data.len() as u32);
+            self.cap.set(Some(cap));
             Poll::Ready(Some(Ok(data)))
         } else if let Some(err) = self.err.take() {
+            // the payload ends after an error
+            self.insert_flags(Flags::EOF);
             Poll::Ready(Some(Err(err)))
         } else if self.flags.get().contains(Flags::EOF) {
             Poll::Ready(None)
         } else {
             self.task.register(cx.waker());
-            self.io_task.wake();
             Poll::Pending
         }
     }
@@ -218,10 +266,190 @@ impl fmt::Debug for Inner {
             .field("capacity", &cap)
             .field("error", &err)
             .field("items", &self.items.borrow())
+            .field("trailers", &self.trailers.borrow())
             .finish();
 
         self.cap.set(Some(cap));
         self.err.set(err);
         result
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::{Arc, atomic::AtomicUsize, atomic::Ordering};
+    use std::task::Wake;
+
+    use ntex_h2::client::SimpleClient;
+
+    use super::*;
+    use crate::http::{HeaderMap, Method};
+    use crate::io::{Io, IoBoxed, testing::IoTest};
+    use crate::{SharedCfg, time::Millis, time::sleep, util::ByteString};
+
+    struct Counter(AtomicUsize);
+
+    impl Wake for Counter {
+        fn wake(self: Arc<Self>) {
+            self.0.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+
+    /// A pending read does not wake the payload io task, only dropping the payload does.
+    #[crate::rt_test]
+    async fn test_pending_read_does_not_wake_io_task() {
+        let (io, server) = IoTest::create();
+        io.remote_buffer_cap(64 * 1024);
+        let client = SimpleClient::new(
+            IoBoxed::from(Io::new(io, SharedCfg::default())),
+            false,
+            ByteString::from_static("localhost"),
+        );
+        server.write([0, 0, 0, 4, 0, 0, 0, 0, 0]);
+        sleep(Millis(50)).await;
+        let (snd, _rcv) = client
+            .send(Method::GET, "/".into(), HeaderMap::default(), true)
+            .await
+            .unwrap();
+
+        let (sender, payload) = Payload::create(snd.stream().empty_capacity());
+        let io_task = Arc::new(Counter(AtomicUsize::new(0)));
+        let io_waker = io_task.clone().into();
+        assert!(sender.on_cancel(&io_waker).is_pending());
+
+        let reader = Arc::new(Counter(AtomicUsize::new(0)));
+        let reader_waker = reader.clone().into();
+        let mut cx = Context::from_waker(&reader_waker);
+        for _ in 0..3 {
+            assert!(payload.poll_read(&mut cx).is_pending());
+        }
+        assert_eq!(io_task.0.load(Ordering::SeqCst), 0);
+
+        drop(payload);
+        assert_eq!(io_task.0.load(Ordering::SeqCst), 1);
+        assert!(sender.on_cancel(&io_waker).is_ready());
+    }
+
+    /// A ready read does not register the reader waker, new data does not wake
+    /// a reader that is not waiting.
+    #[crate::rt_test]
+    async fn test_ready_read_does_not_register_waker() {
+        let (io, server) = IoTest::create();
+        io.remote_buffer_cap(64 * 1024);
+        let client = SimpleClient::new(
+            IoBoxed::from(Io::new(io, SharedCfg::default())),
+            false,
+            ByteString::from_static("localhost"),
+        );
+        server.write([0, 0, 0, 4, 0, 0, 0, 0, 0]);
+        sleep(Millis(50)).await;
+        let (snd, rcv) = client
+            .send(Method::GET, "/".into(), HeaderMap::default(), true)
+            .await
+            .unwrap();
+
+        // `200` response and two DATA frames
+        server.write([0, 0, 1, 1, 4, 0, 0, 0, 1, 0x88]);
+        server.write([0, 0, 2, 0, 0, 0, 0, 0, 1, b'a', b'b']);
+        server.write([0, 0, 2, 0, 0, 0, 0, 0, 1, b'c', b'd']);
+        let _ = rcv.recv().await.unwrap();
+        let mut chunks = Vec::new();
+        for _ in 0..2 {
+            let msg = rcv.recv().await.unwrap();
+            let h2::MessageKind::Data(data, cap) = msg.kind else {
+                panic!("unexpected message: {msg:?}")
+            };
+            chunks.push((data, cap));
+        }
+
+        let (sender, payload) = Payload::create(snd.stream().empty_capacity());
+        let reader = Arc::new(Counter(AtomicUsize::new(0)));
+        let reader_waker = reader.clone().into();
+        let mut cx = Context::from_waker(&reader_waker);
+
+        let (data, cap) = chunks.remove(0);
+        sender.feed_data(data, cap);
+        assert!(matches!(payload.poll_read(&mut cx), Poll::Ready(Some(Ok(ref d))) if d == "ab"));
+
+        let (data, cap) = chunks.remove(0);
+        sender.feed_data(data, cap);
+        assert_eq!(reader.0.load(Ordering::SeqCst), 0);
+        assert!(matches!(payload.poll_read(&mut cx), Poll::Ready(Some(Ok(ref d))) if d == "cd"));
+    }
+
+    /// Trailers are available after all queued data is read.
+    #[crate::rt_test]
+    async fn test_trailers_after_data() {
+        let (io, server) = IoTest::create();
+        io.remote_buffer_cap(64 * 1024);
+        let client = SimpleClient::new(
+            IoBoxed::from(Io::new(io, SharedCfg::default())),
+            false,
+            ByteString::from_static("localhost"),
+        );
+        server.write([0, 0, 0, 4, 0, 0, 0, 0, 0]);
+        sleep(Millis(50)).await;
+        let (snd, rcv) = client
+            .send(Method::GET, "/".into(), HeaderMap::default(), true)
+            .await
+            .unwrap();
+
+        // `200` response and a DATA frame
+        server.write([0, 0, 1, 1, 4, 0, 0, 0, 1, 0x88]);
+        server.write([0, 0, 2, 0, 0, 0, 0, 0, 1, b'a', b'b']);
+        let _ = rcv.recv().await.unwrap();
+        let msg = rcv.recv().await.unwrap();
+        let h2::MessageKind::Data(data, cap) = msg.kind else {
+            panic!("unexpected message: {msg:?}")
+        };
+
+        let (sender, payload) = Payload::create(snd.stream().empty_capacity());
+        sender.feed_data(data, cap);
+        let mut trailers = HeaderMap::default();
+        trailers.insert(
+            crate::http::header::HeaderName::from_static("x-trailer"),
+            crate::http::header::HeaderValue::from_static("1"),
+        );
+        sender.feed_trailers(trailers);
+        // ignored, the payload is complete
+        sender.set_error(PayloadError::Incomplete(None));
+        assert!(payload.trailers().is_none());
+
+        assert_eq!(payload.read().await.unwrap().unwrap(), "ab");
+        assert_eq!(payload.trailers().unwrap().get("x-trailer").unwrap(), "1");
+        assert!(payload.read().await.is_none());
+        assert!(payload.trailers().is_some());
+    }
+
+    #[crate::rt_test]
+    async fn test_debug_and_stream() {
+        use crate::util::stream_recv;
+
+        let (io, server) = IoTest::create();
+        io.remote_buffer_cap(64 * 1024);
+        let client = SimpleClient::new(
+            IoBoxed::from(Io::new(io, SharedCfg::default())),
+            false,
+            ByteString::from_static("localhost"),
+        );
+        server.write([0, 0, 0, 4, 0, 0, 0, 0, 0]);
+        sleep(Millis(50)).await;
+        let (snd, _rcv) = client
+            .send(Method::GET, "/".into(), HeaderMap::default(), true)
+            .await
+            .unwrap();
+
+        let (sender, mut payload) = Payload::create(snd.stream().empty_capacity());
+        let s = format!("{payload:?}");
+        assert!(s.contains("Inner") && s.contains("capacity"), "{s}");
+
+        let mut trailers = HeaderMap::default();
+        trailers.insert(
+            crate::http::header::HeaderName::from_static("x-trailer"),
+            crate::http::header::HeaderValue::from_static("1"),
+        );
+        sender.feed_trailers(trailers);
+        assert!(stream_recv(&mut payload).await.is_none());
+        assert_eq!(payload.trailers().unwrap().len(), 1);
     }
 }

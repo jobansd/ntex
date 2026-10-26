@@ -4,8 +4,7 @@ use std::{fmt, ops};
 use serde::de;
 
 use crate::http::Payload;
-use crate::web::error::{ErrorRenderer, QueryPayloadError};
-use crate::web::{FromRequest, HttpRequest};
+use crate::web::{FromRequest, HttpRequest, State, error::QueryPayloadError};
 
 /// Extract typed information from the request's query.
 ///
@@ -13,7 +12,9 @@ use crate::web::{FromRequest, HttpRequest};
 /// be decoded into any type which depends upon data ordering e.g. tuples or tuple-structs.
 /// Attempts to do so will *fail at runtime*.
 ///
-/// [**`QueryConfig`**](struct.QueryConfig.html) allows to configure extraction process.
+/// If the query string cannot be deserialized into `T`, extraction fails with
+/// [`QueryPayloadError`](crate::web::error::QueryPayloadError), which the default
+/// error domain renders as `400 Bad Request`.
 ///
 /// ## Example
 ///
@@ -33,14 +34,15 @@ use crate::web::{FromRequest, HttpRequest};
 /// }
 ///
 /// // Use `Query` extractor for query information (and destructure it within the signature).
-/// // This handler gets called only if the request's query string contains a `username` field.
-/// // The correct request for this handler would be `/index.html?id=64&response_type=Code"`.
+/// // If `id` or `response_type` is missing or invalid, extraction fails and the
+/// // handler is not called.
+/// // The correct request for this handler would be `/index.html?id=64&response_type=Code`.
 /// async fn index(web::types::Query(info): web::types::Query<AuthRequest>) -> String {
 ///     format!("Authorization request for client with id={} and type={:?}!", info.id, info.response_type)
 /// }
 ///
 /// fn main() {
-///     let app = web::App::new().service(
+///     let app = web::App::default().service(
 ///        web::resource("/index.html").route(web::get().to(index))); // <- use `Query` extractor
 /// }
 /// ```
@@ -111,27 +113,28 @@ impl<T: fmt::Display> fmt::Display for Query<T> {
 /// }
 ///
 /// // Use `Query` extractor for query information.
-/// // This handler get called only if request's query contains `username` field
-/// // The correct request for this handler would be `/index.html?id=64&response_type=Code"`
+/// // If `id` or `response_type` is missing or invalid, extraction fails and the
+/// // handler is not called.
+/// // The correct request for this handler would be `/index.html?id=64&response_type=Code`
 /// async fn index(info: web::types::Query<AuthRequest>) -> String {
 ///     format!("Authorization request for client with id={} and type={:?}!", info.id, info.response_type)
 /// }
 ///
 /// fn main() {
-///     let app = web::App::new().service(
+///     let app = web::App::default().service(
 ///        web::resource("/index.html")
 ///            .route(web::get().to(index))); // <- use `Query` extractor
 /// }
 /// ```
-impl<T, Err> FromRequest<Err> for Query<T>
+impl<St, T> FromRequest<St> for Query<T>
 where
+    St: State,
     T: de::DeserializeOwned,
-    Err: ErrorRenderer,
 {
     type Error = QueryPayloadError;
 
     #[inline]
-    async fn from_request(req: &HttpRequest, _: &mut Payload) -> Result<Self, Self::Error> {
+    async fn from_request(_: &St, req: &HttpRequest, _: &mut Payload) -> Result<Self, Self::Error> {
         serde_urlencoded::from_str::<T>(req.query_string()).map_or_else(
             move |e| {
                 let e = QueryPayloadError::Deserialize(e);
@@ -177,14 +180,16 @@ mod tests {
     #[crate::rt_test]
     async fn test_request_extract() {
         let req = TestRequest::with_uri("/name/user1/").to_srv_request();
-        let (req, mut pl) = req.into_parts();
-        let res = from_request::<Query<Id>>(&req, &mut pl).await;
+        let (req, mut pl, ()) = req.into_parts();
+        let res = from_request::<_, Query<Id>>(&(), &req, &mut pl).await;
         assert!(res.is_err());
 
         let req = TestRequest::with_uri("/name/user1/?id=test").to_srv_request();
-        let (req, mut pl) = req.into_parts();
+        let (req, mut pl, ()) = req.into_parts();
 
-        let mut s = from_request::<Query<Id>>(&req, &mut pl).await.unwrap();
+        let mut s = from_request::<_, Query<Id>>(&(), &req, &mut pl)
+            .await
+            .unwrap();
         assert_eq!(s.id, "test");
         assert_eq!(format!("{s}, {s:?}"), "Id(test), Id { id: \"test\" }");
 

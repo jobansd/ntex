@@ -4,15 +4,15 @@ use std::{fmt, iter::FusedIterator, net::SocketAddr};
 use ntex_bytes::ByteString;
 use ntex_util::future::Either;
 
-/// Connect request
+/// Address information required by [`Connect`].
 pub trait Address: Unpin + 'static {
-    /// Host name of the request
+    /// Returns the host name.
     fn host(&self) -> &str;
 
-    /// Port of the request
+    /// Returns an explicitly configured port, if available.
     fn port(&self) -> Option<u16>;
 
-    /// `SocketAddr` of the address
+    /// Returns a pre-resolved socket address, if available.
     fn addr(&self) -> Option<SocketAddr> {
         None
     }
@@ -62,7 +62,7 @@ impl Address for SocketAddr {
     }
 }
 
-/// Connect request
+/// Request to resolve and connect to a remote address.
 #[derive(Eq, PartialEq, Debug, Hash)]
 pub struct Connect<T> {
     pub(super) req: T,
@@ -71,7 +71,7 @@ pub struct Connect<T> {
 }
 
 impl<T: Address> Connect<T> {
-    /// Create `Connect` instance by spliting the string by ':' and convert the second part to u16
+    /// Creates a connection request and derives a port from the host when present.
     #[must_use]
     pub fn new(req: T) -> Connect<T> {
         let (_, port) = parse(req.host());
@@ -82,7 +82,9 @@ impl<T: Address> Connect<T> {
         }
     }
 
-    /// Create new `Connect` instance from host and address. Connector skips name resolution stage for such connect messages.
+    /// Creates a request with a pre-resolved socket address.
+    ///
+    /// The connector skips DNS resolution for this request.
     #[must_use]
     pub fn with(req: T, addr: SocketAddr) -> Connect<T> {
         Connect {
@@ -92,16 +94,17 @@ impl<T: Address> Connect<T> {
         }
     }
 
-    /// Use port if address does not provide one.
+    /// Sets the port used when [`Address::port()`] does not provide one.
     ///
-    /// By default it set to 0
+    /// This replaces the port parsed from a `host:port` host by
+    /// [`new()`](Self::new), which is zero if the host has none.
     #[must_use]
     pub fn set_port(mut self, port: u16) -> Self {
         self.port = port;
         self
     }
 
-    /// Use address.
+    /// Sets one pre-resolved socket address.
     #[must_use]
     pub fn set_addr(mut self, addr: Option<SocketAddr>) -> Self {
         if let Some(addr) = addr {
@@ -110,7 +113,7 @@ impl<T: Address> Connect<T> {
         self
     }
 
-    /// Use addresses.
+    /// Sets multiple pre-resolved socket addresses.
     #[must_use]
     pub fn set_addrs<I>(mut self, addrs: I) -> Self
     where
@@ -125,17 +128,18 @@ impl<T: Address> Connect<T> {
         self
     }
 
-    /// Host name
+    /// Returns the request host name.
     pub fn host(&self) -> &str {
         self.req.host()
     }
 
-    /// Port of the request
+    /// Returns the port from [`Address::port()`], or the one parsed from the
+    /// host or set by [`set_port()`](Self::set_port).
     pub fn port(&self) -> u16 {
         self.req.port().unwrap_or(self.port)
     }
 
-    /// Preresolved addresses of the request.
+    /// Iterates over the request's pre-resolved addresses.
     pub fn addrs(&self) -> ConnectAddrsIter<'_> {
         if let Some(addr) = self.req.addr() {
             ConnectAddrsIter {
@@ -152,7 +156,7 @@ impl<T: Address> Connect<T> {
         }
     }
 
-    /// Takes preresolved addresses of the request.
+    /// Removes and returns the request's pre-resolved addresses.
     pub fn take_addrs(&mut self) -> ConnectTakeAddrsIter {
         if let Some(addr) = self.req.addr() {
             ConnectTakeAddrsIter {
@@ -169,12 +173,12 @@ impl<T: Address> Connect<T> {
         }
     }
 
-    /// Return reference to inner type
+    /// Returns the original address value.
     pub fn get_ref(&self) -> &T {
         &self.req
     }
 
-    /// Call callback with current address and construct new Connect instance.
+    /// Maps the original address value while preserving port and resolved addresses.
     pub fn map_addr<F, R>(self, f: F) -> Connect<R>
     where
         F: FnOnce(T) -> R,
@@ -207,11 +211,16 @@ impl<T: Address> From<T> for Connect<T> {
 
 impl<T: Address> fmt::Display for Connect<T> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "{}:{}", self.host(), self.port())
+        let (host, _) = parse(self.host());
+        if host.contains(':') {
+            write!(f, "[{host}]:{}", self.port())
+        } else {
+            write!(f, "{host}:{}", self.port())
+        }
     }
 }
 
-/// Iterator over addresses in a [`Connect`](struct.Connect.html) request.
+/// Iterator over addresses in a [`Connect`] request.
 #[derive(Clone)]
 pub struct ConnectAddrsIter<'a> {
     inner: Either<Option<SocketAddr>, vec_deque::Iter<'a, SocketAddr>>,
@@ -246,7 +255,7 @@ impl ExactSizeIterator for ConnectAddrsIter<'_> {}
 
 impl FusedIterator for ConnectAddrsIter<'_> {}
 
-/// Owned iterator over addresses in a [`Connect`](struct.Connect.html) request.
+/// Owning iterator over addresses removed from a [`Connect`] request.
 #[derive(Debug)]
 pub struct ConnectTakeAddrsIter {
     inner: Either<Option<SocketAddr>, vec_deque::IntoIter<SocketAddr>>,
@@ -275,18 +284,22 @@ impl ExactSizeIterator for ConnectTakeAddrsIter {}
 
 impl FusedIterator for ConnectTakeAddrsIter {}
 
-fn parse(host: &str) -> (&str, Option<u16>) {
-    let mut parts_iter = host.splitn(2, ':');
-    if let Some(host) = parts_iter.next() {
-        let port_str = parts_iter.next().unwrap_or("");
-        if let Ok(port) = port_str.parse::<u16>() {
-            (host, Some(port))
-        } else {
-            (host, None)
+/// Splits `host`, `host:port`, `[v6]`, `[v6]:port` or bare `v6` into host and port.
+///
+/// Brackets are stripped from IPv6 hosts.
+pub(super) fn parse(host: &str) -> (&str, Option<u16>) {
+    let (name, port) = if let Some(rest) = host.strip_prefix('[') {
+        match rest.split_once(']') {
+            Some((ip, tail)) => (ip, tail.strip_prefix(':')),
+            None => (host, None),
         }
     } else {
-        (host, None)
-    }
+        match host.split_once(':') {
+            Some((name, port)) if !port.contains(':') => (name, Some(port)),
+            _ => (host, None),
+        }
+    };
+    (name, port.and_then(|p| p.parse::<u16>().ok()))
 }
 
 #[cfg(test)]
@@ -305,6 +318,42 @@ mod tests {
         let s = ByteString::from("test");
         assert_eq!(s.host(), "test");
         assert_eq!(s.port(), None);
+    }
+
+    #[test]
+    fn parse_host() {
+        assert_eq!(parse("example.com"), ("example.com", None));
+        assert_eq!(parse("example.com:443"), ("example.com", Some(443)));
+        assert_eq!(parse("example.com:bad"), ("example.com", None));
+        assert_eq!(parse("127.0.0.1:8080"), ("127.0.0.1", Some(8080)));
+        assert_eq!(parse("[::1]"), ("::1", None));
+        assert_eq!(parse("[::1]:443"), ("::1", Some(443)));
+        assert_eq!(parse("[::1]443"), ("::1", None));
+        assert_eq!(parse("::1"), ("::1", None));
+        assert_eq!(parse("2001:db8::1"), ("2001:db8::1", None));
+        assert_eq!(parse("[::1"), ("[::1", None));
+        assert_eq!(parse(""), ("", None));
+
+        assert_eq!(Connect::new("[::1]:8080").port(), 8080);
+        assert_eq!(Connect::new("::1").set_port(80).port(), 80);
+    }
+
+    #[test]
+    fn display() {
+        assert_eq!(
+            Connect::new("example.com:443").to_string(),
+            "example.com:443"
+        );
+        assert_eq!(
+            Connect::new("example.com").set_port(80).to_string(),
+            "example.com:80"
+        );
+        assert_eq!(Connect::new("[::1]:8080").to_string(), "[::1]:8080");
+        assert_eq!(Connect::new("::1").set_port(80).to_string(), "[::1]:80");
+        assert_eq!(
+            Connect::new("fe80::1%3").set_port(80).to_string(),
+            "[fe80::1%3]:80"
+        );
     }
 
     #[test]
@@ -362,5 +411,43 @@ mod tests {
         let addrs: Vec<_> = connect.take_addrs().collect();
         assert_eq!(addrs.len(), 1);
         assert!(addrs.contains(&addr));
+    }
+
+    #[test]
+    fn connect_with_addr() {
+        let addr: SocketAddr = "127.0.0.1:8080".parse().unwrap();
+        let connect = Connect::with("example.com", addr);
+        assert_eq!(connect.port(), 0);
+        assert_eq!(connect.addrs().len(), 1);
+        assert_eq!(connect.addrs().next(), Some(addr));
+
+        let connect: Connect<&str> = "example.com:80".into();
+        assert_eq!(connect.port(), 80);
+        assert_eq!(connect.addrs().len(), 0);
+
+        // `None` keeps the current addresses
+        let connect = connect.set_addr(None);
+        assert_eq!(connect.addrs().len(), 0);
+        let mut connect = connect.set_addr(Some(addr)).set_addr(None);
+        assert_eq!(connect.addrs().collect::<Vec<_>>(), vec![addr]);
+
+        let mut it = connect.take_addrs();
+        assert_eq!(it.len(), 1);
+        assert_eq!(it.next(), Some(addr));
+        assert_eq!(it.len(), 0);
+        assert_eq!(connect.take_addrs().len(), 0);
+
+        let mut connect = Connect::new(addr);
+        assert_eq!(connect.addrs().len(), 1);
+        assert_eq!(connect.take_addrs().len(), 1);
+
+        let addr2: SocketAddr = "127.0.0.1:8081".parse().unwrap();
+        let mut connect = Connect::new("example.com").set_addrs([addr, addr2]);
+        assert_eq!(connect.addrs().len(), 2);
+        let mut it = connect.take_addrs();
+        assert_eq!(it.len(), 2);
+        it.next();
+        assert_eq!(it.len(), 1);
+        assert!(format!("{it:?}").contains("8081"));
     }
 }

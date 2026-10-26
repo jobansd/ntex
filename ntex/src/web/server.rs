@@ -1,18 +1,18 @@
-use std::{fmt, io, marker::PhantomData, net, sync::Arc, sync::Mutex};
+use std::{io, marker::PhantomData, net, sync::Arc, sync::Mutex};
 
 #[cfg(feature = "openssl")]
 use tls_openssl::ssl::{AlpnError, SslAcceptor, SslAcceptorBuilder};
 #[cfg(feature = "rustls")]
 use tls_rustls::ServerConfig as RustlsServerConfig;
 
-use crate::http::{HttpService, Request, Response, ResponseError, body::MessageBody};
-use crate::server::{Server, ServerBuilder};
-use crate::service::{IntoServiceFactory, ServiceFactory, cfg::SharedCfg};
-use crate::time::Seconds;
+use crate::error::IntoFailure;
+use crate::http::{self, Request, Response, ResponseError};
+use crate::server::{Affinity, LoadBalancing, NoConfig, Server, ServerAppConfig, ServerBuilder};
+use crate::service::{IntoServiceFactory, Service, ServiceFactory, State, fn_service};
+use crate::{SharedCfg, time::Seconds};
 
 struct Config {
     host: Option<String>,
-    cfg: SharedCfg,
 }
 
 /// An HTTP Server.
@@ -25,53 +25,77 @@ struct Config {
 /// #[ntex::main]
 /// async fn main() -> std::io::Result<()> {
 ///     HttpServer::new(
-///         async || App::new()
-///             .service(web::resource("/").to(|| async { HttpResponse::Ok() })))
-///         .bind("127.0.0.1:59090")?
+///         async |_| App::new()
+///             .service(web::resource("/").to(async || { HttpResponse::Ok() })))
+///         .bind("127.0.0.1:59090", ntex::SharedCfg::default())?
 ///         .run()
 ///         .await
 /// }
 /// ```
 #[derive(derive_more::Debug)]
 #[debug("HttpServer")]
-pub struct HttpServer<F, I, S, B>
+pub struct HttpServer<Cfg, F, I, Sf>
 where
-    F: AsyncFn() -> I + Send + Clone + 'static,
-    I: IntoServiceFactory<S, Request, SharedCfg>,
-    S: ServiceFactory<Request, SharedCfg>,
-    S::Error: ResponseError,
-    S::InitError: fmt::Debug,
-    S::Response: Into<Response<B>>,
-    B: MessageBody,
+    Cfg: ServerAppConfig,
+    Cfg::State: Clone,
+    F: AsyncFn(&Cfg::State) -> I + Send + Clone + 'static,
+    I: IntoServiceFactory<Sf, Cfg::State, Request>,
+    Sf: ServiceFactory<Cfg::State, Request>,
+    Sf::Res: Into<Response>,
+    Sf::Error: ResponseError,
+    Sf::InitError: IntoFailure,
 {
-    pub(super) factory: F,
+    factory: F,
     config: Arc<Mutex<Config>>,
     backlog: i32,
-    builder: ServerBuilder,
-    _t: PhantomData<(S, B)>,
+    builder: ServerBuilder<Cfg>,
+    _t: PhantomData<Sf>,
 }
 
-impl<F, I, S, B> HttpServer<F, I, S, B>
+impl<F, I, Sf> HttpServer<NoConfig, F, I, Sf>
 where
-    F: AsyncFn() -> I + Send + Clone + 'static,
-    I: IntoServiceFactory<S, Request, SharedCfg>,
-    S: ServiceFactory<Request, SharedCfg> + 'static,
-    S::Error: ResponseError,
-    S::InitError: fmt::Debug,
-    S::Response: Into<Response<B>>,
-    B: MessageBody + 'static,
+    F: AsyncFn(&()) -> I + Send + Clone + 'static,
+    I: IntoServiceFactory<Sf, (), Request>,
+    Sf: ServiceFactory<(), Request> + 'static,
+    Sf::Res: Into<Response>,
+    Sf::Error: ResponseError,
+    Sf::InitError: IntoFailure,
 {
     #[must_use]
     /// Create new http server with application factory
     pub fn new(factory: F) -> Self {
         HttpServer {
             factory,
-            config: Arc::new(Mutex::new(Config {
-                host: None,
-                cfg: SharedCfg::default(),
-            })),
+            config: Arc::new(Mutex::new(Config { host: None })),
             backlog: 1024,
             builder: ServerBuilder::default(),
+            _t: PhantomData,
+        }
+    }
+}
+
+impl<Cfg, F, I, Sf> HttpServer<Cfg, F, I, Sf>
+where
+    Cfg: ServerAppConfig,
+    Cfg::State: Clone,
+    F: AsyncFn(&Cfg::State) -> I + Send + Clone + 'static,
+    I: IntoServiceFactory<Sf, Cfg::State, Request>,
+    Sf: ServiceFactory<Cfg::State, Request> + 'static,
+    Sf::Res: Into<Response>,
+    Sf::Error: ResponseError,
+    Sf::InitError: IntoFailure,
+{
+    #[must_use]
+    /// Create new http server with application factory and state mapping
+    pub fn with_config(cfg: Cfg, factory: F) -> Self
+    where
+        Cfg: ServerAppConfig,
+    {
+        HttpServer {
+            factory,
+            config: Arc::new(Mutex::new(Config { host: None })),
+            backlog: 1024,
+            builder: ServerBuilder::new(cfg),
             _t: PhantomData,
         }
     }
@@ -94,7 +118,7 @@ where
     /// attempting to connect. It should only affect servers under significant
     /// load.
     ///
-    /// Generally set in the 64-2048 range. Default value is 2048.
+    /// Generally set in the 64-2048 range. Default value is 1024.
     ///
     /// This method should be called before `bind()` method call.
     pub fn backlog(mut self, backlog: i32) -> Self {
@@ -110,19 +134,22 @@ where
     /// for each worker.
     ///
     /// By default max connections is set to a 25k.
-    pub fn maxconn(mut self, num: usize) -> Self {
-        self.builder = self.builder.maxconn(num);
+    pub fn max_connections(mut self, num: usize) -> Self {
+        self.builder = self.builder.max_connections(num);
         self
     }
 
     #[must_use]
-    /// Sets the maximum per-worker concurrent connection establish process.
+    /// Sets the per-worker soft limit on concurrent TLS handshakes.
     ///
-    /// All listeners will stop accepting connections when this limit is reached. It
-    /// can be used to limit the global SSL CPU usage.
+    /// This limit applies only to TLS acceptors (OpenSSL and rustls), which apply
+    /// readiness backpressure when it is reached. Independent listener or service
+    /// pipelines with cached readiness can still start handshakes and exceed the
+    /// limit; it is not a strict admission limit. Plain TCP listeners are not
+    /// affected.
     ///
-    /// By default max connections is set to a 256.
-    pub fn maxconnrate(self, num: usize) -> Self {
+    /// By default the limit is 256.
+    pub fn max_tls_handshakes(self, num: usize) -> Self {
         ntex_tls::max_concurrent_ssl_accept(num);
         self
     }
@@ -131,10 +158,10 @@ where
     /// Set server host name.
     ///
     /// Host name is used by application router as a hostname for url generation.
-    /// Check [`ConnectionInfo`](./dev/struct.ConnectionInfo.html#method.host)
+    /// Check [`ConnectionInfo::host()`](crate::web::dev::ConnectionInfo::host)
     /// documentation for more information.
     ///
-    /// By default host name is set to a "localhost" value.
+    /// By default host name is set to a "localhost:8080" value.
     pub fn server_hostname<T: AsRef<str>>(self, val: T) -> Self {
         self.config.lock().unwrap().host = Some(val.as_ref().to_owned());
         self
@@ -150,40 +177,86 @@ where
     }
 
     #[must_use]
+    /// Stops the server when one of the workers panics.
+    ///
+    /// By default, "stop on panic" is disabled.
+    pub fn stop_on_panic(mut self) -> Self {
+        self.builder = self.builder.stop_on_panic();
+        self
+    }
+
+    #[must_use]
     /// Disable signal handling.
     ///
-    /// By default signal handling is enabled.
+    /// By default, signal handling is enabled.
     pub fn disable_signals(mut self) -> Self {
         self.builder = self.builder.disable_signals();
         self
     }
 
     #[must_use]
-    /// Timeout for graceful workers shutdown.
+    /// Timeout for graceful worker shutdown.
     ///
     /// After receiving a stop signal, workers have this much time to finish
-    /// serving requests. Workers still alive after the timeout are force
-    /// dropped.
+    /// serving requests. Workers that are still alive after the timeout are
+    /// forcefully dropped.
     ///
-    /// By default shutdown timeout sets to 30 seconds.
-    pub fn shutdown_timeout(mut self, sec: Seconds) -> Self {
-        self.builder = self.builder.shutdown_timeout(sec);
+    /// This bounds the worker as a whole, not an individual connection. Each
+    /// connection is bound separately by `IoConfig::set_shutdown_timeout`, so
+    /// this value should leave room for the connections a worker is still
+    /// draining to shut down themselves.
+    ///
+    /// By default, the timeout is set to 30 seconds.
+    pub fn graceful_shutdown_timeout(mut self, sec: Seconds) -> Self {
+        self.builder = self.builder.graceful_shutdown_timeout(sec);
         self
     }
 
     #[must_use]
-    /// Enable cpu affinity.
-    ///
-    /// By default affinity is disabled.
-    pub fn enable_affinity(mut self) -> Self {
-        self.builder = self.builder.enable_affinity();
+    #[deprecated(
+        since = "4.4.0",
+        note = "affinity is enabled by default, use `affinity()` to change it"
+    )]
+    /// Does nothing, affinity is enabled by default.
+    pub fn enable_affinity(self) -> Self {
         self
     }
 
     #[must_use]
-    /// Set io config for named service.
-    pub fn config<T: Into<SharedCfg>>(self, cfg: T) -> Self {
-        self.config.lock().unwrap().cfg = cfg.into();
+    /// Sets the CPU affinity of worker threads.
+    ///
+    /// Workers are spread over physical cores first, see [`Affinity`].
+    ///
+    /// By default, [`Affinity::Soft`] is used on Windows and
+    /// [`Affinity::Core`] on other platforms.
+    pub fn affinity(mut self, affinity: Affinity) -> Self {
+        self.builder = self.builder.affinity(affinity);
+        self
+    }
+
+    #[must_use]
+    /// Sets how new connections are distributed between workers.
+    ///
+    /// By default, [`LoadBalancing::IncomingCpu`] sends new connections to idle
+    /// workers, which helps when connections are long-lived or their load is
+    /// uneven, and prefers the worker on the CPU that receives a connection's
+    /// network packets. [`LoadBalancing::RoundRobin`] sends them to the
+    /// workers in turn.
+    pub fn load_balancing(mut self, balancing: LoadBalancing) -> Self {
+        self.builder = self.builder.load_balancing(balancing);
+        self
+    }
+
+    #[must_use]
+    /// Graceful shutdown.
+    ///
+    /// When enabled, SIGQUIT, SIGSEGV, SIGABRT, and application panics stop the
+    /// server gracefully. SIGTERM always stops the server gracefully, and SIGINT
+    /// always stops it immediately.
+    ///
+    /// By default, these events stop the server immediately.
+    pub fn graceful_shutdown(mut self) -> Self {
+        self.builder = self.builder.graceful_shutdown();
         self
     }
 
@@ -191,17 +264,23 @@ where
     ///
     /// `HttpServer` does not change any configuration for `TcpListener`,
     /// it needs to be configured before passing it to `listen()` method.
-    pub fn listen(mut self, lst: net::TcpListener) -> io::Result<Self> {
-        let cfg = self.config.clone();
+    pub fn listen(mut self, lst: net::TcpListener, cfg: impl Into<SharedCfg>) -> io::Result<Self> {
         let factory = self.factory.clone();
         let addr = lst.local_addr().unwrap();
 
         self.builder = self.builder.listen(
             format!("ntex-web-service-{addr}"),
             lst,
-            async move |r| {
-                r.config(cfg.lock().unwrap().cfg.clone());
-                HttpService::new(factory().await)
+            cfg.into(),
+            async move |st| {
+                let state = st.clone();
+                fn_service(async move |req| {
+                    Ok(State {
+                        req,
+                        state: state.clone(),
+                    })
+                })
+                .and_then(http::HttpService::new(factory(st).await))
             },
         )?;
         Ok(self)
@@ -214,27 +293,39 @@ where
     pub fn listen_openssl(
         self,
         lst: net::TcpListener,
+        cfg: impl Into<SharedCfg>,
         builder: SslAcceptorBuilder,
     ) -> io::Result<Self> {
-        self.listen_ssl_inner(lst, openssl_acceptor(builder)?)
+        self.listen_openssl_inner(lst, cfg.into(), openssl_acceptor(builder)?)
     }
 
     #[cfg(feature = "openssl")]
-    fn listen_ssl_inner(
+    fn listen_openssl_inner(
         mut self,
         lst: net::TcpListener,
+        cfg: SharedCfg,
         acceptor: SslAcceptor,
     ) -> io::Result<Self> {
         let factory = self.factory.clone();
-        let cfg = self.config.clone();
         let addr = lst.local_addr().unwrap();
 
         self.builder = self.builder.listen(
             format!("ntex-web-service-{addr}"),
             lst,
-            async move |r| {
-                r.config(cfg.lock().unwrap().cfg.clone());
-                HttpService::new(factory().await).openssl(acceptor.clone())
+            cfg,
+            async move |st| {
+                let state = st.clone();
+
+                http::openssl(
+                    acceptor.clone(),
+                    fn_service(async move |req| {
+                        Ok(State {
+                            req,
+                            state: state.clone(),
+                        })
+                    })
+                    .and_then(http::HttpService::new(factory(st).await)),
+                )
             },
         )?;
         Ok(self)
@@ -247,27 +338,39 @@ where
     pub fn listen_rustls(
         self,
         lst: net::TcpListener,
+        cfg: impl Into<SharedCfg>,
         config: RustlsServerConfig,
     ) -> io::Result<Self> {
-        self.listen_rustls_inner(lst, config)
+        self.listen_rustls_inner(lst, cfg.into(), config)
     }
 
     #[cfg(feature = "rustls")]
     fn listen_rustls_inner(
         mut self,
         lst: net::TcpListener,
+        cfg: SharedCfg,
         config: RustlsServerConfig,
     ) -> io::Result<Self> {
         let factory = self.factory.clone();
-        let cfg = self.config.clone();
         let addr = lst.local_addr().unwrap();
 
         self.builder = self.builder.listen(
             format!("ntex-web-rustls-service-{addr}"),
             lst,
-            async move |r| {
-                r.config(cfg.lock().unwrap().cfg.clone());
-                HttpService::new(factory().await).rustls(config.clone())
+            cfg,
+            async move |st| {
+                let state = st.clone();
+                http::rustls(
+                    config.clone(),
+                    http::ALPN_PROTOS,
+                    fn_service(async move |req| {
+                        Ok(State {
+                            req,
+                            state: state.clone(),
+                        })
+                    })
+                    .and_then(http::HttpService::new(factory(st).await)),
+                )
             },
         )?;
         Ok(self)
@@ -276,11 +379,14 @@ where
     /// The socket address to bind.
     ///
     /// To bind multiple addresses this method can be called multiple times.
-    pub fn bind<A: net::ToSocketAddrs>(mut self, addr: A) -> io::Result<Self> {
-        let sockets = self.bind2(addr)?;
-
-        for lst in sockets {
-            self = self.listen(lst)?;
+    pub fn bind<A: net::ToSocketAddrs>(
+        mut self,
+        addr: A,
+        cfg: impl Into<SharedCfg>,
+    ) -> io::Result<Self> {
+        let cfg = cfg.into();
+        for lst in self.bind2(addr)? {
+            self = self.listen(lst, cfg.clone())?;
         }
 
         Ok(self)
@@ -320,15 +426,17 @@ where
         mut self,
         addr: A,
         builder: SslAcceptorBuilder,
+        cfg: impl Into<SharedCfg>,
     ) -> io::Result<Self>
     where
         A: net::ToSocketAddrs,
     {
+        let cfg = cfg.into();
         let sockets = self.bind2(addr)?;
         let acceptor = openssl_acceptor(builder)?;
 
         for lst in sockets {
-            self = self.listen_ssl_inner(lst, acceptor.clone())?;
+            self = self.listen_openssl_inner(lst, cfg.clone(), acceptor.clone())?;
         }
 
         Ok(self)
@@ -342,10 +450,12 @@ where
         mut self,
         addr: A,
         config: &RustlsServerConfig,
+        cfg: impl Into<SharedCfg>,
     ) -> io::Result<Self> {
+        let cfg = cfg.into();
         let sockets = self.bind2(addr)?;
         for lst in sockets {
-            self = self.listen_rustls_inner(lst, config.clone())?;
+            self = self.listen_rustls_inner(lst, cfg.clone(), config.clone())?;
         }
         Ok(self)
     }
@@ -353,52 +463,69 @@ where
     #[cfg(unix)]
     /// Start listening for unix domain connections on existing listener.
     ///
-    /// This method is available with `uds` feature.
-    pub fn listen_uds(mut self, lst: std::os::unix::net::UnixListener) -> io::Result<Self> {
-        let cfg = self.config.clone();
+    /// This method is available only on Unix.
+    pub fn listen_uds(
+        mut self,
+        lst: std::os::unix::net::UnixListener,
+        cfg: impl Into<SharedCfg>,
+    ) -> io::Result<Self> {
         let factory = self.factory.clone();
         let addr = format!("ntex-web-service-{:?}", lst.local_addr()?);
 
-        self.builder = self.builder.listen_uds(addr, lst, async move |r| {
-            r.config(cfg.lock().unwrap().cfg.clone());
-            HttpService::new(factory().await)
-        })?;
+        self.builder = self
+            .builder
+            .listen_uds(addr, lst, cfg.into(), async move |st| {
+                let state = st.clone();
+                fn_service(async move |req| {
+                    Ok(State {
+                        req,
+                        state: state.clone(),
+                    })
+                })
+                .and_then(http::HttpService::new(factory(st).await))
+            })?;
         Ok(self)
     }
 
     #[cfg(unix)]
     /// Start listening for incoming unix domain connections.
     ///
-    /// This method is available with `uds` feature.
-    pub fn bind_uds<A>(mut self, addr: A) -> io::Result<Self>
+    /// This method is available only on Unix.
+    pub fn bind_uds<A>(mut self, addr: A, cfg: impl Into<SharedCfg>) -> io::Result<Self>
     where
         A: AsRef<std::path::Path>,
     {
-        let cfg = self.config.clone();
         let factory = self.factory.clone();
 
         self.builder = self.builder.bind_uds(
             format!("ntex-web-service-{:?}", addr.as_ref().display()),
             addr,
-            async move |r| {
-                r.config(cfg.lock().unwrap().cfg.clone());
-                HttpService::new(factory().await)
+            cfg.into(),
+            async move |st| {
+                let state = st.clone();
+                fn_service(async move |req| {
+                    Ok(State {
+                        req,
+                        state: state.clone(),
+                    })
+                })
+                .and_then(http::HttpService::new(factory(st).await))
             },
         )?;
         Ok(self)
     }
 }
 
-impl<F, I, S, B> HttpServer<F, I, S, B>
+impl<Cfg, F, I, Sf> HttpServer<Cfg, F, I, Sf>
 where
-    F: AsyncFn() -> I + Send + Clone + 'static,
-    I: IntoServiceFactory<S, Request, SharedCfg>,
-    S: ServiceFactory<Request, SharedCfg>,
-    S::Error: ResponseError,
-    S::InitError: fmt::Debug,
-    S::Response: Into<Response<B>>,
-    S::Service: 'static,
-    B: MessageBody,
+    Cfg: ServerAppConfig,
+    Cfg::State: Clone,
+    F: AsyncFn(&Cfg::State) -> I + Send + Clone + 'static,
+    I: IntoServiceFactory<Sf, Cfg::State, Request>,
+    Sf: ServiceFactory<Cfg::State, Request> + 'static,
+    Sf::Res: Into<Response>,
+    Sf::Error: ResponseError,
+    Sf::InitError: IntoFailure,
 {
     /// Start listening for incoming connections.
     ///
@@ -406,8 +533,9 @@ where
     /// For each address this method starts separate thread which does
     /// `accept()` in a loop.
     ///
-    /// This methods panics if no socket address can be bound or an ntex system
-    /// is not yet configured.
+    /// # Panics
+    ///
+    /// Panics if no listener was registered before calling this method.
     ///
     /// ```rust,no_run
     /// use ntex::web::{self, App, HttpResponse, HttpServer};
@@ -415,9 +543,9 @@ where
     /// #[ntex::main]
     /// async fn main() -> std::io::Result<()> {
     ///     HttpServer::new(
-    ///         async || App::new().service(web::resource("/").to(|| async { HttpResponse::Ok() }))
+    ///         async |_| App::new().service(web::resource("/").to(async || { HttpResponse::Ok() }))
     ///     )
-    ///         .bind("127.0.0.1:0")?
+    ///         .bind("127.0.0.1:0", ntex::SharedCfg::default())?
     ///         .run()
     ///         .await
     /// }

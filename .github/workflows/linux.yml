@@ -8,7 +8,7 @@ jobs:
       fail-fast: false
       matrix:
         version:
-          - 1.88.0 # MSRV
+          - 1.97.0 # MSRV
           - stable
           - nightly
 
@@ -35,41 +35,62 @@ jobs:
       - name: Run tests (neon-polling)
         timeout-minutes: 10
         run: |
-          cargo nextest run --retries=3 --all --no-default-features --features="ntex/neon-polling,ntex/cookie,ntex/url,ntex/compress,ntex/openssl,ntex/rustls,ntex/ws"
+          cargo nextest run --retries=3 --all --no-default-features --features="ntex/neon-polling,ntex/cookie,ntex/compress,ntex/openssl,ntex/rustls,ntex/ws"
 
       - name: Run doc tests (neon-polling)
         timeout-minutes: 10
         run: |
-          cargo test --doc --all --no-default-features --features="ntex/neon-polling,ntex/cookie,ntex/url,ntex/compress,ntex/openssl,ntex/rustls,ntex/ws"
+          cargo test --doc --all --no-default-features --features="ntex/neon-polling,ntex/cookie,ntex/compress,ntex/openssl,ntex/rustls,ntex/ws"
 
       - name: Run tests (neon-uring)
         timeout-minutes: 10
         run: |
-          cargo nextest run --retries=3 --all --no-default-features --features="ntex/neon-uring,ntex/cookie,ntex/url,ntex/compress,ntex/openssl,ntex/rustls,ntex/ws"
+          cargo nextest run --retries=3 --all --no-default-features --features="ntex/neon-uring,ntex/cookie,ntex/compress,ntex/openssl,ntex/rustls,ntex/ws"
 
       - name: Run doc tests (neon-uring)
         timeout-minutes: 10
         run: |
-          cargo test --doc --all --no-default-features --features="ntex/neon-uring,ntex/cookie,ntex/url,ntex/compress,ntex/openssl,ntex/rustls,ntex/ws"
+          cargo test --doc --all --no-default-features --features="ntex/neon-uring,ntex/cookie,ntex/compress,ntex/openssl,ntex/rustls,ntex/ws"
+
+      - name: Run tests (neon rustls only)
+        if: matrix.version == '1.97.0'
+        timeout-minutes: 10
+        run: |
+          cargo nextest run --retries=3 --workspace --exclude ntex-tls --no-default-features --features="ntex/neon-polling,ntex/cookie,ntex/compress,ntex/rustls,ntex/ws"
+
+      - name: Run tests (ntex-bytes tracker)
+        timeout-minutes: 10
+        run: |
+          cargo test -p ntex-bytes --features tracker
+
+      - name: Run tests (tracker, neon-polling)
+        timeout-minutes: 10
+        run: |
+          cargo nextest run --retries=3 -p ntex-io -p ntex-net --no-default-features --features="ntex-net/neon-polling,ntex-net/tracker"
+
+      - name: Run tests (tracker, neon-uring)
+        timeout-minutes: 10
+        run: |
+          cargo nextest run --retries=3 -p ntex-io -p ntex-net --no-default-features --features="ntex-net/neon-uring,ntex-net/tracker"
 
       - name: Run tests (tokio)
         timeout-minutes: 10
         run: |
-          cargo nextest run --retries=3 --all --no-default-features --features="ntex/tokio,ntex/cookie,ntex/url,ntex/compress,ntex/openssl,ntex/rustls,ntex/ws"
+          cargo nextest run --retries=3 --all --no-default-features --features="ntex/tokio,ntex/cookie,ntex/compress,ntex/openssl,ntex/rustls,ntex/ws"
 
       - name: Run doc tests (tokio)
         timeout-minutes: 10
         run: |
-          cargo test --doc --all --no-default-features --features="ntex/tokio,ntex/cookie,ntex/url,ntex/compress,ntex/openssl,ntex/rustls,ntex/ws"
+          cargo test --doc --all --no-default-features --features="ntex/tokio,ntex/cookie,ntex/compress,ntex/openssl,ntex/rustls,ntex/ws"
 
       - name: Run tests (compio)
+        if: matrix.version == 'stable'
         timeout-minutes: 10
-        continue-on-error: true
         run: |
-          cargo nextest run --retries=3 --all --no-default-features --features="ntex/compio,ntex/cookie,ntex/url,ntex/compress,ntex/openssl,ntex/rustls,ntex/ws"
+          cargo nextest run --retries=3 --all --no-default-features --features="ntex/compio,ntex/cookie,ntex/compress,ntex/openssl,ntex/rustls,ntex/ws"
 
       - name: Run doc tests (compio)
+        if: matrix.version == 'stable'
         timeout-minutes: 10
-        continue-on-error: true
         run: |
-          cargo test --doc --all --no-default-features --features="ntex/compio,ntex/cookie,ntex/url,ntex/compress,ntex/openssl,ntex/rustls,ntex/ws"
+          cargo test --doc --all --no-default-features --features="ntex/compio,ntex/cookie,ntex/compress,ntex/openssl,ntex/rustls,ntex/ws"

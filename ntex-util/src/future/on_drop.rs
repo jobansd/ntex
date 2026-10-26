@@ -1,19 +1,22 @@
 #![allow(clippy::unused_unit)]
 use std::{cell::Cell, fmt, future::Future, pin::Pin, task::Context, task::Poll};
 
-/// Execute fn during drop
+/// Runs a callback when this guard is dropped.
+///
+/// Call [`cancel`](Self::cancel) to drop the guard without running it.
 pub struct OnDropFn<F: FnOnce()> {
     f: Cell<Option<F>>,
 }
 
 impl<F: FnOnce()> OnDropFn<F> {
+    /// Creates a guard that runs `f` when dropped.
     pub fn new(f: F) -> Self {
         Self {
             f: Cell::new(Some(f)),
         }
     }
 
-    /// Cancel fn execution
+    /// Discards the callback so it will not run on drop.
     pub fn cancel(&self) {
         self.f.take();
     }
@@ -35,11 +38,11 @@ impl<F: FnOnce()> Drop for OnDropFn<F> {
     }
 }
 
-/// Trait adds future `on_drop` support
+/// Extension trait for running a callback when a pending future is dropped.
 pub trait OnDropFutureExt: Future + Sized {
     /// Wraps this future so that `on_drop` is called if the future is dropped
-    /// before it completes. The callback is cancelled if the future resolves
-    /// successfully.
+    /// before it completes. The callback is cancelled once the future
+    /// completes, whatever its output.
     fn on_drop<F: FnOnce()>(self, on_drop: F) -> OnDropFuture<Self, F> {
         OnDropFuture::new(self, on_drop)
     }
@@ -48,6 +51,7 @@ pub trait OnDropFutureExt: Future + Sized {
 impl<F: Future> OnDropFutureExt for F {}
 
 pin_project_lite::pin_project! {
+    /// Future wrapper that runs a callback if dropped before completion.
     pub struct OnDropFuture<Ft: Future, F: FnOnce()> {
         #[pin]
         fut: Ft,
@@ -106,5 +110,13 @@ mod test {
 
         drop(f);
         assert!(dropped);
+    }
+
+    #[ntex::test]
+    async fn on_drop_completed() {
+        let mut dropped = false;
+        let f = std::future::ready(1).on_drop(|| dropped = true);
+        assert_eq!(f.await, 1);
+        assert!(!dropped);
     }
 }

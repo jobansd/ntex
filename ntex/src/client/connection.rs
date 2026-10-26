@@ -2,23 +2,16 @@ use std::{fmt, time};
 
 use crate::http::body::Body;
 use crate::http::{Payload, ResponseHead, Version};
-use crate::io::{IoBoxed, types::HttpProtocol};
-use crate::time::Millis;
+use crate::io::IoBoxed;
+#[cfg(test)]
+use crate::io::types::HttpProtocol;
+use crate::{error::Error, time::Millis};
 
 use super::{ClientRawRequest, error::ClientError, h1proto, h2proto, pool::Acquired};
 
 pub(super) enum ConnectionType {
     H1(IoBoxed),
     H2(h2proto::H2Client),
-}
-
-impl ConnectionType {
-    pub(super) fn tag(&self) -> &'static str {
-        match &self {
-            ConnectionType::H1(io) => io.tag(),
-            ConnectionType::H2(io) => io.tag(),
-        }
-    }
 }
 
 impl fmt::Debug for ConnectionType {
@@ -30,9 +23,7 @@ impl fmt::Debug for ConnectionType {
     }
 }
 
-#[doc(hidden)]
-/// HTTP client connection
-pub struct Connection {
+pub(crate) struct Connection {
     io: Option<ConnectionType>,
     created: time::Instant,
     pool: Option<Acquired>,
@@ -49,11 +40,7 @@ impl fmt::Debug for Connection {
 }
 
 impl Connection {
-    pub(super) fn new(
-        io: ConnectionType,
-        created: time::Instant,
-        pool: Option<Acquired>,
-    ) -> Self {
+    pub(super) fn new(io: ConnectionType, created: time::Instant, pool: Option<Acquired>) -> Self {
         Self {
             pool,
             created,
@@ -62,25 +49,15 @@ impl Connection {
     }
 
     pub(super) fn release(self, close: bool) {
-        if let Some(mut pool) = self.pool {
-            pool.release(
-                Self {
-                    io: self.io,
-                    created: self.created,
-                    pool: None,
-                },
-                close,
-            );
+        if let (Some(pool), Some(ConnectionType::H1(io))) = (self.pool, self.io) {
+            pool.release(io, self.created, close);
         } else {
-            log::debug!("{self:?}: http pool is not set, dropping");
+            log::debug!("http pool is not set, dropping connection");
         }
     }
 
-    pub(super) fn into_inner(self) -> (ConnectionType, time::Instant, Option<Acquired>) {
-        (self.io.unwrap(), self.created, self.pool)
-    }
-
-    pub fn protocol(&self) -> HttpProtocol {
+    #[cfg(test)]
+    pub(super) fn protocol(&self) -> HttpProtocol {
         match self.io {
             Some(ConnectionType::H1(_)) => HttpProtocol::Http1,
             Some(ConnectionType::H2(_)) => HttpProtocol::Http2,
@@ -93,7 +70,7 @@ impl Connection {
         mut req: ClientRawRequest,
         body: Body,
         timeout: Millis,
-    ) -> Result<(ResponseHead, Payload), ClientError> {
+    ) -> Result<(ResponseHead, Payload), Error<ClientError>> {
         match self.io.take().unwrap() {
             ConnectionType::H1(io) => {
                 req.head.version = Version::HTTP_11;

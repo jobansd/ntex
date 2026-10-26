@@ -1,14 +1,18 @@
-use std::{cell::Cell, io, mem, num::NonZeroU32, os::fd::AsRawFd, rc::Rc};
+use std::{cell::Cell, io, mem, num::NonZeroU32, os::fd::AsRawFd, ptr, rc::Rc, task::Poll};
 
-use ntex_bytes::{BufMut, BytePage, BytePages, BytesMut};
+use ntex_bytes::{BufMut, BytePage, BytePages, Bytes, BytesMut, info::PageKind};
 use ntex_io::{IoContext, IoTaskStatus};
-use ntex_io_uring::{cqueue, opcode, opcode2, types::Fd};
+use ntex_io_uring::{cqueue, opcode, types::Fd};
 use ntex_rt::Arbiter;
 use ntex_util::channel::pool;
 use slab::Slab;
 use socket2::Socket;
 
-use super::driver::{Driver, DriverApi, Handler};
+use super::{
+    bufring::BufRing,
+    reactor::{Handler, Reactor, ReactorApi},
+};
+use crate::helpers::Queue;
 
 #[derive(Clone)]
 pub(crate) struct StreamOps(Rc<StreamOpsInner>);
@@ -30,20 +34,36 @@ enum IdType {
 
 bitflags::bitflags! {
     #[derive(Copy, Clone, Debug, Eq, PartialEq, Ord, PartialOrd, Hash)]
-    struct Flags: u8 {
-        const RD_CANCELING = 0b0000_0001;
-        const RD_REISSUE   = 0b0000_0010;
-        const RD_MORE      = 0b0000_0100;
-        const WR_CANCELING = 0b0000_1000;
-        const WR_REISSUE   = 0b0001_0000;
-        const NO_ZC        = 0b0010_0000;
-        const DROPPED_PRI  = 0b0100_0000;
-        const DROPPED_SEC  = 0b1000_0000;
+    struct Flags: u16 {
+        const RD_CANCELING = 0b0000_0000_0001;
+        const RD_REISSUE   = 0b0000_0000_0010;
+        const WR_CANCELING = 0b0000_0000_1000;
+        const WR_REISSUE   = 0b0000_0001_0000;
+        const NO_ZC        = 0b0000_0010_0000;
+        const DROPPED_PRI  = 0b0000_0100_0000;
+        const DROPPED_SEC  = 0b0000_1000_0000;
+        /// `Close` is submitted, descriptor belongs to the kernel
+        const CLOSING      = 0b0001_0000_0000;
+        /// `SendMsg` is not supported, send one page at a time
+        const NO_MSG       = 0b0010_0000_0000;
+        /// `SendMsgZc` is not supported
+        const NO_ZC_MSG    = 0b0100_0000_0000;
+        /// Input is streaming, receive into the connection's read buffer
+        /// instead of a provided buffer
+        const RD_DIRECT    = 0b1000_0000_0000;
     }
 }
 
-const ZC_SIZE: u32 = 1536;
+/// Smaller sends are copied, zero-copy setup costs more than it saves
+const ZC_SIZE: u32 = 16 * 1024;
+const ZC_MAX_SIZE: u32 = 128 * 1024;
+/// Limits for the pages gathered into one send
+const SEND_MAX_PAGES: usize = 16;
+const SEND_MAX_SIZE: usize = 256 * 1024;
 const IORING_RECVSEND_POLL_FIRST: u16 = 1;
+/// Ask the kernel to report in the notification whether data was copied
+const IORING_SEND_ZC_REPORT_USAGE: u16 = 8;
+const IORING_NOTIF_USAGE_ZC_COPIED: usize = 1 << 31;
 
 #[derive(Debug)]
 struct StreamItem {
@@ -60,13 +80,21 @@ enum Operation {
         id: usize,
         buf: BytesMut,
     },
+    /// Receive into a buffer selected from the provided buffer ring
+    RecvRing {
+        id: usize,
+    },
+    /// Send of gathered pages, or of an inline page
     Send {
         id: usize,
-        buf: BytePage,
-        result: Option<io::Result<usize>>,
+        buf: Box<SendBuf>,
+        state: SendState,
     },
-    Poll {
+    /// Send of a single heap backed page, no allocation required
+    SendOne {
         id: usize,
+        page: BytePage,
+        state: SendState,
     },
     Shutdown {
         tx: Option<pool::Sender<io::Result<()>>>,
@@ -77,15 +105,267 @@ enum Operation {
     Nop,
 }
 
+/// Pages of one send operation.
+///
+/// Boxed, the kernel references the pages, the `iovec` array and the `msghdr`
+/// by address until the operation, or its zero-copy notification, completes.
+/// Pages are stored from the start of the array without gaps.
+struct SendBuf {
+    pages: [Option<BytePage>; SEND_MAX_PAGES],
+    iov: [libc::iovec; SEND_MAX_PAGES],
+    msg: libc::msghdr,
+}
+
+#[derive(Debug)]
+struct SendState {
+    /// Result of the first completion of a zero-copy send
+    result: Option<io::Result<usize>>,
+    /// Zero-copy send
+    zc: bool,
+    /// Zero-copy send with `IORING_SEND_ZC_REPORT_USAGE`
+    zc_report: bool,
+    /// Output was already returned to the write buffer for a resend
+    resent: bool,
+}
+
+impl Operation {
+    /// Splits `Send` and `SendOne` operations for shared completion handling
+    fn into_send(self) -> (usize, SendData, SendState) {
+        match self {
+            Operation::Send { id, buf, state } => (id, SendData::Pages(buf), state),
+            Operation::SendOne { id, page, state } => (id, SendData::Page(page), state),
+            _ => unreachable!("not a send operation"),
+        }
+    }
+}
+
+/// Output of one send operation.
+///
+/// A single page is stored in the operation itself, the kernel references
+/// its heap data, which does not move with the operations slab. Inline pages
+/// and gathered pages are boxed.
+#[derive(Debug)]
+enum SendData {
+    Page(BytePage),
+    Pages(Box<SendBuf>),
+}
+
+/// Zero-copy send failure that is resolved by resending the output
+#[derive(Copy, Clone, Debug)]
+enum ZcRetry {
+    /// The kernel rejected `IORING_SEND_ZC_REPORT_USAGE`
+    NoReport,
+    /// Pinned pages are charged against `RLIMIT_MEMLOCK` until the
+    /// notification arrives, the limit is shared by all connections
+    NoMem,
+}
+
+impl ZcRetry {
+    fn check(state: &SendState, res: &io::Result<usize>) -> Option<Self> {
+        match res.as_ref().err()?.raw_os_error()? {
+            libc::EINVAL if state.zc_report => Some(ZcRetry::NoReport),
+            libc::ENOMEM | libc::ENOBUFS if state.zc => Some(ZcRetry::NoMem),
+            _ => None,
+        }
+    }
+
+    fn apply(self, item: &mut StreamItem, zc_report: &mut bool) {
+        match self {
+            ZcRetry::NoReport => {
+                log::debug!(
+                    "{}: IORING_SEND_ZC_REPORT_USAGE is not supported",
+                    item.tag()
+                );
+                *zc_report = false;
+            }
+            ZcRetry::NoMem => {
+                log::debug!(
+                    "{}: Zero-copy send failed with no memory, disable ({:?})",
+                    item.tag(),
+                    item.fd()
+                );
+                item.flags.insert(Flags::NO_ZC);
+            }
+        }
+    }
+}
+
+/// Output of `page` past `offset` that shares the page's data, or a copy for
+/// `Vec` pages whose split would copy and free the original.
+fn shared_tail(page: &BytePage, offset: usize) -> BytePage {
+    if page.info() == PageKind::Vec {
+        BytePage::from(Bytes::copy_from_slice(&page[offset..]))
+    } else {
+        // `freeze` gives a view of its own, advancing a shared `BytesMut`
+        // storage in place would move the start of the original page too
+        let mut p = BytePage::from(page.clone().freeze());
+        p.advance_to(offset);
+        p
+    }
+}
+
+impl SendData {
+    /// Takes output for one send, gathering up to `max_pages` pages and
+    /// `max_size` bytes.
+    fn take(dst: &mut BytePages, max_pages: usize, max_size: usize) -> Option<Self> {
+        let first = dst.take()?;
+        let second = if max_pages > 1 { dst.take() } else { None };
+        let second = match second {
+            Some(page) if first.len() + page.len() <= max_size => page,
+            second => {
+                if let Some(page) = second {
+                    dst.prepend(page);
+                }
+                // the kernel references the page data by address
+                // while the operation moves with the slab
+                if !first.is_inline() {
+                    return Some(SendData::Page(first));
+                }
+                let mut buf = SendBuf::new();
+                buf.pages[0] = Some(first);
+                return Some(SendData::Pages(buf));
+            }
+        };
+        let mut size = first.len() + second.len();
+        let mut buf = SendBuf::new();
+        buf.pages[0] = Some(first);
+        buf.pages[1] = Some(second);
+        for slot in &mut buf.pages[2..max_pages] {
+            let Some(page) = dst.take() else { break };
+            if size + page.len() > max_size {
+                dst.prepend(page);
+                break;
+            }
+            size += page.len();
+            *slot = Some(page);
+        }
+        Some(SendData::Pages(buf))
+    }
+
+    fn into_op(self, id: usize, state: SendState) -> Operation {
+        match self {
+            SendData::Page(page) => Operation::SendOne { id, page, state },
+            SendData::Pages(buf) => Operation::Send { id, buf, state },
+        }
+    }
+
+    fn len(&self) -> usize {
+        match self {
+            SendData::Page(page) => page.len(),
+            SendData::Pages(buf) => buf.len(),
+        }
+    }
+
+    /// Returns output past `sent` to the write buffer, the kernel is done
+    /// with the pages.
+    fn release(self, ctx: &IoContext, sent: usize) {
+        match self {
+            SendData::Page(mut page) => {
+                if sent < page.len() {
+                    page.advance_to(sent);
+                    ctx.with_write_dst(|dst| dst.prepend(page));
+                }
+            }
+            SendData::Pages(buf) => buf.release(ctx, sent),
+        }
+    }
+
+    /// Returns output past `sent` to the write buffer while the kernel still
+    /// references the pages until the zero-copy notification arrives.
+    fn release_shared(&self, ctx: &IoContext, sent: usize) {
+        match self {
+            SendData::Page(page) => {
+                if sent < page.len() {
+                    ctx.with_write_dst(|dst| dst.prepend(shared_tail(page, sent)));
+                }
+            }
+            SendData::Pages(buf) => buf.release_shared(ctx, sent),
+        }
+    }
+}
+
+impl std::fmt::Debug for SendBuf {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SendBuf")
+            .field("pages", &self.pages().count())
+            .field("len", &self.len())
+            .finish()
+    }
+}
+
+impl SendBuf {
+    fn new() -> Box<Self> {
+        Box::new(SendBuf {
+            pages: [const { None }; SEND_MAX_PAGES],
+            iov: [libc::iovec {
+                iov_base: std::ptr::null_mut(),
+                iov_len: 0,
+            }; SEND_MAX_PAGES],
+            // SAFETY: all-zero is a valid `msghdr`
+            msg: unsafe { mem::zeroed() },
+        })
+    }
+
+    fn pages(&self) -> impl Iterator<Item = &BytePage> {
+        self.pages.iter().map_while(Option::as_ref)
+    }
+
+    fn len(&self) -> usize {
+        self.pages().map(BytePage::len).sum()
+    }
+
+    /// Position of the first byte past `sent`, as page index and offset.
+    fn unsent(&self, mut sent: usize) -> Option<(usize, usize)> {
+        for (idx, page) in self.pages().enumerate() {
+            if sent < page.len() {
+                return Some((idx, sent));
+            }
+            sent -= page.len();
+        }
+        None
+    }
+
+    /// Returns output past `sent` to the write buffer, the kernel is done
+    /// with the pages.
+    fn release(mut self: Box<Self>, ctx: &IoContext, sent: usize) {
+        if let Some((idx, offset)) = self.unsent(sent) {
+            ctx.with_write_dst(|dst| {
+                for i in (idx..SEND_MAX_PAGES).rev() {
+                    if let Some(mut page) = self.pages[i].take() {
+                        if i == idx {
+                            page.advance_to(offset);
+                        }
+                        dst.prepend(page);
+                    }
+                }
+            });
+        }
+    }
+
+    /// Returns output past `sent` to the write buffer while the kernel still
+    /// references the pages until the zero-copy notification arrives.
+    fn release_shared(&self, ctx: &IoContext, sent: usize) {
+        if let Some((idx, offset)) = self.unsent(sent) {
+            ctx.with_write_dst(|dst| {
+                for i in (idx..SEND_MAX_PAGES).rev() {
+                    if let Some(page) = &self.pages[i] {
+                        let offset = if i == idx { offset } else { 0 };
+                        dst.prepend(shared_tail(page, offset));
+                    }
+                }
+            });
+        }
+    }
+}
+
 struct StreamOpsHandler {
     inner: Rc<StreamOpsInner>,
 }
 
 #[allow(clippy::box_collection)]
 struct StreamOpsInner {
-    api: DriverApi,
-    delayed: Cell<bool>,
-    delayed_feed: Cell<Option<Box<Vec<IdType>>>>,
+    api: ReactorApi,
+    delayed_feed: Queue<IdType>,
     storage: Cell<Option<Box<StreamOpsStorage>>>,
     pool: pool::Pool<io::Result<()>>,
     default_flags: Flags,
@@ -94,19 +374,29 @@ struct StreamOpsInner {
 struct StreamOpsStorage {
     ops: Slab<Option<Operation>>,
     streams: Slab<StreamItem>,
+    /// Provided buffers for receives that wait for input
+    bufs: Option<BufRing>,
+    /// `IORING_SEND_ZC_REPORT_USAGE` is supported, cleared on first `EINVAL`
+    zc_report: bool,
 }
 
 impl StreamOps {
     /// Get `StreamOps` instance from the current runtime, or create new one
-    pub(crate) fn get(driver: &Driver) -> Self {
+    pub(crate) fn get(reactor: &Reactor) -> Self {
         Arbiter::get_value(|| {
             let mut inner = None;
-            driver.register(|api| {
-                let default_flags = if api.is_supported(opcode::SendZc::CODE) {
+            reactor.register(|api| {
+                let mut default_flags = if api.is_supported(opcode::SendZc::CODE) {
                     Flags::empty()
                 } else {
                     Flags::NO_ZC
                 };
+                if !api.is_supported(opcode::SendMsg::CODE) {
+                    default_flags.insert(Flags::NO_MSG);
+                }
+                if !api.is_supported(opcode::SendMsgZc::CODE) {
+                    default_flags.insert(Flags::NO_ZC_MSG);
+                }
                 assert!(
                     api.is_supported(opcode::Close::CODE),
                     "opcode::Close is required for io-uring support"
@@ -118,16 +408,18 @@ impl StreamOps {
 
                 let mut ops = Slab::new();
                 ops.insert(Some(Operation::Nop));
+                let bufs = BufRing::new(&api);
 
                 let ops = Rc::new(StreamOpsInner {
                     api,
                     default_flags,
-                    delayed: Cell::new(false),
-                    delayed_feed: Cell::new(Some(Box::new(Vec::new()))),
+                    delayed_feed: Queue::new(),
                     pool: pool::new(),
                     storage: Cell::new(Some(Box::new(StreamOpsStorage {
                         ops,
                         streams: Slab::new(),
+                        bufs,
+                        zc_report: true,
                     }))),
                 });
                 inner = Some(ops.clone());
@@ -149,17 +441,14 @@ impl StreamOps {
             ctx,
             rd_op: None,
             wr_op: None,
-            flags: if zc { self.0.default_flags } else { Flags::NO_ZC },
+            flags: if zc {
+                self.0.default_flags
+            } else {
+                self.0.default_flags | Flags::NO_ZC
+            },
         };
 
-        let id = self.0.with(|st| {
-            // handle RDHUP event
-            let op = opcode::PollAdd::new(item.fd(), libc::POLLRDHUP as u32).build();
-            let id = st.streams.insert(item);
-            let op_id = st.ops.insert(Some(Operation::Poll { id })) as u32;
-            self.0.api.submit(op_id, op);
-            id
-        });
+        let id = self.0.with(|st| st.streams.insert(item));
         (
             StreamCtl {
                 id,
@@ -183,41 +472,26 @@ impl Handler for StreamOpsHandler {
     fn canceled(&mut self, user_data: usize) {
         self.inner
             .with(|st| match st.ops.remove(user_data).unwrap() {
-                Operation::Recv { id, buf } => {
-                    if let Some(item) = st.streams.get_mut(id) {
-                        #[cfg(feature = "trace")]
-                        log::trace!("{}: Recv canceled {:?}", item.tag(), item.fd());
-                        item.rd_op.take();
-                        item.flags.remove(Flags::RD_CANCELING);
-
-                        let res = item.ctx.update_read_status(buf, Ok(0));
-                        if item.flags.contains(Flags::RD_REISSUE) || res == IoTaskStatus::Io
-                        {
-                            item.flags.remove(Flags::RD_REISSUE);
-                            st.recv(id, false, &self.inner.api);
-                        }
-                    }
-                }
-                Operation::Send { id, buf, .. } => {
+                Operation::Recv { id, buf } => st.recv_canceled(id, Some(buf), &self.inner.api),
+                // the kernel returns a selected buffer to the ring by itself
+                Operation::RecvRing { id } => st.recv_canceled(id, None, &self.inner.api),
+                op @ (Operation::Send { .. } | Operation::SendOne { .. }) => {
+                    let (id, buf, _) = op.into_send();
                     if let Some(item) = st.streams.get_mut(id) {
                         #[cfg(feature = "trace")]
                         log::trace!("{}: Send canceled: {:?}", item.tag(), item.fd());
-                        item.ctx.with_write_buf(|pages| pages.prepend(buf));
+                        buf.release(&item.ctx, 0);
                         item.wr_op.take();
                         item.flags.remove(Flags::WR_CANCELING);
 
-                        let res = item.ctx.update_write_status(Ok(false));
-                        if item.flags.contains(Flags::WR_REISSUE) || res == IoTaskStatus::Io
-                        {
+                        let res = item.ctx.update_write_status(Ok(0));
+                        if item.flags.contains(Flags::WR_REISSUE) || res == IoTaskStatus::Io {
                             item.flags.remove(Flags::WR_REISSUE);
                             st.send(id, &self.inner.api);
                         }
                     }
                 }
-                Operation::Nop
-                | Operation::Poll { .. }
-                | Operation::Close { .. }
-                | Operation::Shutdown { .. } => {}
+                Operation::Nop | Operation::Close { .. } | Operation::Shutdown { .. } => {}
             });
     }
 
@@ -225,51 +499,14 @@ impl Handler for StreamOpsHandler {
     fn completed(&mut self, user_data: usize, flags: u32, res: io::Result<usize>) {
         self.inner.with(|st| {
             match st.ops[user_data].take().unwrap() {
-                Operation::Recv { id, mut buf, } => {
-
-                    if let Some(item) = st.streams.get_mut(id) {
-                        #[cfg(feature = "trace")]
-                        log::trace!(
-                            "{}: RcvDone({id}) {res:?} non-empty:{}",
-                            item.ctx.tag(),
-                            cqueue::sock_nonempty(flags));
-
-                        // reset op reference
-                        let _ = item.rd_op.take();
-
-                        // handle WouldBlock
-                        if matches!(res, Err(ref e) if e.kind() == io::ErrorKind::WouldBlock || e.raw_os_error() == Some(::libc::EINPROGRESS)) {
-                            log::error!("{}: Received WouldBlock {:?}, id: {:?}", item.tag(), res, item.ctx.id());
-                            st.recv_more(id, buf, &self.inner.api);
-                        } else {
-                            if let Ok(size) = res {
-                                if size > 0 {
-                                    // SAFETY: kernel tells us how many bytes it read
-                                    unsafe { buf.advance_mut(size) };
-                                } else {
-                                    item.ctx.stop(None);
-                                }
-                            }
-
-                            // handle IORING_CQE_F_SOCK_NONEMPTY flag
-                            if cqueue::sock_nonempty(flags) && !(matches!(res, Ok(0) | Err(_))) {
-                                // In case of disconnect, sock_nonempty is set to true.
-                                // First completion contains data, second Recv(0)
-                                // Before receiving Recv(0), POLLRDHUP is triggered
-                                // Driver must read all recv() call before handling
-                                // disconnects
-                                item.flags.insert(Flags::RD_MORE);
-                                st.recv_more(id, buf, &self.inner.api);
-                            } else {
-                                item.flags.remove(Flags::RD_MORE);
-                                if item.ctx.update_read_status(buf, res) == IoTaskStatus::Io {
-                                    st.recv(id, self.inner.api.is_new(), &self.inner.api);
-                                }
-                            }
-                        }
-                    }
+                Operation::Recv { id, buf } => {
+                    st.recv_done(id, buf, flags, res, &self.inner.api);
                 }
-                Operation::Send { id, buf, result } => {
+                Operation::RecvRing { id } => {
+                    st.recv_ring_done(id, flags, res, &self.inner.api);
+                }
+                op @ (Operation::Send { .. } | Operation::SendOne { .. }) => {
+                    let (id, buf, mut state) = op.into_send();
                     if let Some(item) = st.streams.get_mut(id) {
                         #[cfg(feature = "trace")]
                         log::trace!(
@@ -280,12 +517,42 @@ impl Handler for StreamOpsHandler {
                         );
 
                         if cqueue::notif(flags) {
-                            let res = result.unwrap_or(res).map(|n| {
-                                if n == 0 {
-                                    item.ctx.stop(None);
+                            // the kernel copied data anyway (loopback, veth, no
+                            // scatter-gather), zero-copy only adds overhead
+                            if state.zc_report
+                                && matches!(res, Ok(v) if v & IORING_NOTIF_USAGE_ZC_COPIED != 0)
+                                && !item.flags.contains(Flags::NO_ZC)
+                            {
+                                #[cfg(feature = "trace")]
+                                log::trace!("{}: Zero-copy send was copied, disable ({:?})", item.tag(), item.fd());
+                                item.flags.insert(Flags::NO_ZC);
+                            }
+                            if state.resent {
+                                let _ = st.ops.remove(user_data);
+                                return;
+                            }
+                            let has_result = state.result.is_some();
+                            let res = state.result.unwrap_or(res);
+                            if matches!(res, Err(ref e) if e.raw_os_error() == Some(libc::ECANCELED)) {
+                                #[cfg(feature = "trace")]
+                                log::trace!("{}: Send canceled: {:?}", item.tag(), item.fd());
+                                buf.release(&item.ctx, 0);
+                                item.flags.remove(Flags::WR_CANCELING);
+
+                                let res = item.ctx.update_write_status(Ok(0));
+                                if item.flags.contains(Flags::WR_REISSUE) || res == IoTaskStatus::Io {
+                                    item.flags.remove(Flags::WR_REISSUE);
+                                    st.send(id, &self.inner.api);
                                 }
-                                n > 0
-                            });
+                                let _ = st.ops.remove(user_data);
+                                return;
+                            }
+                            // unsent output was returned with the first completion
+                            let res = if has_result {
+                                res.and_then(write_status)
+                            } else {
+                                complete_send(&item.ctx, buf, res)
+                            };
                             if item.ctx.update_write_status(res) == IoTaskStatus::Io {
                                 st.send(id, &self.inner.api);
                             }
@@ -293,39 +560,50 @@ impl Handler for StreamOpsHandler {
                             // reset op reference
                             item.wr_op.take();
 
-                            // try to send next chunk
-                            if res.is_ok() {
+                            if let Ok(n) = res && n > 0 {
+                                // Unsent output has to go back before the next
+                                // chunk is sent to keep output in order
+                                if n < buf.len() {
+                                    buf.release_shared(&item.ctx, n);
+                                }
+                                st.send(id, &self.inner.api);
+                            } else if let Some(retry) = ZcRetry::check(&state, &res) {
+                                retry.apply(item, &mut st.zc_report);
+                                // the kernel may hold pages until the notification
+                                buf.release_shared(&item.ctx, 0);
+                                state.resent = true;
                                 st.send(id, &self.inner.api);
                             }
                             // insert op back for "notify" handling
-                            st.ops[user_data] = Some(Operation::Send {
-                                id,
-                                buf,
-                                result: Some(res) });
+                            state.result = Some(res);
+                            st.ops[user_data] = Some(buf.into_op(id, state));
                             // we reuse same op id
                             return
                         } else {
                             // reset op reference
                             item.wr_op.take();
 
+                            // resend without the failed zero-copy feature
+                            if let Some(retry) = ZcRetry::check(&state, &res) {
+                                retry.apply(item, &mut st.zc_report);
+                                buf.release(&item.ctx, 0);
+                                st.send(id, &self.inner.api);
+                                let _ = st.ops.remove(user_data);
+                                return;
+                            }
+
                             // release buffer and try to send next chunk
-                            let res = res.map(|n| {
-                                if n == 0 {
-                                    item.ctx.stop(None);
-                                }
-                                n > 0
-                            });
+                            let res = complete_send(&item.ctx, buf, res);
                             if item.ctx.update_write_status(res) == IoTaskStatus::Io {
                                 st.send(id, &self.inner.api);
                             }
                         }
+                    } else if cqueue::more(flags) && !cqueue::notif(flags) {
+                        // stream is gone, but the kernel still holds the buffer
+                        // until the zero-copy notification arrives
+                        st.ops[user_data] = Some(buf.into_op(id, state));
+                        return;
                     }
-                }
-                Operation::Poll { id } => {
-                    if let Some(item) = st.streams.get_mut(id)
-                        && !item.flags.contains(Flags::RD_MORE) && !item.ctx.is_stopped() {
-                            item.ctx.stop(res.err());
-                        }
                 }
                 Operation::Shutdown { tx } => {
                     if let Some(tx) = tx {
@@ -353,52 +631,274 @@ impl Handler for StreamOpsHandler {
     }
 
     fn cleanup(&mut self) {
-        if let Some(v) = self.inner.storage.take() {
-            for (_, val) in v.streams {
-                if val.flags.contains(Flags::DROPPED_PRI) {
-                    mem::forget(val.io);
+        // Reactor has flushed pending submissions and canceled all in-flight
+        // operations. Release every socket here, otherwise stored `IoContext`s
+        // keep `StreamOpsInner` alive through the io handle and nothing closes.
+        if let Some(mut v) = self.inner.storage.take() {
+            for item in v.streams.drain() {
+                if item.flags.intersects(Flags::DROPPED_PRI | Flags::CLOSING) {
+                    // descriptor is closed or being closed by the kernel
+                    mem::forget(item.io);
                 } else {
                     log::trace!(
-                        "{}: Unclosed sockets {:?}",
-                        val.ctx.tag(),
-                        val.io.peer_addr()
+                        "{}: Unclosed socket {:?}",
+                        item.ctx.tag(),
+                        item.io.peer_addr()
                     );
+                    drop(item.io);
                 }
             }
+            self.inner.storage.set(Some(v));
         }
-        self.inner.delayed_feed.take();
+        self.inner.delayed_feed.clear();
     }
 }
 
+fn is_would_block(res: &io::Result<usize>) -> bool {
+    matches!(res, Err(e) if e.kind() == io::ErrorKind::WouldBlock
+        || e.raw_os_error() == Some(libc::EINPROGRESS))
+}
+
+fn write_status(n: usize) -> io::Result<usize> {
+    if n == 0 {
+        Err(io::Error::new(
+            io::ErrorKind::WriteZero,
+            "failed to write frame to transport",
+        ))
+    } else {
+        Ok(n)
+    }
+}
+
+/// Completes a send, returning output that did not reach the peer.
+///
+/// The pages were taken out of the write buffer when the send was submitted,
+/// so they are counted as in-flight output. Whatever the kernel did not accept
+/// has to go back, otherwise it is both lost and left counted as outstanding.
+fn complete_send(ctx: &IoContext, buf: SendData, res: io::Result<usize>) -> io::Result<usize> {
+    if let Ok(n) = res
+        && n < buf.len()
+    {
+        buf.release(ctx, n);
+    }
+    res.and_then(write_status)
+}
+
 impl StreamOpsStorage {
-    fn recv(&mut self, id: usize, poll_first: bool, api: &DriverApi) {
-        if let Some(item) = self.streams.get_mut(id) {
+    fn recv(&mut self, id: usize, poll_first: bool, api: &ReactorApi) {
+        if let Some(item) = self.streams.get_mut(id)
+            && !item.flags.contains(Flags::CLOSING)
+        {
             if item.rd_op.is_none() {
-                #[cfg(feature = "trace")]
-                log::trace!("{}: Rcv({id})", item.ctx.tag());
+                // an idle connection does not hold a read buffer, the ring
+                // provides one once input arrives. Input that completes a
+                // partial frame is received into its buffer without a copy
+                if let Some(ring) = &self.bufs
+                    && !item.flags.contains(Flags::RD_DIRECT)
+                    && item.ctx.read_buf_size() == 0
+                {
+                    #[cfg(feature = "trace")]
+                    log::trace!("{}: RcvRing({id})", item.ctx.tag());
 
-                let mut buf = item.ctx.get_read_buf();
-                let s = buf.chunk_mut();
-                let buf_ptr = s.as_mut_ptr();
-                let buf_len = s.len() as u32;
-                let op_id = self.ops.insert(Some(Operation::Recv { id, buf })) as u32;
-                item.rd_op = NonZeroU32::new(op_id);
+                    let op_id = self.ops.insert(Some(Operation::RecvRing { id })) as u32;
+                    item.rd_op = NonZeroU32::new(op_id);
 
-                api.submit_inline(op_id, move |entry| {
-                    let op = opcode2::Recv::with(entry, item.fd()).buffer(buf_ptr, buf_len);
-                    if poll_first {
-                        op.ioprio(IORING_RECVSEND_POLL_FIRST);
-                    }
-                });
+                    let (bgid, buf_len) = (ring.bgid(), ring.buf_len());
+                    api.submit(op_id, move |entry| {
+                        let op = opcode::Recv::new(entry, item.fd(), ptr::null_mut(), buf_len)
+                            .buffer_select(bgid);
+                        if poll_first {
+                            op.ioprio(IORING_RECVSEND_POLL_FIRST);
+                        }
+                    });
+                } else {
+                    #[cfg(feature = "trace")]
+                    log::trace!("{}: Rcv({id})", item.ctx.tag());
+
+                    let mut buf = item.ctx.take_read_buf();
+                    let s = buf.chunk_mut();
+                    let buf_ptr = s.as_mut_ptr();
+                    let buf_len = s.len() as u32;
+                    let op_id = self.ops.insert(Some(Operation::Recv { id, buf })) as u32;
+                    item.rd_op = NonZeroU32::new(op_id);
+
+                    api.submit(op_id, move |entry| {
+                        let op = opcode::Recv::new(entry, item.fd(), buf_ptr, buf_len);
+                        if poll_first {
+                            op.ioprio(IORING_RECVSEND_POLL_FIRST);
+                        }
+                    });
+                }
             } else if item.flags.contains(Flags::RD_CANCELING) {
                 item.flags.insert(Flags::RD_REISSUE);
             }
         }
     }
 
-    fn recv_more(&mut self, id: usize, mut buf: BytesMut, api: &DriverApi) {
+    /// A receive was canceled, `buf` is the read buffer it took.
+    ///
+    /// A ring receive takes no read buffer. Reading was paused or the stream
+    /// is closing, so the receive is reissued only for a resume that raced
+    /// the cancel, it could not submit while the canceled receive was pending.
+    /// Later resumes submit it themselves.
+    fn recv_canceled(&mut self, id: usize, buf: Option<BytesMut>, api: &ReactorApi) {
         if let Some(item) = self.streams.get_mut(id) {
-            item.ctx.resize_read_buf(&mut buf);
+            #[cfg(feature = "trace")]
+            log::trace!("{}: Recv canceled {:?}", item.tag(), item.fd());
+            item.rd_op.take();
+            item.flags.remove(Flags::RD_CANCELING);
+
+            if let Some(buf) = buf {
+                let _ = item.ctx.release_read_buf(buf, Poll::Pending);
+            }
+            if item.flags.contains(Flags::RD_REISSUE) {
+                item.flags.remove(Flags::RD_REISSUE);
+                self.recv(id, false, api);
+            }
+        }
+    }
+
+    fn recv_done(
+        &mut self,
+        id: usize,
+        mut buf: BytesMut,
+        flags: u32,
+        res: io::Result<usize>,
+        api: &ReactorApi,
+    ) {
+        if let Some(item) = self.streams.get_mut(id) {
+            #[cfg(feature = "trace")]
+            log::trace!(
+                "{}: RcvDone({id}) {res:?} non-empty:{}",
+                item.ctx.tag(),
+                cqueue::sock_nonempty(flags)
+            );
+
+            // reset op reference, a pending cancel lost the race
+            // with this completion and has nothing to cancel anymore
+            let _ = item.rd_op.take();
+            item.flags.remove(Flags::RD_CANCELING | Flags::RD_REISSUE);
+
+            if is_would_block(&res) {
+                log::error!(
+                    "{}: Received WouldBlock {:?}, id: {:?}",
+                    item.tag(),
+                    res,
+                    item.ctx.id()
+                );
+                self.recv_more(id, buf, true, api);
+            } else {
+                if let Ok(size) = res
+                    && size > 0
+                {
+                    // SAFETY: kernel tells us how many bytes it read
+                    unsafe { buf.advance_mut(size) };
+                }
+                self.recv_complete(id, buf, flags, res, api);
+            }
+        }
+    }
+
+    fn recv_ring_done(&mut self, id: usize, flags: u32, res: io::Result<usize>, api: &ReactorApi) {
+        let bid = cqueue::buffer_select(flags);
+        if matches!(res, Err(ref e) if e.raw_os_error() == Some(libc::ECANCELED)) {
+            // canceled after a buffer was selected
+            if let (Some(bid), Some(ring)) = (bid, &mut self.bufs) {
+                ring.recycle(bid);
+            }
+            self.recv_canceled(id, None, api);
+            return;
+        }
+        let Some(item) = self.streams.get_mut(id) else {
+            if let (Some(bid), Some(ring)) = (bid, &mut self.bufs) {
+                ring.recycle(bid);
+            }
+            return;
+        };
+
+        #[cfg(feature = "trace")]
+        log::trace!(
+            "{}: RcvRingDone({id}) {res:?} bid:{bid:?} non-empty:{}",
+            item.ctx.tag(),
+            cqueue::sock_nonempty(flags)
+        );
+
+        let _ = item.rd_op.take();
+        item.flags.remove(Flags::RD_CANCELING | Flags::RD_REISSUE);
+
+        if let (Some(bid), Some(ring)) = (bid, &mut self.bufs) {
+            if let Ok(size) = res
+                && size > 0
+            {
+                // the received page becomes the read buffer, it is charged
+                // to the connection's tracker once it leaves the ring
+                #[cfg_attr(not(feature = "tracker"), allow(unused_mut))]
+                let mut buf = ring.take(bid, size);
+                #[cfg(feature = "tracker")]
+                if let Some(t) = item.ctx.buf_tracker() {
+                    buf.set_tracker(t);
+                }
+                self.recv_complete(id, buf, flags, res, api);
+                return;
+            }
+            ring.recycle(bid);
+        }
+
+        match res {
+            Err(ref e) if e.raw_os_error() == Some(libc::ENOBUFS) => {
+                // all ring buffers are in use, receive into a buffer of its own
+                item.flags.insert(Flags::RD_DIRECT);
+                self.recv(id, false, api);
+            }
+            ref res if is_would_block(res) => self.recv(id, true, api),
+            res => {
+                let res = match res {
+                    Ok(size) if size > 0 => Err(io::Error::other("Received data without a buffer")),
+                    res => res,
+                };
+                if item.ctx.release_read_buf(BytesMut::new(), Poll::Ready(res)) == IoTaskStatus::Io
+                {
+                    self.recv(id, api.is_new(), api);
+                }
+            }
+        }
+    }
+
+    /// Completes a receive into `buf`.
+    fn recv_complete(
+        &mut self,
+        id: usize,
+        buf: BytesMut,
+        flags: u32,
+        res: io::Result<usize>,
+        api: &ReactorApi,
+    ) {
+        let item = &mut self.streams[id];
+        let nonempty = cqueue::sock_nonempty(flags);
+
+        // handle IORING_CQE_F_SOCK_NONEMPTY flag, more input is queued, keep
+        // reading into the same buffer until it is full. The buffer is not
+        // grown, so read backpressure applies once it is released
+        if nonempty && buf.remaining_mut() > 0 && matches!(res, Ok(size) if size > 0) {
+            self.recv_more(id, buf, false, api);
+        } else {
+            // input that fills the buffer is streaming, the next receive goes
+            // to a buffer sized by the read history instead of a ring page
+            item.flags
+                .set(Flags::RD_DIRECT, nonempty || buf.remaining_mut() == 0);
+            if item.ctx.release_read_buf(buf, Poll::Ready(res)) == IoTaskStatus::Io {
+                self.recv(id, api.is_new(), api);
+            }
+        }
+    }
+
+    fn recv_more(&mut self, id: usize, mut buf: BytesMut, resize: bool, api: &ReactorApi) {
+        if let Some(item) = self.streams.get_mut(id)
+            && !item.flags.contains(Flags::CLOSING)
+        {
+            if resize {
+                buf.reserve_more();
+            }
 
             let slice = buf.chunk_mut();
             let buf_ptr = slice.as_mut_ptr();
@@ -406,38 +906,100 @@ impl StreamOpsStorage {
             let op_id = self.ops.insert(Some(Operation::Recv { id, buf })) as u32;
             item.rd_op = NonZeroU32::new(op_id);
 
-            api.submit_inline(op_id, move |entry| {
-                opcode2::Recv::with(entry, item.fd()).buffer(buf_ptr, buf_len);
+            api.submit(op_id, move |entry| {
+                opcode::Recv::new(entry, item.fd(), buf_ptr, buf_len);
             });
         }
     }
 
-    fn send(&mut self, id: usize, api: &DriverApi) {
-        if let Some(item) = self.streams.get_mut(id) {
+    fn send(&mut self, id: usize, api: &ReactorApi) {
+        if let Some(item) = self.streams.get_mut(id)
+            && !item.flags.contains(Flags::CLOSING)
+        {
             if item.wr_op.is_none() {
-                let page = item.ctx.with_write_buf(BytePages::take);
-                if let Some(buf) = page {
-                    #[cfg(feature = "trace")]
-                    log::trace!("{}: Snd({id}) size:{:?}", item.ctx.tag(), buf.len());
+                let zc = !item.flags.contains(Flags::NO_ZC);
+                let max_pages = if item.flags.contains(Flags::NO_MSG) {
+                    1
+                } else {
+                    SEND_MAX_PAGES
+                };
+                // a zero-copy send is limited to `ZC_MAX_SIZE`
+                let max_size = if zc { ZC_MAX_SIZE as usize } else { SEND_MAX_SIZE };
+                let buf = item
+                    .ctx
+                    .with_write_dst(|dst| SendData::take(dst, max_pages, max_size));
+                let Some(mut buf) = buf else {
+                    return;
+                };
+                let len = buf.len();
+                let num = match &buf {
+                    SendData::Page(_) => 1,
+                    SendData::Pages(buf) => buf.pages().count(),
+                };
+                let use_zc = zc
+                    && (ZC_SIZE as usize..=ZC_MAX_SIZE as usize).contains(&len)
+                    && (num == 1 || !item.flags.contains(Flags::NO_ZC_MSG));
+                let zc_report = use_zc && self.zc_report;
+                let zc_flags = if zc_report { IORING_SEND_ZC_REPORT_USAGE } else { 0 };
 
-                    let buf_ptr = buf.as_ptr();
-                    let buf_len = buf.len() as u32;
-                    let op_id = self.ops.insert(Some(Operation::Send {
-                        id,
-                        buf,
+                #[cfg(feature = "trace")]
+                log::trace!(
+                    "{}: Snd({id}) size:{len} pages:{num} zc:{use_zc}",
+                    item.ctx.tag(),
+                );
+
+                // SAFETY: a single page is heap backed, gathered pages are
+                // stored in the boxed `SendBuf`, the data does not move until
+                // the operation completes
+                let (ptr, msg) = if num == 1 {
+                    let ptr = match &buf {
+                        SendData::Page(page) => unsafe { page.as_ptr() },
+                        SendData::Pages(buf) => buf
+                            .pages()
+                            .next()
+                            .map(|page| unsafe { page.as_ptr() })
+                            .unwrap_or_default(),
+                    };
+                    (ptr, ptr::null())
+                } else {
+                    let SendData::Pages(buf) = &mut buf else {
+                        unreachable!()
+                    };
+                    let SendBuf { pages, iov, msg } = &mut **buf;
+                    for (iov, page) in iov.iter_mut().zip(pages.iter().flatten()) {
+                        iov.iov_base = unsafe { page.as_ptr() }.cast_mut().cast();
+                        iov.iov_len = page.len();
+                    }
+                    msg.msg_iov = iov.as_mut_ptr();
+                    msg.msg_iovlen = num as _;
+                    (ptr::null(), &raw const buf.msg)
+                };
+
+                let op_id = self.ops.insert(Some(buf.into_op(
+                    id,
+                    SendState {
                         result: None,
-                    })) as u32;
-                    item.wr_op = NonZeroU32::new(op_id);
+                        zc: use_zc,
+                        zc_report,
+                        resent: false,
+                    },
+                ))) as u32;
+                item.wr_op = NonZeroU32::new(op_id);
 
-                    api.submit_inline(op_id, move |entry| {
-                        if item.flags.contains(Flags::NO_ZC) || buf_len <= ZC_SIZE {
-                            opcode2::Send::with(entry, item.fd()).buffer(buf_ptr, buf_len);
-                        } else {
-                            opcode2::SendZc::with(entry, item.fd())
-                                .buffer(buf_ptr, buf_len);
-                        }
-                    });
-                }
+                api.submit(op_id, move |entry| match (msg.is_null(), use_zc) {
+                    (true, true) => {
+                        opcode::SendZc::new(entry, item.fd(), ptr, len as u32).zc_flags(zc_flags);
+                    }
+                    (true, false) => {
+                        opcode::Send::new(entry, item.fd(), ptr, len as u32);
+                    }
+                    (false, true) => {
+                        opcode::SendMsgZc::new(entry, item.fd(), msg).ioprio(zc_flags);
+                    }
+                    (false, false) => {
+                        opcode::SendMsg::new(entry, item.fd(), msg);
+                    }
+                });
             } else if item.flags.contains(Flags::WR_CANCELING) {
                 item.flags.insert(Flags::WR_REISSUE);
             }
@@ -448,14 +1010,77 @@ impl StreamOpsStorage {
         self.ops.insert(Some(op)) as u32
     }
 
-    fn pause_read(&mut self, id: usize, api: &DriverApi) {
-        let item = &mut self.streams[id];
-        if let Some(rd_op) = item.rd_op
+    fn pause_read(&mut self, id: usize, api: &ReactorApi) {
+        let Some(item) = self.streams.get_mut(id) else {
+            return;
+        };
+        if let Some(rd_op) = item.rd_op {
+            if item.flags.contains(Flags::RD_CANCELING) {
+                // paused again before the cancel completed
+                item.flags.remove(Flags::RD_REISSUE);
+            } else {
+                item.flags.insert(Flags::RD_CANCELING);
+                api.cancel(rd_op.get());
+                log::trace!("{}: Recv to pause ({:?})", item.tag(), item.fd());
+            }
+        }
+    }
+
+    fn drop_stream(&mut self, id: usize, api: &ReactorApi) {
+        // Dropping while `StreamOps` handling event
+        let Some(item) = self.streams.get_mut(id) else {
+            return;
+        };
+        log::trace!("{}: Close ({:?})", item.tag(), item.fd());
+
+        item.flags.insert(Flags::CLOSING);
+
+        // `Close` only removes the descriptor from the file table, in-flight
+        // operations keep the socket open, so no FIN or RST is sent until
+        // they complete. Operations are canceled by id, which does not
+        // depend on the descriptor still being present in the table.
+        if let Some(op) = item.rd_op
             && !item.flags.contains(Flags::RD_CANCELING)
         {
             item.flags.insert(Flags::RD_CANCELING);
-            api.cancel(rd_op.get());
-            log::trace!("{}: Recv to pause ({:?})", item.tag(), item.fd());
+            api.cancel(op.get());
+        }
+        if let Some(op) = item.wr_op
+            && !item.flags.contains(Flags::WR_CANCELING)
+        {
+            item.flags.insert(Flags::WR_CANCELING);
+            api.cancel(op.get());
+        }
+
+        let fd = item.fd();
+        let op_id = self.add_operation(Operation::Close { id });
+        api.submit(op_id, move |entry| {
+            opcode::Close::new(entry, fd);
+        });
+    }
+
+    fn drop_weak_stream(&mut self, id: usize) {
+        // Dropping while `StreamOps` handling event
+        let Some(item) = self.streams.get_mut(id) else {
+            return;
+        };
+        if item.flags.contains(Flags::DROPPED_PRI) {
+            // io is closed already, remove from storage
+            let item = self.streams.remove(id);
+            mem::forget(item.io);
+        } else {
+            item.flags.insert(Flags::DROPPED_SEC);
+        }
+    }
+}
+
+impl Drop for StreamOpsInner {
+    fn drop(&mut self) {
+        if let Some(st) = self.storage.get_mut()
+            && let Some(ring) = &mut st.bufs
+            && let Err(e) = ring.unregister(&self.api)
+        {
+            log::error!("Cannot unregister provided buffer ring: {e:?}");
         }
     }
 }
@@ -471,58 +1096,15 @@ impl StreamOpsInner {
         result
     }
 
-    fn drop_stream(&self, id: usize) {
-        // Dropping while `StreamOps` handling event
-        if let Some(mut storage) = self.storage.take() {
-            let item = &mut storage.streams[id];
-            log::trace!("{}: Close ({:?})", item.tag(), item.fd());
-
-            let entry = opcode::Close::new(item.fd()).build();
-            let op_id = storage.add_operation(Operation::Close { id });
-            self.api.submit(op_id, entry);
-            self.storage.set(Some(storage));
-        } else {
-            self.add_delayed_drop(IdType::Stream(id as u32));
-        }
-    }
-
-    fn drop_weak_stream(&self, id: usize) {
-        // Dropping while `StreamOps` handling event
-        if let Some(mut storage) = self.storage.take() {
-            let item = &mut storage.streams[id];
-            if item.flags.contains(Flags::DROPPED_PRI) {
-                // io is closed already, remove from storage
-                let item = storage.streams.remove(id);
-                mem::forget(item.io);
-            } else {
-                item.flags.insert(Flags::DROPPED_SEC);
-            }
-            self.storage.set(Some(storage));
-        } else {
-            self.add_delayed_drop(IdType::Weak(id as u32));
-        }
-    }
-
-    fn add_delayed_drop(&self, id: IdType) {
-        self.delayed.set(true);
-        if let Some(mut feed) = self.delayed_feed.take() {
-            feed.push(id);
-            self.delayed_feed.set(Some(feed));
-        }
-    }
-
     fn check_delayed_feed(&self) {
-        if self.delayed.get() {
-            self.delayed.set(false);
-            if let Some(mut feed) = self.delayed_feed.take() {
-                for id in feed.drain(..) {
-                    match id {
-                        IdType::Stream(id) => self.drop_stream(id as usize),
-                        IdType::Weak(id) => self.drop_weak_stream(id as usize),
-                    }
+        if let Some(mut storage) = self.storage.take() {
+            while let Some(id) = self.delayed_feed.pop() {
+                match id {
+                    IdType::Stream(id) => storage.drop_stream(id as usize, &self.api),
+                    IdType::Weak(id) => storage.drop_weak_stream(id as usize),
                 }
-                self.delayed_feed.set(Some(feed));
             }
+            self.storage.set(Some(storage));
         }
     }
 }
@@ -538,7 +1120,21 @@ impl StreamItem {
 }
 
 impl StreamCtl {
-    pub(crate) async fn shutdown(&self) -> io::Result<()> {
+    pub(crate) async fn shutdown(&self, terminate: bool) -> io::Result<()> {
+        if terminate {
+            // The connection was force-closed, so it is released without the
+            // graceful close: the receive queue is not drained and no
+            // `SHUT_RDWR` is submitted. The socket is aborted instead, so that
+            // the peer sees an RST and cannot mistake a truncated stream for a
+            // complete one. Dropping this handle submits the `Close` that
+            // releases the descriptor.
+            self.inner.with(|storage| {
+                storage.pause_read(self.id, &self.inner.api);
+                crate::helpers::abort_raw_socket(storage.streams[self.id].fd().0);
+            });
+            return Ok(());
+        }
+
         self.inner
             .with(|storage| {
                 storage.pause_read(self.id, &self.inner.api);
@@ -549,16 +1145,22 @@ impl StreamCtl {
                     self.id
                 );
                 let fd = storage.streams[self.id].fd();
+                if storage.streams[self.id].rd_op.is_none() {
+                    // `pause_read()` above only submits a cancel, so a recv can
+                    // still be in flight; draining now would race it. Nothing is
+                    // lost by skipping, that recv empties the queue itself.
+                    crate::helpers::drain_raw_socket(fd.0);
+                }
                 let (tx, rx) = self.inner.pool.channel();
                 let op_id = storage.add_operation(Operation::shutdown(tx));
-                self.inner
-                    .api
-                    .submit(op_id, opcode::Shutdown::new(fd, libc::SHUT_RDWR).build());
+                self.inner.api.submit(op_id, move |entry| {
+                    opcode::Shutdown::new(entry, fd, libc::SHUT_RDWR);
+                });
                 rx
             })
             .await
             .map_err(|_| io::Error::other("gone"))
-            .and_then(|item| item)
+            .and_then(crate::helpers::shutdown_result)
     }
 
     pub(crate) fn resume_read(&self) {
@@ -578,21 +1180,32 @@ impl StreamCtl {
 
 impl Drop for StreamCtl {
     fn drop(&mut self) {
-        self.inner.drop_stream(self.id);
+        if let Some(mut storage) = self.inner.storage.take() {
+            storage.drop_stream(self.id, &self.inner.api);
+            self.inner.storage.set(Some(storage));
+        } else {
+            self.inner.delayed_feed.push(IdType::Stream(self.id as u32));
+        }
     }
 }
 
 impl WeakStreamCtl {
-    pub(crate) fn with_io<F, R>(&self, f: F) -> R
+    pub(crate) fn with_io<F, R>(&self, f: F) -> Option<R>
     where
         F: FnOnce(&Socket) -> R,
     {
-        self.inner.with(|storage| f(&storage.streams[self.id].io))
+        self.inner
+            .with(|storage| storage.streams.get(self.id).map(|item| f(&item.io)))
     }
 }
 
 impl Drop for WeakStreamCtl {
     fn drop(&mut self) {
-        self.inner.drop_weak_stream(self.id);
+        if let Some(mut storage) = self.inner.storage.take() {
+            storage.drop_weak_stream(self.id);
+            self.inner.storage.set(Some(storage));
+        } else {
+            self.inner.delayed_feed.push(IdType::Weak(self.id as u32));
+        }
     }
 }

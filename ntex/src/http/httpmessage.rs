@@ -15,19 +15,21 @@ use crate::util::Extensions;
 #[cfg(feature = "cookie")]
 struct Cookies(Vec<Cookie<'static>>);
 
-/// Trait that implements general purpose operations on http messages
+/// Common operations for HTTP requests and responses.
 pub trait HttpMessage: Sized {
-    /// Read the message headers.
+    /// Returns the message headers.
     fn message_headers(&self) -> &HeaderMap;
 
-    /// Request's extensions container
+    /// Returns the message extensions.
     fn message_extensions(&self) -> Ref<'_, Extensions>;
 
-    /// Mutable reference to a the request's extensions container
+    /// Returns mutable access to the message extensions.
     fn message_extensions_mut(&self) -> RefMut<'_, Extensions>;
 
-    /// Read the request content type. If request does not contain
-    /// *Content-Type* header, empty str get returned.
+    /// Returns the media type from the `Content-Type` header.
+    ///
+    /// Parameters such as `charset` are omitted. Returns an empty string when
+    /// the header is missing or is not valid UTF-8.
     fn content_type(&self) -> &str {
         if let Some(content_type) = self.message_headers().get(header::CONTENT_TYPE)
             && let Ok(content_type) = content_type.to_str()
@@ -37,15 +39,18 @@ pub trait HttpMessage: Sized {
         ""
     }
 
-    /// Get content type encoding
+    /// Returns the character encoding declared by `Content-Type`.
     ///
-    /// UTF-8 is used by default, If request charset is not set.
+    /// UTF-8 is returned when the header or its `charset` parameter is absent.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ContentTypeError::ParseError`] for an invalid media type or
+    /// [`ContentTypeError::UnknownEncoding`] for an unknown charset.
     fn encoding(&self) -> Result<&'static Encoding, ContentTypeError> {
         if let Some(mime_type) = self.mime_type()? {
             if let Some(charset) = mime_type.get_param("charset") {
-                if let Some(enc) =
-                    Encoding::for_label_no_replacement(charset.as_str().as_bytes())
-                {
+                if let Some(enc) = Encoding::for_label_no_replacement(charset.as_str().as_bytes()) {
                     Ok(enc)
                 } else {
                     Err(ContentTypeError::UnknownEncoding)
@@ -58,7 +63,12 @@ pub trait HttpMessage: Sized {
         }
     }
 
-    /// Convert the request content type to a known mime type.
+    /// Parses the `Content-Type` header as a MIME type.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ContentTypeError::ParseError`] when the header is not valid
+    /// UTF-8 or does not contain a valid MIME value.
     fn mime_type(&self) -> Result<Option<Mime>, ContentTypeError> {
         if let Some(content_type) = self.message_headers().get(header::CONTENT_TYPE) {
             if let Ok(content_type) = content_type.to_str() {
@@ -73,7 +83,12 @@ pub trait HttpMessage: Sized {
         }
     }
 
-    /// Check if request has chunked transfer encoding
+    /// Returns whether `Transfer-Encoding` contains `chunked`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`DecodeError::Header`] when the header value is not valid
+    /// UTF-8.
     fn chunked(&self) -> Result<bool, DecodeError> {
         if let Some(encodings) = self.message_headers().get(header::TRANSFER_ENCODING) {
             if let Ok(s) = encodings.to_str() {
@@ -87,13 +102,17 @@ pub trait HttpMessage: Sized {
     }
 
     #[cfg(feature = "cookie")]
-    /// Load request cookies.
+    /// Parses and caches cookies from the `Cookie` headers.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if a header is not valid UTF-8 or a cookie cannot be
+    /// parsed.
     fn cookies(&self) -> Result<Ref<'_, Vec<Cookie<'static>>>, coo_kie::ParseError> {
         if self.message_extensions().get::<Cookies>().is_none() {
             let mut cookies = Vec::new();
             for hdr in self.message_headers().get_all(header::COOKIE) {
-                let s =
-                    str::from_utf8(hdr.as_bytes()).map_err(coo_kie::ParseError::from)?;
+                let s = str::from_utf8(hdr.as_bytes()).map_err(coo_kie::ParseError::from)?;
                 for cookie_str in s.split(';').map(str::trim) {
                     if !cookie_str.is_empty() {
                         cookies.push(Cookie::parse_encoded(cookie_str)?.into_owned());
@@ -108,7 +127,7 @@ pub trait HttpMessage: Sized {
     }
 
     #[cfg(feature = "cookie")]
-    /// Return request cookie.
+    /// Returns the first request cookie with the given name.
     fn cookie(&self, name: &str) -> Option<Cookie<'static>> {
         if let Ok(cookies) = self.cookies() {
             for cookie in cookies.iter() {
@@ -130,25 +149,23 @@ mod tests {
 
     #[test]
     fn test_content_type() {
-        let req = TestRequest::with_header("content-type", "text/plain").finish();
+        let req = TestRequest::with_header("content-type", "text/plain").build();
         assert_eq!(req.content_type(), "text/plain");
         let req =
-            TestRequest::with_header("content-type", "application/json; charset=utf=8")
-                .finish();
+            TestRequest::with_header("content-type", "application/json; charset=utf=8").build();
         assert_eq!(req.content_type(), "application/json");
-        let req = TestRequest::default().finish();
+        let req = TestRequest::builder().build();
         assert_eq!(req.content_type(), "");
     }
 
     #[test]
     fn test_mime_type() {
-        let req = TestRequest::with_header("content-type", "application/json").finish();
+        let req = TestRequest::with_header("content-type", "application/json").build();
         assert_eq!(req.mime_type().unwrap(), Some(mime::APPLICATION_JSON));
-        let req = TestRequest::default().finish();
+        let req = TestRequest::builder().build();
         assert_eq!(req.mime_type().unwrap(), None);
         let req =
-            TestRequest::with_header("content-type", "application/json; charset=utf-8")
-                .finish();
+            TestRequest::with_header("content-type", "application/json; charset=utf-8").build();
         let mt = req.mime_type().unwrap().unwrap();
         assert_eq!(mt.get_param(mime::CHARSET), Some(mime::UTF_8));
         assert_eq!(mt.type_(), mime::APPLICATION);
@@ -157,38 +174,32 @@ mod tests {
 
     #[test]
     fn test_mime_type_error() {
-        let req = TestRequest::with_header(
-            "content-type",
-            "applicationadfadsfasdflknadsfklnadsfjson",
-        )
-        .finish();
+        let req =
+            TestRequest::with_header("content-type", "applicationadfadsfasdflknadsfklnadsfjson")
+                .build();
         assert_eq!(Err(ContentTypeError::ParseError), req.mime_type());
     }
 
     #[test]
     fn test_encoding() {
-        let req = TestRequest::default().finish();
+        let req = TestRequest::builder().build();
         assert_eq!(UTF_8.name(), req.encoding().unwrap().name());
 
-        let req = TestRequest::with_header("content-type", "application/json").finish();
+        let req = TestRequest::with_header("content-type", "application/json").build();
         assert_eq!(UTF_8.name(), req.encoding().unwrap().name());
 
-        let req = TestRequest::with_header(
-            "content-type",
-            "application/json; charset=ISO-8859-2",
-        )
-        .finish();
+        let req = TestRequest::with_header("content-type", "application/json; charset=ISO-8859-2")
+            .build();
         assert_eq!(ISO_8859_2, req.encoding().unwrap());
     }
 
     #[test]
     fn test_encoding_error() {
-        let req = TestRequest::with_header("content-type", "applicatjson").finish();
+        let req = TestRequest::with_header("content-type", "applicatjson").build();
         assert_eq!(Some(ContentTypeError::ParseError), req.encoding().err());
 
         let req =
-            TestRequest::with_header("content-type", "application/json; charset=kkkttktk")
-                .finish();
+            TestRequest::with_header("content-type", "application/json; charset=kkkttktk").build();
         assert_eq!(
             Some(ContentTypeError::UnknownEncoding),
             req.encoding().err()
@@ -197,18 +208,39 @@ mod tests {
 
     #[test]
     fn test_chunked() {
-        let req = TestRequest::default().finish();
+        let req = TestRequest::builder().build();
         assert!(!req.chunked().unwrap());
 
-        let req = TestRequest::with_header(header::TRANSFER_ENCODING, "chunked").finish();
+        let req = TestRequest::with_header(header::TRANSFER_ENCODING, "chunked").build();
         assert!(req.chunked().unwrap());
 
-        let req = TestRequest::default()
+        let req = TestRequest::builder()
             .header(
                 header::TRANSFER_ENCODING,
                 b"some va\xadscc\xacas0xsdasdlue".as_ref(),
             )
-            .finish();
+            .build();
         assert!(req.chunked().is_err());
+    }
+
+    #[test]
+    fn test_mime_type_not_utf8() {
+        let req = TestRequest::default()
+            .header(
+                header::CONTENT_TYPE,
+                header::HeaderValue::from_bytes(b"text/\xff").unwrap(),
+            )
+            .build();
+        assert_eq!(req.mime_type(), Err(ContentTypeError::ParseError));
+    }
+
+    #[cfg(feature = "cookie")]
+    #[test]
+    fn test_cookie_not_found() {
+        let req = TestRequest::default()
+            .header(header::COOKIE, "c1=v1; ")
+            .build();
+        assert_eq!(req.cookies().unwrap().len(), 1);
+        assert!(req.cookie("c2").is_none());
     }
 }

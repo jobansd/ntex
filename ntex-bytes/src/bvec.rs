@@ -1,26 +1,22 @@
-use std::{borrow, cmp, fmt, io, ops::Deref, ops::DerefMut, ptr};
+use std::{borrow, fmt, io, ops::DerefMut, ptr};
 
-use crate::{Buf, BufMut, Bytes, buf::IntoIter, buf::UninitSlice, storage::StorageVec};
+use crate::{Buf, BufMut, BytePageSize, Bytes, buf::UninitSlice, stvec::StorageVec};
 
 /// A unique reference to a contiguous slice of memory.
 ///
 /// `BytesMut` represents a unique view into a potentially shared memory region.
 /// Given the uniqueness guarantee, owners of `BytesMut` handles are able to
-/// mutate the memory. It is similar to a `Vec<u8>` but with less copies and
+/// mutate the memory. It is similar to a `Vec<u8>` but with fewer copies and
 /// allocations. It also always allocates.
 ///
-/// For more detail, see [Bytes](struct.Bytes.html).
+/// For more detail, see [`Bytes`].
 ///
 /// # Growth
 ///
-/// One key difference from `Vec<u8>` is that most operations **do not
-/// implicitly grow the buffer**. This means that calling `my_bytes.put("hello
-/// world");` could panic if `my_bytes` does not have enough capacity. Before
-/// writing to the buffer, ensure that there is enough remaining capacity by
-/// calling `my_bytes.remaining_mut()`. In general, avoiding calls to `reserve`
-/// is preferable.
-///
-/// The only exception is `extend` which implicitly reserves required capacity.
+/// Safe write operations such as [`BufMut::put_slice`], [`BufMut::put_u8`], and
+/// [`extend_from_slice`](Self::extend_from_slice) reserve additional capacity
+/// when needed. Use [`reserve`](Self::reserve) when the required capacity is
+/// known in advance to avoid repeated allocation.
 ///
 /// # Examples
 ///
@@ -31,7 +27,7 @@ use crate::{Buf, BufMut, Bytes, buf::IntoIter, buf::UninitSlice, storage::Storag
 ///
 /// buf.put_u8(b'h');
 /// buf.put_u8(b'e');
-/// buf.put("llo");
+/// buf.put_slice(b"llo");
 ///
 /// assert_eq!(&buf[..], b"hello");
 ///
@@ -59,8 +55,8 @@ impl BytesMut {
     ///
     /// # Panics
     ///
-    /// Panics if `capacity` greater than 60bit for 64bit systems
-    /// and 28bit for 32bit systems
+    /// Panics if `capacity` exceeds `u32::MAX` minus the buffer
+    /// header size, just under 4 GiB.
     ///
     /// # Examples
     ///
@@ -84,7 +80,146 @@ impl BytesMut {
         }
     }
 
-    /// Creates a new `BytesMut` from slice, by copying it.
+    /// Creates a new empty `BytesMut` backed by a page of the specified size.
+    ///
+    /// The buffer has the [`capacity`](BytePageSize::capacity) of the page
+    /// size. Pages are taken from the current thread's page cache, and the
+    /// page returns to the cache of the thread that drops the last reference
+    /// to it, including [`Bytes`] split off the buffer.
+    ///
+    /// When the buffer grows, it moves to a page of the size that fits the
+    /// new capacity, see [`reserve`](Self::reserve). Above the largest page
+    /// size the buffer is a regular allocation without a page size, it is
+    /// freed when dropped.
+    ///
+    /// [`BytePageSize::Unset`] has the allocation size of
+    /// [`BytePageSize::Size64`], it creates a `Size64` page.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use ntex_bytes::{BytePageSize, BytesMut};
+    ///
+    /// let mut buf = BytesMut::with_page_size(BytePageSize::Size4);
+    /// assert_eq!(buf.capacity(), BytePageSize::Size4.capacity());
+    /// assert_eq!(buf.page_size(), BytePageSize::Size4);
+    ///
+    /// buf.extend_from_slice(&[0; 5000]);
+    /// assert_eq!(buf.page_size(), BytePageSize::Size8);
+    /// ```
+    #[inline]
+    #[must_use]
+    pub fn with_page_size(size: BytePageSize) -> BytesMut {
+        let size = if size == BytePageSize::Unset {
+            BytePageSize::Size64
+        } else {
+            size
+        };
+        BytesMut {
+            storage: StorageVec::sized(size),
+        }
+    }
+
+    /// Creates a new `BytesMut` from the page cache, like
+    /// [`with_page_size`](Self::with_page_size), with the allocation charged
+    /// to `tracker`.
+    ///
+    /// The allocation stays charged while any `BytesMut` or [`Bytes`]
+    /// handle refers to it. A buffer that grows into a new allocation
+    /// charges it to the same tracker, the old allocation is uncharged when
+    /// its last handle is dropped. Copies made by [`Clone`], conversions or
+    /// [`Bytes::trimdown`] are not charged.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use ntex_bytes::{BytePageSize, BytesMut, BytesTracker};
+    ///
+    /// let tracker = BytesTracker::new();
+    /// let buf = BytesMut::with_page_size_in(BytePageSize::Size4, &tracker);
+    /// assert_eq!(tracker.snapshot().live_bytes, 4096);
+    /// assert_eq!(tracker.snapshot().live_allocations, 1);
+    ///
+    /// drop(buf);
+    /// assert_eq!(tracker.snapshot().live_bytes, 0);
+    /// ```
+    #[cfg(feature = "tracker")]
+    #[cfg_attr(docsrs, doc(cfg(feature = "tracker")))]
+    #[inline]
+    #[must_use]
+    pub fn with_page_size_in(size: BytePageSize, tracker: &crate::BytesTracker) -> BytesMut {
+        let size = if size == BytePageSize::Unset {
+            BytePageSize::Size64
+        } else {
+            size
+        };
+        BytesMut {
+            storage: StorageVec::sized_in(size, tracker),
+        }
+    }
+
+    /// Charges the allocation of the buffer to `tracker`.
+    ///
+    /// The allocation stays charged as described in
+    /// [`with_page_size_in`](Self::with_page_size_in). If the allocation is
+    /// charged to a different tracker, the charge moves to `tracker`, also
+    /// while it is shared with [`Bytes`] handles. Setting the tracker the
+    /// buffer is already charged to does nothing.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use ntex_bytes::{BytesMut, BytesTracker};
+    ///
+    /// let tracker = BytesTracker::new();
+    /// let mut buf = BytesMut::with_capacity(256);
+    /// buf.extend_from_slice(&[0; 128]);
+    ///
+    /// let head = buf.split_to(64);
+    /// buf.set_tracker(&tracker);
+    /// assert!(buf.tracker().unwrap().ptr_eq(&tracker));
+    /// assert_eq!(tracker.snapshot().live_allocations, 1);
+    ///
+    /// let other = BytesTracker::new();
+    /// buf.set_tracker(&other);
+    /// assert_eq!(tracker.snapshot().live_allocations, 0);
+    /// assert_eq!(other.snapshot().live_allocations, 1);
+    ///
+    /// drop((buf, head));
+    /// assert_eq!(other.snapshot().live_allocations, 0);
+    /// ```
+    #[cfg(feature = "tracker")]
+    #[cfg_attr(docsrs, doc(cfg(feature = "tracker")))]
+    #[inline]
+    pub fn set_tracker(&mut self, tracker: &crate::BytesTracker) {
+        self.storage.set_tracker(tracker);
+    }
+
+    /// Returns the tracker charged with the allocation of the buffer.
+    #[cfg(feature = "tracker")]
+    #[cfg_attr(docsrs, doc(cfg(feature = "tracker")))]
+    #[inline]
+    #[must_use]
+    pub fn tracker(&self) -> Option<&crate::BytesTracker> {
+        self.storage.tracker()
+    }
+
+    /// Returns the page size of the buffer.
+    ///
+    /// The page size is derived from the allocation size, a buffer whose
+    /// allocation, header included, is exactly a page size belongs to that
+    /// page size. This covers buffers created by
+    /// [`with_page_size`](Self::with_page_size), converted from a pooled
+    /// [`BytePage`](crate::BytePage), or created with a page
+    /// [`capacity`](BytePageSize::capacity). They return to the page cache
+    /// when the last reference is dropped. Other buffers return
+    /// [`BytePageSize::Unset`], they are freed when dropped.
+    #[inline]
+    pub fn page_size(&self) -> BytePageSize {
+        self.storage.page_size()
+    }
+
+    /// Creates a `BytesMut` by copying a byte slice.
     #[inline]
     #[must_use]
     pub fn copy_from_slice<T: AsRef<[u8]>>(src: T) -> Self {
@@ -135,7 +270,7 @@ impl BytesMut {
         self.storage.len()
     }
 
-    /// Returns true if the `BytesMut` has a length of 0.
+    /// Returns `true` if the buffer is empty.
     ///
     /// # Examples
     ///
@@ -165,6 +300,33 @@ impl BytesMut {
         self.storage.capacity()
     }
 
+    /// Returns `true` if no other handle refers to the underlying buffer.
+    ///
+    /// Values split off with [`split_to`](Self::split_to) or frozen into
+    /// [`Bytes`] share the buffer with `self`. While they exist, clearing
+    /// `self` does not reclaim the capacity in front of it, and the whole
+    /// allocation stays alive as long as any of them does.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use ntex_bytes::BytesMut;
+    ///
+    /// let mut buf = BytesMut::with_capacity(64);
+    /// buf.extend_from_slice(&[0; 32]);
+    /// assert!(buf.is_unique());
+    ///
+    /// let head = buf.split_to(30);
+    /// assert!(!buf.is_unique());
+    ///
+    /// drop(head);
+    /// assert!(buf.is_unique());
+    /// ```
+    #[inline]
+    pub fn is_unique(&self) -> bool {
+        self.storage.is_unique()
+    }
+
     /// Converts `self` into an immutable `Bytes`.
     ///
     /// The conversion is zero cost and is used to indicate that the slice
@@ -178,7 +340,7 @@ impl BytesMut {
     /// use std::thread;
     ///
     /// let mut b = BytesMut::with_capacity(64);
-    /// b.put("hello world");
+    /// b.put_slice(b"hello world");
     /// let b1 = b.freeze();
     /// let b2 = b1.clone();
     ///
@@ -286,13 +448,13 @@ impl BytesMut {
     #[inline]
     pub fn advance_to(&mut self, cnt: usize) {
         unsafe {
-            self.storage.set_start(cnt as u32);
+            self.storage.set_start(cnt);
         }
     }
 
     /// Splits the bytes into two at the given index.
     ///
-    /// Does nothing if `at > len`.
+    /// Returns `None` if `at > len`.
     #[inline]
     #[must_use]
     pub fn split_to_checked(&mut self, at: usize) -> Option<Bytes> {
@@ -311,8 +473,9 @@ impl BytesMut {
     /// If `len` is greater than the buffer's current length, this has no
     /// effect.
     ///
-    /// The [`split_off`] method can emulate `truncate`, but this causes the
-    /// excess bytes to be returned instead of dropped.
+    /// `truncate(0)` on a buffer that is not shared with any other handle
+    /// also reclaims the capacity in front of the current view, see
+    /// [`clear`](Self::clear).
     ///
     /// # Examples
     ///
@@ -323,14 +486,16 @@ impl BytesMut {
     /// buf.truncate(5);
     /// assert_eq!(buf, b"hello"[..]);
     /// ```
-    ///
-    /// [`split_off`]: #method.split_off
     #[inline]
     pub fn truncate(&mut self, len: usize) {
         self.storage.truncate(len);
     }
 
     /// Clears the buffer, removing all data.
+    ///
+    /// If no other handle refers to the underlying buffer (see
+    /// [`is_unique`](Self::is_unique)), the view is reset to the start of the
+    /// allocation, so the full capacity becomes available again.
     ///
     /// # Examples
     ///
@@ -354,8 +519,8 @@ impl BytesMut {
     ///
     /// # Panics
     ///
-    /// Panics if `new_len` greater than 60bit for 64bit systems
-    /// and 28bit for 32bit systems
+    /// Panics if `new_len` exceeds `u32::MAX` minus the buffer
+    /// header size, just under 4 GiB.
     ///
     /// # Examples
     ///
@@ -410,8 +575,7 @@ impl BytesMut {
     ///
     /// # Panics
     ///
-    /// This method will panic if `len` is out of bounds for the underlying
-    /// slice or if it comes after the `end` of the configured window.
+    /// Panics if `len > self.capacity()`.
     #[inline]
     pub unsafe fn set_len(&mut self, len: usize) {
         self.storage.set_len(len);
@@ -427,10 +591,21 @@ impl BytesMut {
     /// buffer's capacity, then the current view will be copied to the front of
     /// the buffer and the handle will take ownership of the full buffer.
     ///
+    /// Otherwise a unique buffer that is not a pooled page is reallocated,
+    /// often in place, and a new buffer is allocated in all other cases. The
+    /// new capacity is at least twice the current length, so appending in
+    /// small steps reallocates a logarithmic number of times. Use
+    /// [`reserve_exact`](Self::reserve_exact) to avoid the doubling.
+    ///
+    /// A buffer with a [`page_size`](Self::page_size) moves to a page of the
+    /// smallest size that fits the new capacity, but not smaller than its
+    /// current page size, the old page returns to the page cache. Above the
+    /// largest page size, a regular buffer without a page size is allocated.
+    ///
     /// # Panics
     ///
-    /// Panics if new capacity is greater than 60bit for 64bit systems
-    /// and 28bit for 32bit systems
+    /// Panics if the new capacity exceeds `u32::MAX` minus the buffer
+    /// header size, just under 4 GiB.
     ///
     /// # Examples
     ///
@@ -464,46 +639,118 @@ impl BytesMut {
     /// assert_eq!(buf.capacity(), 128);
     /// assert_eq!(buf.as_ptr(), ptr);
     /// ```
-    ///
-    /// # Panics
-    ///
-    /// Panics if the new capacity overflows `usize`.
     #[inline]
     pub fn reserve(&mut self, additional: usize) {
         self.storage.reserve(additional);
     }
 
-    /// Reserves capacity for inserting additional bytes into the given `BytesMut`.
+    /// Reserves capacity for exactly `additional` more bytes to be inserted
+    /// into the given `BytesMut`.
     ///
-    /// This is equivalent to calling
-    /// `BytesMut::reserve(capacity - BytesMut::remaining_mut())`.
+    /// Behaves like [`reserve`](Self::reserve), it reclaims the existing buffer
+    /// when possible and reallocates a unique buffer, but a new allocation is
+    /// sized to hold exactly `additional` more bytes instead of growing to at
+    /// least twice the current length. The allocation size is the new capacity
+    /// plus the buffer header, [`METADATA_SIZE`](crate::METADATA_SIZE) bytes.
+    /// The contents are not moved when the buffer already has enough remaining
+    /// capacity.
+    ///
+    /// The capacity is not rounded up to a page size, a buffer with a
+    /// [`page_size`](Self::page_size) loses it unless the new capacity is a page
+    /// capacity.
     ///
     /// # Panics
     ///
-    /// Panics if new capacity is greater than 60bit for 64bit systems
-    /// and 28bit for 32bit systems
+    /// Panics if the new capacity exceeds `u32::MAX` minus the buffer
+    /// header size, just under 4 GiB.
     ///
     /// # Examples
-    ///
-    /// In the following example, a new buffer is allocated.
     ///
     /// ```
     /// use ntex_bytes::BytesMut;
     ///
-    /// let mut buf = BytesMut::copy_from_slice(&b"hello"[..]);
-    /// buf.reserve_capacity(128);
-    /// assert!(buf.capacity() >= 128);
-    /// assert!(buf.len() >= 5);
+    /// let mut buf = BytesMut::copy_from_slice(&[0; 1000][..]);
+    /// buf.reserve_exact(24);
+    /// assert_eq!(buf.capacity(), 1024);
+    ///
+    /// // enough remaining capacity keeps the current buffer
+    /// let ptr = buf.as_ptr();
+    /// buf.reserve_exact(24);
+    /// assert_eq!(buf.as_ptr(), ptr);
     /// ```
     #[inline]
-    pub fn reserve_capacity(&mut self, cap: usize) {
-        self.storage.reserve_capacity(cap);
+    pub fn reserve_exact(&mut self, additional: usize) {
+        self.storage.reserve_exact(additional);
     }
 
-    /// Appends given bytes to this object.
+    /// Grows the buffer by one step if its remaining capacity is less than
+    /// the low threshold of its page size.
     ///
-    /// If this `BytesMut` object has not enough capacity, it is resized first.
-    /// So unlike `put_slice` operation, `extend_from_slice` does not panic.
+    /// Nothing happens when the remaining capacity is at least
+    /// [`BytePageSize::low`](crate::BytePageSize::low) of the buffer's
+    /// [`page_size`](Self::page_size), 1 KiB for a 16 KiB page and 4 KiB
+    /// for a buffer without a page size.
+    ///
+    /// If the allocation holds the data and
+    /// [`BytePageSize::half_capacity`](crate::BytePageSize::half_capacity)
+    /// more bytes, it is reused: a unique buffer moves its data to the start
+    /// of the allocation, a shared buffer with a page size moves to a page of
+    /// the same size. Otherwise a buffer with a page size moves to a page of
+    /// the next larger page size, the old page returns to the page cache. A
+    /// buffer without a page size, or with the largest page size, grows its
+    /// capacity by its current capacity, by at least 112 bytes (104 with the
+    /// `tracker` feature) and by at most 64 KiB, like [`reserve_exact`](Self::reserve_exact) does: a unique
+    /// buffer is reallocated, often in place, otherwise the data is copied
+    /// into a new buffer.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the new capacity exceeds `u32::MAX` minus the buffer
+    /// header size, just under 4 GiB.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use ntex_bytes::{BytePageSize, BytesMut};
+    ///
+    /// let mut buf = BytesMut::with_page_size(BytePageSize::Size4);
+    /// buf.extend_from_slice(b"hello");
+    ///
+    /// // the remaining capacity is above the low threshold, the buffer is kept
+    /// buf.reserve_more();
+    /// assert_eq!(buf.page_size(), BytePageSize::Size4);
+    ///
+    /// buf.extend_from_slice(&[0; 4000]);
+    /// buf.reserve_more();
+    /// assert_eq!(buf.page_size(), BytePageSize::Size8);
+    /// assert_eq!(buf.capacity(), BytePageSize::Size8.capacity());
+    /// assert_eq!(&buf[..5], b"hello");
+    ///
+    /// // consumed data makes room, the page is compacted in place
+    /// let mut buf = BytesMut::with_page_size(BytePageSize::Size4);
+    /// buf.extend_from_slice(&[0; 4000]);
+    /// buf.advance_to(3990);
+    /// buf.reserve_more();
+    /// assert_eq!(buf.page_size(), BytePageSize::Size4);
+    /// assert_eq!(buf.capacity(), BytePageSize::Size4.capacity());
+    ///
+    /// let mut buf = BytesMut::with_capacity(1000);
+    /// buf.reserve_more();
+    /// assert_eq!(buf.capacity(), 2000);
+    ///
+    /// let mut buf = BytesMut::with_capacity(1024 * 1024);
+    /// buf.extend_from_slice(&vec![0; 1024 * 1024]);
+    /// buf.reserve_more();
+    /// assert_eq!(buf.capacity(), 1024 * 1024 + 64 * 1024);
+    /// ```
+    #[inline]
+    pub fn reserve_more(&mut self) {
+        self.storage.reserve_more();
+    }
+
+    /// Appends a byte slice to the buffer.
+    ///
+    /// Additional capacity is reserved automatically when needed.
     ///
     /// # Examples
     ///
@@ -542,22 +789,11 @@ impl BytesMut {
     }
 }
 
-impl Buf for BytesMut {
-    #[inline]
-    fn remaining(&self) -> usize {
-        self.len()
-    }
+impl_buf!(BytesMut {});
 
-    #[inline]
-    fn chunk(&self) -> &[u8] {
-        self.storage.as_ref()
-    }
+impl_slice_traits!(BytesMut);
 
-    #[inline]
-    fn advance(&mut self, cnt: usize) {
-        self.advance_to(cnt);
-    }
-}
+impl_partial_eq!(BytesMut);
 
 impl BufMut for BytesMut {
     #[inline]
@@ -573,22 +809,27 @@ impl BufMut for BytesMut {
 
     #[inline]
     fn chunk_mut(&mut self) -> &mut UninitSlice {
-        unsafe {
-            // This will never panic as `len` can never become invalid
-            let ptr = &mut self.storage.as_ptr();
-            UninitSlice::from_raw_parts_mut(ptr.add(self.len()), self.remaining_mut())
+        self.storage.spare_mut()
+    }
+
+    #[inline]
+    fn put<T: Buf>(&mut self, mut src: T)
+    where
+        Self: Sized,
+    {
+        self.reserve(src.remaining());
+        while src.has_remaining() {
+            let chunk = src.chunk();
+            let len = chunk.len();
+            self.put_slice(chunk);
+            src.advance(len);
         }
     }
 
     #[inline]
     fn put_slice(&mut self, src: &[u8]) {
-        let len = src.len();
-        self.reserve(len);
-
-        unsafe {
-            ptr::copy_nonoverlapping(src.as_ptr(), self.chunk_mut().as_mut_ptr(), len);
-            self.advance_mut(len);
-        }
+        self.reserve(src.len());
+        self.storage.put_slice_partial(src);
     }
 
     #[inline]
@@ -603,38 +844,31 @@ impl BufMut for BytesMut {
     }
 }
 
-impl bytes::buf::Buf for BytesMut {
-    #[inline]
-    fn remaining(&self) -> usize {
-        self.len()
-    }
-
-    #[inline]
-    fn chunk(&self) -> &[u8] {
-        self.storage.as_ref()
-    }
-
-    #[inline]
-    fn advance(&mut self, cnt: usize) {
-        self.advance_to(cnt);
-    }
-}
-
+/// Interop with the `bytes` crate: like `bytes::BytesMut`, the buffer grows on
+/// demand, so `remaining_mut()` reports `usize::MAX - len` and `chunk_mut()`
+/// is never empty. The native [`BufMut`] impl reports spare capacity instead.
 unsafe impl bytes::buf::BufMut for BytesMut {
     #[inline]
     fn remaining_mut(&self) -> usize {
-        BufMut::remaining_mut(self)
+        usize::MAX - self.len()
     }
 
     #[inline]
     unsafe fn advance_mut(&mut self, cnt: usize) {
+        let remaining = BufMut::remaining_mut(self);
+        assert!(
+            cnt <= remaining,
+            "cannot advance past `remaining_mut`: {cnt:?} <= {remaining:?}"
+        );
         BufMut::advance_mut(self, cnt);
     }
 
     #[inline]
     fn chunk_mut(&mut self) -> &mut bytes::buf::UninitSlice {
+        if BufMut::remaining_mut(self) == 0 {
+            self.reserve(64);
+        }
         unsafe {
-            // This will never panic as `len` can never become invalid
             let ptr = self.storage.as_ptr();
             bytes::buf::UninitSlice::from_raw_parts_mut(
                 ptr.add(self.len()),
@@ -644,8 +878,31 @@ unsafe impl bytes::buf::BufMut for BytesMut {
     }
 
     #[inline]
+    fn put<T: bytes::buf::Buf>(&mut self, mut src: T)
+    where
+        Self: Sized,
+    {
+        self.reserve(src.remaining());
+        while src.has_remaining() {
+            let chunk = src.chunk();
+            let len = chunk.len();
+            BufMut::put_slice(self, chunk);
+            src.advance(len);
+        }
+    }
+
+    #[inline]
     fn put_slice(&mut self, src: &[u8]) {
         BufMut::put_slice(self, src);
+    }
+
+    #[inline]
+    fn put_bytes(&mut self, val: u8, cnt: usize) {
+        self.reserve(cnt);
+        unsafe {
+            ptr::write_bytes(self.storage.as_ptr().add(self.len()), val, cnt);
+            BufMut::advance_mut(self, cnt);
+        }
     }
 
     #[inline]
@@ -659,26 +916,10 @@ unsafe impl bytes::buf::BufMut for BytesMut {
     }
 }
 
-impl AsRef<[u8]> for BytesMut {
-    #[inline]
-    fn as_ref(&self) -> &[u8] {
-        self.storage.as_ref()
-    }
-}
-
 impl AsMut<[u8]> for BytesMut {
     #[inline]
     fn as_mut(&mut self) -> &mut [u8] {
         self.storage.as_mut()
-    }
-}
-
-impl Deref for BytesMut {
-    type Target = [u8];
-
-    #[inline]
-    fn deref(&self) -> &[u8] {
-        self.as_ref()
     }
 }
 
@@ -698,20 +939,6 @@ impl PartialEq for BytesMut {
     }
 }
 
-impl Default for BytesMut {
-    #[inline]
-    fn default() -> BytesMut {
-        BytesMut::new()
-    }
-}
-
-impl borrow::Borrow<[u8]> for BytesMut {
-    #[inline]
-    fn borrow(&self) -> &[u8] {
-        self.as_ref()
-    }
-}
-
 impl borrow::BorrowMut<[u8]> for BytesMut {
     #[inline]
     fn borrow_mut(&mut self) -> &mut [u8] {
@@ -725,16 +952,13 @@ impl PartialEq<Bytes> for BytesMut {
     }
 }
 
-impl io::Read for BytesMut {
-    fn read(&mut self, dst: &mut [u8]) -> io::Result<usize> {
-        let len = cmp::min(self.len(), dst.len());
-        if len > 0 {
-            dst[..len].copy_from_slice(&self[..len]);
-            self.advance_to(len);
-        }
-        Ok(len)
+impl PartialEq<BytesMut> for Bytes {
+    fn eq(&self, other: &BytesMut) -> bool {
+        *other == *self
     }
 }
+
+impl_read!(BytesMut);
 
 impl io::Write for BytesMut {
     fn write(&mut self, src: &[u8]) -> Result<usize, io::Error> {
@@ -744,12 +968,6 @@ impl io::Write for BytesMut {
 
     fn flush(&mut self) -> Result<(), io::Error> {
         Ok(())
-    }
-}
-
-impl fmt::Debug for BytesMut {
-    fn fmt(&self, fmt: &mut fmt::Formatter<'_>) -> fmt::Result {
-        fmt::Debug::fmt(&crate::debug::BsDebug(self.storage.as_ref()), fmt)
     }
 }
 
@@ -768,35 +986,13 @@ impl Clone for BytesMut {
     }
 }
 
-impl IntoIterator for BytesMut {
-    type Item = u8;
-    type IntoIter = IntoIter<BytesMut>;
-
-    fn into_iter(self) -> Self::IntoIter {
-        IntoIter::new(self)
-    }
-}
-
-impl<'a> IntoIterator for &'a BytesMut {
-    type Item = &'a u8;
-    type IntoIter = std::slice::Iter<'a, u8>;
-
-    fn into_iter(self) -> Self::IntoIter {
-        self.as_ref().iter()
-    }
-}
-
 impl FromIterator<u8> for BytesMut {
     fn from_iter<T: IntoIterator<Item = u8>>(into_iter: T) -> Self {
         let iter = into_iter.into_iter();
         let (min, maybe_max) = iter.size_hint();
 
         let mut out = BytesMut::with_capacity(maybe_max.unwrap_or(min));
-        for i in iter {
-            out.reserve(1);
-            out.put_u8(i);
-        }
-
+        out.extend(iter);
         out
     }
 }
@@ -813,14 +1009,8 @@ impl Extend<u8> for BytesMut {
         T: IntoIterator<Item = u8>,
     {
         let iter = iter.into_iter();
-
-        let (lower, _) = iter.size_hint();
-        self.reserve(lower);
-
-        for (idx, b) in iter.enumerate() {
-            if idx >= lower {
-                self.reserve(1);
-            }
+        self.reserve(iter.size_hint().0);
+        for b in iter {
             self.put_u8(b);
         }
     }
@@ -832,99 +1022,6 @@ impl<'a> Extend<&'a u8> for BytesMut {
         T: IntoIterator<Item = &'a u8>,
     {
         self.extend(iter.into_iter().copied());
-    }
-}
-
-impl PartialEq<[u8]> for BytesMut {
-    fn eq(&self, other: &[u8]) -> bool {
-        &**self == other
-    }
-}
-
-impl<const N: usize> PartialEq<[u8; N]> for BytesMut {
-    fn eq(&self, other: &[u8; N]) -> bool {
-        &**self == other
-    }
-}
-
-impl PartialEq<BytesMut> for [u8] {
-    fn eq(&self, other: &BytesMut) -> bool {
-        *other == *self
-    }
-}
-
-impl<const N: usize> PartialEq<BytesMut> for [u8; N] {
-    fn eq(&self, other: &BytesMut) -> bool {
-        *other == *self
-    }
-}
-
-impl<const N: usize> PartialEq<BytesMut> for &[u8; N] {
-    fn eq(&self, other: &BytesMut) -> bool {
-        *other == *self
-    }
-}
-
-impl PartialEq<str> for BytesMut {
-    fn eq(&self, other: &str) -> bool {
-        &**self == other.as_bytes()
-    }
-}
-
-impl PartialEq<BytesMut> for str {
-    fn eq(&self, other: &BytesMut) -> bool {
-        *other == *self
-    }
-}
-
-impl PartialEq<Vec<u8>> for BytesMut {
-    fn eq(&self, other: &Vec<u8>) -> bool {
-        *self == other[..]
-    }
-}
-
-impl PartialEq<BytesMut> for Vec<u8> {
-    fn eq(&self, other: &BytesMut) -> bool {
-        *other == *self
-    }
-}
-
-impl PartialEq<String> for BytesMut {
-    fn eq(&self, other: &String) -> bool {
-        *self == other[..]
-    }
-}
-
-impl PartialEq<BytesMut> for String {
-    fn eq(&self, other: &BytesMut) -> bool {
-        *other == *self
-    }
-}
-
-impl<'a, T: ?Sized> PartialEq<&'a T> for BytesMut
-where
-    BytesMut: PartialEq<T>,
-{
-    fn eq(&self, other: &&'a T) -> bool {
-        *self == **other
-    }
-}
-
-impl PartialEq<BytesMut> for &[u8] {
-    fn eq(&self, other: &BytesMut) -> bool {
-        *other == *self
-    }
-}
-
-impl PartialEq<BytesMut> for &str {
-    fn eq(&self, other: &BytesMut) -> bool {
-        *other == *self
-    }
-}
-
-impl PartialEq<BytesMut> for Bytes {
-    fn eq(&self, other: &BytesMut) -> bool {
-        other[..] == self[..]
     }
 }
 
@@ -966,8 +1063,10 @@ impl<'a> From<&'a str> for BytesMut {
 impl From<Bytes> for BytesMut {
     #[inline]
     fn from(src: Bytes) -> BytesMut {
-        //src.try_mut().unwrap_or_else(|src| BytesMut::copy_from_slice(&src[..]))
-        BytesMut::copy_from_slice(&src[..])
+        match src.storage.try_into_vec() {
+            Ok(storage) => BytesMut { storage },
+            Err(storage) => BytesMut::copy_from_slice(storage.as_ref()),
+        }
     }
 }
 
@@ -983,6 +1082,142 @@ mod tests {
     use super::*;
 
     #[test]
+    fn growth_is_amortized() {
+        let mut buf = BytesMut::with_capacity(0);
+        let mut cap = buf.capacity();
+        let mut reallocs = 0;
+        for _ in 0..10_000 {
+            buf.put_slice(b"abcdefgh");
+            if buf.capacity() != cap {
+                reallocs += 1;
+                cap = buf.capacity();
+            }
+        }
+        assert_eq!(buf.len(), 80_000);
+        assert!(reallocs <= 16, "reallocs: {reallocs}");
+
+        // writes through `io::Write` and `fmt::Write` grow the same way
+        let mut buf = BytesMut::with_capacity(0);
+        for i in 0..1000 {
+            std::fmt::Write::write_fmt(&mut buf, format_args!("{i:08}")).unwrap();
+        }
+        assert_eq!(buf.len(), 8000);
+        assert!(buf.capacity() < 16_000);
+    }
+
+    #[test]
+    fn growth_of_little_data_is_exact() {
+        let mut buf = BytesMut::copy_from_slice(b"hello");
+        buf.reserve(64 * 1024);
+        assert_eq!(buf.capacity(), 5 + 64 * 1024);
+
+        // a buffer shared with split off `Bytes`
+        let mut buf = BytesMut::with_capacity(1024);
+        buf.extend_from_slice(&[1; 1024]);
+        let head = buf.split_to(1000);
+        buf.reserve(4096);
+        assert_eq!(buf.capacity(), 24 + 4096);
+        assert_eq!(&head[..], &[1; 1000][..]);
+    }
+
+    #[test]
+    fn from_unique_bytes_reuses_buffer() {
+        let mut buf = BytesMut::with_capacity(256);
+        buf.extend_from_slice(&[1; 64]);
+        let b = buf.freeze();
+        let ptr = b.as_ptr();
+
+        let mut m = BytesMut::from(b);
+        assert_eq!(m.as_ptr(), ptr);
+        assert_eq!(&m[..], &[1; 64][..]);
+        assert_eq!(m.capacity(), 256);
+
+        // spare capacity past the view is writable
+        m.extend_from_slice(&[2; 192]);
+        assert_eq!(m.as_ptr(), ptr);
+        assert_eq!(&m[64..], &[2; 192][..]);
+    }
+
+    #[test]
+    fn from_unique_bytes_subview() {
+        let mut buf = BytesMut::with_capacity(256);
+        buf.extend_from_slice(&[1; 128]);
+        let mut b = buf.freeze();
+        let head = b.split_to(32);
+        drop(head);
+        b.truncate(64);
+        let ptr = b.as_ptr();
+
+        let mut m = BytesMut::from(b);
+        assert_eq!(m.as_ptr(), ptr);
+        assert_eq!(m.len(), 64);
+        assert_eq!(m.capacity(), 256 - 32);
+
+        // the dropped tail of the view is spare capacity again
+        m.extend_from_slice(&[3; 160]);
+        assert_eq!(m.as_ptr(), ptr);
+        assert_eq!(&m[..64], &[1; 64][..]);
+        assert_eq!(&m[64..], &[3; 160][..]);
+    }
+
+    #[test]
+    fn from_shared_bytes_copies() {
+        let b = BytesMut::copy_from_slice([1; 64]).freeze();
+        let b2 = b.clone();
+
+        let mut m = BytesMut::from(b);
+        assert_ne!(m.as_ptr(), b2.as_ptr());
+        m[0] = 2;
+        assert_eq!(&b2[..], &[1; 64][..]);
+
+        // the buffer is still referenced by a `BytesMut`
+        let mut buf = BytesMut::with_capacity(256);
+        buf.extend_from_slice(&[1; 64]);
+        let b = buf.take();
+        let m = BytesMut::from(b);
+        assert_ne!(m.as_ptr(), buf.as_ptr());
+        buf.extend_from_slice(&[2; 64]);
+        assert_eq!(&m[..], &[1; 64][..]);
+    }
+
+    // Run under miri: without `Acquire`, the header update races with the
+    // read made by the other thread before it released its handle.
+    #[test]
+    fn from_bytes_synchronizes_with_release() {
+        let b = BytesMut::copy_from_slice([1; 64]).freeze();
+        let other = b.clone();
+        let handle = std::thread::spawn(move || {
+            let val = other[0];
+            drop(other);
+            val
+        });
+
+        let ptr = b.as_ptr();
+        let mut storage = b.storage;
+        let mut m = loop {
+            match storage.try_into_vec() {
+                Ok(storage) => break BytesMut { storage },
+                Err(st) => {
+                    storage = st;
+                    std::thread::yield_now();
+                }
+            }
+        };
+        assert_eq!(m.as_ptr(), ptr);
+        m[0] = 2;
+        assert_eq!(handle.join().unwrap(), 1);
+    }
+
+    #[test]
+    fn from_inline_and_static_bytes() {
+        let m = BytesMut::from(Bytes::copy_from_slice(b"inline"));
+        assert_eq!(&m[..], b"inline");
+
+        let m = BytesMut::from(Bytes::from_static(&[1; 64]));
+        assert_eq!(&m[..], &[1; 64][..]);
+    }
+
+    #[test]
     fn bvec_read() {
         use std::io::Read;
 
@@ -992,5 +1227,14 @@ mod tests {
         assert_eq!(b.read(&mut buf).unwrap(), 3);
         assert_eq!(b.len(), 0);
         assert_eq!(buf, [49, 50, 51, 0, 0, 0, 0, 0, 0, 0]);
+    }
+
+    #[test]
+    fn from_bytes_ref() {
+        let b = Bytes::from_static(b"hello");
+        let mut m = BytesMut::from(&b);
+        m.extend_from_slice(b"!");
+        assert_eq!(m, "hello!");
+        assert_eq!(b, "hello");
     }
 }

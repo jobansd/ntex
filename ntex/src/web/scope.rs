@@ -1,177 +1,154 @@
-use std::{cell::RefCell, fmt, rc::Rc, task::Context};
+use std::{cell::RefCell, marker::PhantomData, rc::Rc};
 
+use crate::error::{Failure, IntoFailure};
 use crate::http::Response;
 use crate::router::{IntoPattern, ResourceDef, Router};
-use crate::service::boxed::{self, BoxService, BoxServiceFactory};
-use crate::service::cfg::SharedCfg;
-use crate::service::{Identity, Middleware, Service, ServiceCtx, ServiceFactory};
-use crate::service::{IntoServiceFactory, chain_factory, dev::ServiceChainFactory};
-use crate::util::{Extensions, join};
+use crate::service::{Identity, ServiceChainFactory, boxed};
+use crate::{IntoServiceFactory, Middleware, Service, ServiceFactory, factory};
 
-use super::app::Filter;
-use super::config::ServiceConfig;
+use super::app_service::WebServiceRouter;
 use super::dev::{WebServiceConfig, WebServiceFactory};
-use super::error::ErrorRenderer;
+use super::error::{WebError, WebResponseError};
 use super::guard::Guard;
-use super::request::WebRequest;
-use super::resource::Resource;
-use super::response::WebResponse;
 use super::rmap::ResourceMap;
-use super::route::Route;
-use super::service::{AppServiceFactory, AppState, ServiceFactoryWrapper};
-use super::stack::WebStack;
+use super::service::{AppServiceFactory, ServiceFactoryWrapper};
+use super::stack::{Filter, WebStack};
+use super::{HttpService, Resource, Route, ServiceConfig, State, WebRequest, WebResponse};
 
 type Guards = Vec<Box<dyn Guard>>;
-type HttpService<Err: ErrorRenderer> =
-    BoxService<WebRequest<Err>, WebResponse, Err::Container>;
-type HttpNewService<Err: ErrorRenderer> =
-    BoxServiceFactory<SharedCfg, WebRequest<Err>, WebResponse, Err::Container, ()>;
 
-/// Resources scope.
+/// Groups services under a shared path prefix.
 ///
-/// Scope is a set of resources with common root path.
-/// Scopes collect multiple paths under a common path prefix.
-/// Scope path can contain variable path segments as resources.
-/// Scope prefix is always complete path segment, i.e `/app` would
-/// be converted to a `/app/` and it would not match `/app` path.
+/// A scope is useful for keeping a related part of an application together,
+/// such as an API or administration area. It can contain resources, routes,
+/// nested scopes, middleware, filters, guards, and its own fallback service.
 ///
-/// You can get variable path segments from `HttpRequest::match_info()`.
-/// `Path` extractor also is able to extract scope level variable segments.
+/// The prefix matches complete path segments. For example, `scope("/api")`
+/// can contain a service for `/api/users`, but the scope itself does not match
+/// the bare `/api` path. Register an empty nested resource if that path also
+/// needs a handler.
+///
+/// Scope prefixes can contain dynamic segments. Their values remain available
+/// to nested handlers through [`HttpRequest::match_info()`] and the [`Path`]
+/// extractor. For example, `scope("/users/{user_id}")` makes `user_id`
+/// available to every handler nested inside that scope.
+///
+/// Once the scope's prefix and guards match, its middleware and filters run,
+/// followed by its nested router. If no nested service matches, the scope uses
+/// its own fallback, which returns `404 Not Found` by default. It does not fall
+/// back to the surrounding application.
 ///
 /// ```rust
-/// use ntex::web::{self, App, HttpResponse};
+/// use ntex::web::{self, App};
 ///
-/// fn main() {
-///     let app = App::new().service(
-///         web::scope("/{project_id}/")
-///             .service(web::resource("/path1").to(|| async { HttpResponse::Ok() }))
-///             .service(web::resource("/path2").route(web::get().to(|| async { HttpResponse::Ok() })))
-///             .service(web::resource("/path3").route(web::head().to(|| async { HttpResponse::MethodNotAllowed() })))
-///     );
+/// async fn issues(
+///     path: web::types::Path<(String,)>,
+/// ) -> String {
+///     format!("Issues for {}", path.0)
 /// }
+///
+/// App::default().service(
+///     web::scope("/projects/{project_id}")
+///         .route("/issues", web::get().to(issues))
+///         .route("/settings", web::get().to(async || "settings")),
+/// );
 /// ```
 ///
-/// In the above example three routes get registered:
-///  * `/{project_id}/path1` - reponds to all http method
-///  * `/{project_id}/path2` - `GET` requests
-///  * `/{project_id}/path3` - `HEAD` requests
-///
+/// [`HttpRequest::match_info()`]: super::HttpRequest::match_info
+/// [`Path`]: super::types::Path
 #[derive(derive_more::Debug)]
 #[debug("Scope({rdef:?})")]
-pub struct Scope<Err: ErrorRenderer, M = Identity, T = Filter<Err>> {
+pub struct Scope<St: State, In, Out = In, M = Identity, F = Filter<St, In>> {
     middleware: M,
-    filter: ServiceChainFactory<T, WebRequest<Err>, SharedCfg>,
+    filter: ServiceChainFactory<F, St, WebRequest<In>>,
     rdef: Vec<String>,
-    state: Option<Extensions>,
-    services: Vec<Box<dyn AppServiceFactory<Err>>>,
     guards: Vec<Box<dyn Guard>>,
-    default: Rc<RefCell<Option<Rc<HttpNewService<Err>>>>>,
+    external: Vec<ResourceDef>,
+    case_insensitive: bool,
+    ph: PhantomData<Out>,
+}
+
+/// A scope with nested services or a configured fallback.
+///
+/// Methods such as [`Scope::service()`], [`Scope::route()`],
+/// [`Scope::configure()`], and [`Scope::default_service()`] turn a [`Scope`]
+/// into `ScopeServices`. You can then add more services or routes and adjust
+/// the scope fallback.
+#[derive(derive_more::Debug)]
+#[debug("ScopeServices({rdef:?})")]
+pub struct ScopeServices<St: State, In, Out, M, F> {
+    middleware: M,
+    rdef: Vec<String>,
+    guards: Vec<Box<dyn Guard>>,
+    filter: ServiceChainFactory<F, St, WebRequest<In>>,
+    services: Vec<Box<dyn AppServiceFactory<St, Out>>>,
+    default: Option<HttpService<St, Out>>,
     external: Vec<ResourceDef>,
     case_insensitive: bool,
 }
 
-impl<Err: ErrorRenderer> Scope<Err> {
+impl<St: State, In> Scope<St, In, In> {
     #[allow(clippy::needless_pass_by_value)]
     /// Create a new scope
-    pub fn new<T: IntoPattern>(path: T) -> Scope<Err> {
+    pub fn new<T: IntoPattern>(path: T) -> Self {
         Scope {
             middleware: Identity,
-            filter: chain_factory(Filter::new()),
+            filter: factory(Filter::new()),
             rdef: path.patterns(),
-            state: None,
             guards: Vec::new(),
-            services: Vec::new(),
-            default: Rc::new(RefCell::new(None)),
             external: Vec::new(),
             case_insensitive: false,
+            ph: PhantomData,
         }
     }
 }
 
-impl<Err, M, T> Scope<Err, M, T>
+impl<St, In, Out, M, F> Scope<St, In, Out, M, F>
 where
-    T: ServiceFactory<
-            WebRequest<Err>,
-            SharedCfg,
-            Response = WebRequest<Err>,
-            Error = Err::Container,
-            InitError = (),
+    St: State,
+    In: 'static,
+    Out: 'static,
+    F: ServiceFactory<
+            St,
+            WebRequest<In>,
+            Res = WebRequest<Out>,
+            Error = WebError<St, St::Error>,
+            InitError = Failure,
         >,
-    Err: ErrorRenderer,
 {
-    #[must_use]
-    /// Add match guard to a scope.
+    /// Add a match guard to this scope.
+    ///
+    /// The scope is selected only when its path prefix and all registered
+    /// guards match. If a guard rejects the request, the application router can
+    /// try another matching scope or resource; otherwise the application's
+    /// default service is used.
+    ///
+    /// The guard applies to every resource nested in the scope.
     ///
     /// ```rust
-    /// use ntex::web::{self, guard, App, HttpRequest, HttpResponse};
+    /// use ntex::web::{self, guard, App};
     ///
-    /// async fn index(data: web::types::Path<(String, String)>) -> &'static str {
-    ///     "Welcome!"
-    /// }
-    ///
-    /// fn main() {
-    ///     let app = App::new().service(
-    ///         web::scope("/app")
-    ///             .guard(guard::Header("content-type", "text/plain"))
-    ///             .route("/test1", web::get().to(index))
-    ///             .route("/test2", web::post().to(|r: HttpRequest| async {
-    ///                 HttpResponse::MethodNotAllowed()
-    ///             }))
-    ///     );
-    /// }
+    /// App::default().service(
+    ///     web::scope("/api")
+    ///         .guard(guard::Header("x-api-version", "2"))
+    ///         .route("/users", web::get().to(async || "Version 2 users"))
+    /// );
     /// ```
+    #[must_use]
     pub fn guard<G: Guard + 'static>(mut self, guard: G) -> Self {
         self.guards.push(Box::new(guard));
         self
     }
 
-    #[must_use]
-    /// Set or override application state.
-    ///
-    /// Application state could be accessed by using `State<T>`
-    /// extractor where `T` is state type.
-    ///
-    /// ```rust
-    /// use std::cell::Cell;
-    /// use ntex::web::{self, App, HttpResponse};
-    ///
-    /// struct MyState {
-    ///     counter: Cell<usize>,
-    /// }
-    ///
-    /// async fn index(st: web::types::State<MyState>) -> HttpResponse {
-    ///     st.counter.set(st.counter.get() + 1);
-    ///     HttpResponse::Ok().into()
-    /// }
-    ///
-    /// fn main() {
-    ///     let app = App::new().service(
-    ///         web::scope("/app")
-    ///             .state(MyState{ counter: Cell::new(0) })
-    ///             .service(
-    ///                 web::resource("/index.html").route(
-    ///                     web::get().to(index)))
-    ///     );
-    /// }
-    /// ```
-    pub fn state<D: 'static>(mut self, st: D) -> Self {
-        if self.state.is_none() {
-            self.state = Some(Extensions::new());
-        }
-        self.state.as_mut().unwrap().insert(st);
-        self
-    }
-
-    #[must_use]
     /// Use ascii case-insensitive routing.
     ///
     /// Only static segments could be case-insensitive.
+    #[must_use]
     pub fn case_insensitive_routing(mut self) -> Self {
         self.case_insensitive = true;
         self
     }
 
-    #[must_use]
     /// Run external configuration as part of the scope building
     /// process
     ///
@@ -179,104 +156,113 @@ where
     /// different module or even library. For example,
     /// some of the resource's configuration could be moved to different module.
     ///
-    /// ```rust
+    /// ```rust,ignore
     /// use ntex::web::{self, middleware, App, HttpResponse};
     ///
     /// // this function could be located in different module
     /// fn config(cfg: &mut web::ServiceConfig) {
     ///     cfg.service(web::resource("/test")
-    ///         .route(web::get().to(|| async { HttpResponse::Ok() }))
-    ///         .route(web::head().to(|| async { HttpResponse::MethodNotAllowed() }))
+    ///         .route(web::get().to(async || { HttpResponse::Ok() }))
+    ///         .route(web::head().to(async || { HttpResponse::MethodNotAllowed() }))
     ///     );
     /// }
     ///
     /// fn main() {
-    ///     let app = App::new()
+    ///     let app = App::default()
     ///         .middleware(middleware::Logger::default())
     ///         .service(
     ///             web::scope("/api")
     ///                 .configure(config)
     ///         )
-    ///         .route("/index.html", web::get().to(|| async { HttpResponse::Ok() }));
+    ///         .route("/index.html", web::get().to(async || { HttpResponse::Ok() }));
     /// }
     /// ```
-    pub fn configure<F>(mut self, f: F) -> Self
-    where
-        F: FnOnce(&mut ServiceConfig<Err>),
-    {
-        let mut cfg = ServiceConfig::new();
+    #[must_use]
+    pub fn configure(
+        self,
+        f: impl FnOnce(&mut ServiceConfig<St, Out>),
+    ) -> ScopeServices<St, In, Out, M, F> {
+        let mut cfg = ServiceConfig::new(self.external);
         f(&mut cfg);
-        self.services.extend(cfg.services);
-        self.external.extend(cfg.external);
 
-        if !cfg.state.is_empty() {
-            let mut state = self.state.unwrap_or_default();
-            state.extend(cfg.state);
-            self.state = Some(state);
+        ScopeServices {
+            rdef: self.rdef,
+            guards: self.guards,
+            filter: self.filter,
+            middleware: self.middleware,
+            default: None,
+            services: cfg.services,
+            external: cfg.external,
+            case_insensitive: self.case_insensitive,
         }
-        self
     }
 
-    #[must_use]
-    /// Register http service.
+    /// Registers a web service for this scope.
     ///
-    /// This is similar to `App's` service registration.
+    /// The service's path is joined with the scope prefix. A service can be a
+    /// [`Resource`], another [`Scope`], an attribute-macro handler, or a custom
+    /// service built with `web::service()`.
     ///
-    /// ntex web provides several services implementations:
-    ///
-    /// * *`Resource`* is an entry in resource table which corresponds to requested URL.
-    /// * *`Scope`* is a set of resources with common root path.
-    /// * *`StaticFiles`* is a service for static files support
+    /// If this scope matches but none of its services do, the scope's default
+    /// service is used.
     ///
     /// ```rust
-    /// use ntex::web::{self, App, HttpRequest};
+    /// use ntex::web::{self, App};
     ///
-    /// struct AppState;
-    ///
-    /// async fn index(req: HttpRequest) -> &'static str {
-    ///     "Welcome!"
-    /// }
-    ///
-    /// fn main() {
-    ///     let app = App::new().service(
-    ///         web::scope("/app").service(
-    ///             web::scope("/v1")
-    ///                 .service(web::resource("/test1").to(index)))
-    ///     );
-    /// }
+    /// App::default().service(
+    ///     web::scope("/api")
+    ///         .service(web::resource("/users").to(async || "users"))
+    ///         .service(
+    ///             web::scope("/admin")
+    ///                 .route("/health", web::get().to(async || "OK")),
+    ///         ),
+    /// );
     /// ```
-    pub fn service<F>(mut self, factory: F) -> Self
-    where
-        F: WebServiceFactory<Err> + 'static,
-    {
-        self.services
-            .push(Box::new(ServiceFactoryWrapper::new(factory)));
-        self
+    #[must_use]
+    pub fn service(
+        self,
+        factory: impl WebServiceFactory<St, Out>,
+    ) -> ScopeServices<St, In, Out, M, F> {
+        ScopeServices {
+            rdef: self.rdef,
+            guards: self.guards,
+            filter: self.filter,
+            middleware: self.middleware,
+            default: None,
+            external: self.external,
+            case_insensitive: self.case_insensitive,
+            services: vec![Box::new(ServiceFactoryWrapper::new(factory))],
+        }
     }
 
-    #[must_use]
-    /// Configure route for a specific path.
+    /// Register a route for a path relative to this scope.
     ///
-    /// This is a simplified version of the `Scope::service()` method.
-    /// This method can be called multiple times, in that case
-    /// multiple resources with one route would be registered for same resource path.
+    /// This is shorthand for creating a [`Resource`] with one route and
+    /// registering it with [`Scope::service()`]. The route's method and custom
+    /// guards are promoted to resource guards.
+    ///
+    /// If those guards reject a request, the generated resource does not match
+    /// and the scope router continues searching. If nothing else in the scope
+    /// matches, the scope default service is used. Register an explicit
+    /// [`Resource`] when route mismatches should use a resource-level fallback.
+    ///
+    /// Each call creates a separate resource, so the same relative path can be
+    /// registered more than once with different guards.
     ///
     /// ```rust
     /// use ntex::web::{self, App, HttpResponse};
     ///
-    /// async fn index(data: web::types::Path<(String, String)>) -> &'static str {
-    ///     "Welcome!"
-    /// }
-    ///
-    /// fn main() {
-    ///     let app = App::new().service(
-    ///         web::scope("/app")
-    ///             .route("/test1", web::get().to(index))
-    ///             .route("/test2", web::post().to(|| async { HttpResponse::MethodNotAllowed() }))
-    ///     );
-    /// }
+    /// App::default().service(
+    ///     web::scope("/api")
+    ///         .route("/items", web::get().to(async || "list"))
+    ///         .route(
+    ///             "/items",
+    ///             web::post().to(async || HttpResponse::Created()),
+    ///         )
+    /// );
     /// ```
-    pub fn route(self, path: &str, mut route: Route<Err>) -> Self {
+    #[must_use]
+    pub fn route(self, path: &str, mut route: Route<St, Out>) -> ScopeServices<St, In, Out, M, F> {
         self.service(
             Resource::new(path)
                 .add_guards(route.take_guards())
@@ -284,373 +270,408 @@ where
         )
     }
 
-    #[must_use]
-    /// Default service to be used if no matching route could be found.
+    /// Set the fallback service for unmatched requests within this scope.
     ///
-    /// If default resource is not registered, app's default resource is being used.
-    pub fn default_service<F, S>(mut self, f: F) -> Self
+    /// The fallback is called after the scope prefix and guards match but no
+    /// nested resource matches. Without a custom fallback, the scope returns
+    /// `404 Not Found`; it does not delegate to the application's fallback.
+    /// Routing failures inside a matched resource are handled by that
+    /// resource's fallback instead.
+    ///
+    /// ```rust
+    /// use ntex::web::{self, App, HttpRequest, HttpResponse};
+    ///
+    /// async fn not_found(req: HttpRequest) -> HttpResponse {
+    ///     HttpResponse::NotFound()
+    ///         .body(format!("No API resource for {}", req.path()))
+    /// }
+    ///
+    /// App::default().service(
+    ///     web::scope("/api")
+    ///         .route("/health", web::get().to(async || "ready"))
+    ///         .default_service(web::to(not_found))
+    /// );
+    /// ```
+    #[must_use]
+    pub fn default_service<Sf>(
+        self,
+        f: impl IntoServiceFactory<Sf, St, WebRequest<Out>>,
+    ) -> ScopeServices<St, In, Out, M, F>
     where
-        F: IntoServiceFactory<S, WebRequest<Err>, SharedCfg>,
-        S: ServiceFactory<
-                WebRequest<Err>,
-                SharedCfg,
-                Response = WebResponse,
-                Error = Err::Container,
-            > + 'static,
-        S::InitError: fmt::Debug,
+        Sf: ServiceFactory<St, WebRequest<Out>, Res = WebResponse> + 'static,
+        Sf::Error: WebResponseError<St, St::Error>,
+        Sf::InitError: IntoFailure,
     {
         // create and configure default resource
-        self.default = Rc::new(RefCell::new(Some(Rc::new(boxed::factory(
-            chain_factory(f.into_factory())
-                .map_init_err(|e| log::error!("Cannot construct default service: {e:?}")),
-        )))));
+        let default = boxed::factory(
+            f.into_factory()
+                .map_err(WebError::from_err)
+                .map_init_err(IntoFailure::fail),
+        );
 
-        self
+        ScopeServices {
+            rdef: self.rdef,
+            guards: self.guards,
+            filter: self.filter,
+            middleware: self.middleware,
+            default: Some(default),
+            external: self.external,
+            case_insensitive: self.case_insensitive,
+            services: Vec::new(),
+        }
     }
 
+    /// Registers a request filter for this scope.
+    ///
+    /// The filter runs after the scope's path and guards match, but before its
+    /// nested router selects a resource. It is not called for requests that do
+    /// not match this scope.
+    ///
+    /// ```rust
+    /// use std::convert::Infallible;
+    /// use ntex::web::{self, App, WebRequest};
+    ///
+    /// async fn user(_state: &(), user_id: usize) -> String {
+    ///     format!("User {user_id}")
+    /// }
+    ///
+    /// App::new().service(
+    ///     web::scope("/api")
+    ///         .filter(async |req: WebRequest<()>| {
+    ///             Ok::<_, Infallible>(req.map_state(|()| 42usize))
+    ///         })
+    ///         .route("/user", web::get().to_with_state(user)),
+    /// );
+    /// ```
     #[must_use]
-    /// Register request filter.
-    ///
-    /// Filter runs during inbound processing in the request
-    /// lifecycle (request -> response), modifying request as
-    /// necessary, across all requests managed by the *Scope*.
-    ///
-    /// This is similar to `App's` filters, but filter get invoked on scope level.
-    pub fn filter<U, F>(
+    pub fn filter<U, R>(
         self,
-        filter: F,
+        filter: impl IntoServiceFactory<U, St, WebRequest<Out>>,
     ) -> Scope<
-        Err,
+        St,
+        In,
+        R,
         M,
         impl ServiceFactory<
-            WebRequest<Err>,
-            SharedCfg,
-            Response = WebRequest<Err>,
-            Error = Err::Container,
-            InitError = (),
+            St,
+            WebRequest<In>,
+            Res = WebRequest<R>,
+            Error = WebError<St, St::Error>,
+            InitError = Failure,
         >,
     >
     where
-        U: ServiceFactory<
-                WebRequest<Err>,
-                SharedCfg,
-                Response = WebRequest<Err>,
-                Error = Err::Container,
-            >,
-        F: IntoServiceFactory<U, WebRequest<Err>, SharedCfg>,
+        U: ServiceFactory<St, WebRequest<Out>, Res = WebRequest<R>>,
+        U::Error: WebResponseError<St, St::Error>,
+        U::InitError: IntoFailure,
     {
         Scope {
-            filter: self
-                .filter
-                .and_then(filter.into_factory().map_init_err(|_| ())),
+            filter: self.filter.and_then(
+                filter
+                    .into_factory()
+                    .map_err(WebError::from_err)
+                    .map_init_err(IntoFailure::fail),
+            ),
             middleware: self.middleware,
             rdef: self.rdef,
-            state: self.state,
             guards: self.guards,
-            services: self.services,
-            default: self.default,
             external: self.external,
             case_insensitive: self.case_insensitive,
+            ph: PhantomData,
         }
     }
 
-    #[must_use]
-    /// Registers middleware, in the form of a middleware component (type).
+    /// Registers a middleware for this scope.
     ///
-    /// That runs during inbound processing in the request
-    /// lifecycle (request -> response), modifying request as
-    /// necessary, across all requests managed by the *Scope*. Scope-level
-    /// middleware is more limited in what it can modify, relative to Route or
-    /// Application level middleware, in that Scope-level middleware can not modify
-    /// `WebResponse`.
-    pub fn middleware<U>(self, mw: U) -> Scope<Err, WebStack<M, U, Err>, T> {
+    /// The middleware runs only after the scope's path and guards match. It
+    /// wraps everything inside the scope, including its filter, nested routes,
+    /// and fallback service. This means it can inspect or modify both the
+    /// request and response, even when no nested route matches.
+    ///
+    /// ```rust
+    /// use ntex::web::{self, middleware, App};
+    ///
+    /// App::default().service(
+    ///     web::scope("/api")
+    ///         .middleware(
+    ///             middleware::DefaultHeaders::new()
+    ///                 .header("x-api", "v1"),
+    ///         )
+    ///         .route("/health", web::get().to(async || "OK")),
+    /// );
+    /// ```
+    #[must_use]
+    pub fn middleware<U>(self, mw: U) -> Scope<St, In, Out, WebStack<St, U, M>, F> {
         Scope {
-            middleware: WebStack::new(self.middleware, mw),
+            middleware: WebStack::new(mw, self.middleware),
             filter: self.filter,
             rdef: self.rdef,
-            state: self.state,
             guards: self.guards,
-            services: self.services,
-            default: self.default,
             external: self.external,
             case_insensitive: self.case_insensitive,
+            ph: PhantomData,
         }
-    }
-
-    #[doc(hidden)]
-    #[deprecated(since = "3.2.0", note = "use `middleware()` instead")]
-    pub fn wrap<U>(self, mw: U) -> Scope<Err, WebStack<M, U, Err>, T> {
-        self.middleware(mw)
     }
 }
 
-impl<Err, M, T> WebServiceFactory<Err> for Scope<Err, M, T>
+impl<St, In, Out, M, F> ScopeServices<St, In, Out, M, F>
 where
-    T: ServiceFactory<
-            WebRequest<Err>,
-            SharedCfg,
-            Response = WebRequest<Err>,
-            Error = Err::Container,
-            InitError = (),
-        > + 'static,
-    M: Middleware<ScopeService<T::Service, Err>, SharedCfg> + 'static,
-    M::Service: Service<WebRequest<Err>, Response = WebResponse, Error = Err::Container>,
-    Err: ErrorRenderer,
+    St: State,
+    In: 'static,
+    Out: 'static,
+    F: ServiceFactory<
+            St,
+            WebRequest<In>,
+            Res = WebRequest<Out>,
+            Error = WebError<St, St::Error>,
+            InitError = Failure,
+        >,
 {
-    fn register(mut self, config: &mut WebServiceConfig<Err>) {
-        // update default resource if needed
-        if self.default.borrow().is_none() {
-            *self.default.borrow_mut() = Some(config.default_service());
-        }
+    /// Registers another web service inside this scope.
+    ///
+    /// This has the same behavior as [`Scope::service()`]. The service's path
+    /// is joined with the scope prefix and added to the scope's nested router.
+    ///
+    /// If no nested service matches, the scope's default service is used.
+    #[must_use]
+    pub fn service(mut self, factory: impl WebServiceFactory<St, Out>) -> Self {
+        self.services
+            .push(Box::new(ServiceFactoryWrapper::new(factory)));
+        self
+    }
 
-        let state = self.state.take().map(|state| {
-            AppState::new(
-                state,
-                Some(config.state().clone()),
-                config.state().0.config.clone(),
+    /// Register a route for a path relative to this scope.
+    ///
+    /// This is shorthand for creating a [`Resource`] with one route and
+    /// registering it with [`ScopeServices::service()`]. The route's method and
+    /// custom guards are promoted to resource guards.
+    ///
+    /// Each call creates a separate resource, so the same relative path can be
+    /// registered more than once with different guards.
+    ///
+    /// ```rust
+    /// use ntex::web::{self, App, HttpResponse};
+    ///
+    /// App::default().service(
+    ///     web::scope("/api")
+    ///         .route("/items", web::get().to(async || "list"))
+    ///         .route(
+    ///             "/items",
+    ///             web::post().to(async || HttpResponse::Created()),
+    ///         )
+    /// );
+    /// ```
+    #[must_use]
+    pub fn route(self, path: &str, mut route: Route<St, Out>) -> Self {
+        self.service(
+            Resource::new(path)
+                .add_guards(route.take_guards())
+                .route(route),
+        )
+    }
+
+    /// Set the fallback service for unmatched requests within this scope.
+    ///
+    /// The fallback is called after the scope prefix and guards match but no
+    /// nested resource matches. Without a custom fallback, the scope returns
+    /// `404 Not Found`; it does not delegate to the application's fallback.
+    /// Routing failures inside a matched resource are handled by that
+    /// resource's fallback instead.
+    ///
+    /// ```rust
+    /// use ntex::web::{self, App, HttpRequest, HttpResponse};
+    ///
+    /// async fn not_found(req: HttpRequest) -> HttpResponse {
+    ///     HttpResponse::NotFound()
+    ///         .body(format!("No API resource for {}", req.path()))
+    /// }
+    ///
+    /// App::default().service(
+    ///     web::scope("/api")
+    ///         .route("/health", web::get().to(async || "ready"))
+    ///         .default_service(web::to(not_found))
+    /// );
+    /// ```
+    #[must_use]
+    pub fn default_service<Sf>(
+        mut self,
+        f: impl IntoServiceFactory<Sf, St, WebRequest<Out>>,
+    ) -> Self
+    where
+        Sf: ServiceFactory<St, WebRequest<Out>, Res = WebResponse> + 'static,
+        Sf::Error: WebResponseError<St, St::Error>,
+        Sf::InitError: IntoFailure,
+    {
+        // create and configure default resource
+        self.default = Some(boxed::factory(
+            f.into_factory()
+                .map_err(WebError::from_err)
+                .map_init_err(IntoFailure::fail),
+        ));
+
+        self
+    }
+}
+
+impl<St, Outer, In, Out, M, F> WebServiceFactory<St, Outer> for ScopeServices<St, In, Out, M, F>
+where
+    St: State,
+    Outer: 'static,
+    In: 'static,
+    Out: 'static,
+    F: ServiceFactory<
+            St,
+            WebRequest<In>,
+            Res = WebRequest<Out>,
+            Error = WebError<St, St::Error>,
+            InitError = Failure,
+        > + 'static,
+    M: Middleware<WebServiceRouter<St, In, Out, F::Service>, St> + 'static,
+    M::Service: Service<St, WebRequest<Outer>, Res = WebResponse, Error = WebError<St, St::Error>>,
+{
+    fn register(mut self, config: &mut WebServiceConfig<St, Outer>) {
+        // Default service
+        let default = self.default.unwrap_or_else(|| {
+            boxed::factory(
+                factory(async move |req: WebRequest<Out>| {
+                    Ok(req.into_response(Response::NotFound().build()))
+                })
+                .map_init_err(|_| unreachable!()),
             )
         });
 
-        // register nested services
-        let mut cfg = config.clone_config(state.clone());
-        self.services
-            .into_iter()
-            .for_each(|mut srv| srv.register(&mut cfg));
+        // Web app config
+        let mut cfg = WebServiceConfig::new();
 
-        let slesh = self.rdef.iter().any(|s| s.ends_with('/'));
+        // register nested services
+        for mut svc in self.services {
+            svc.register(&mut cfg);
+        }
+
+        // ResourceMap tree
+        let slash = self.rdef.iter().any(|s| s.ends_with('/'));
         let mut rmap = ResourceMap::new(ResourceDef::root_prefix(self.rdef.clone()));
 
-        // external resources
         for mut rdef in std::mem::take(&mut self.external) {
             rmap.add(&mut rdef, None);
         }
 
-        // complete scope pipeline creation
-        let router_factory = ScopeRouterFactory {
-            state,
-            default: self.default.borrow_mut().take(),
-            case_insensitive: self.case_insensitive,
-            services: cfg
-                .into_services()
-                .into_iter()
-                .map(|(rdef, srv, guards, nested)| {
-                    // case for scope prefix ends with '/' and
-                    // resource is empty pattern
-                    let mut rdef = if slesh && rdef.pattern() == "" {
-                        ResourceDef::new("/")
-                    } else {
-                        rdef
-                    };
-                    rmap.add(&mut rdef, nested);
-                    (rdef, srv, RefCell::new(guards))
-                })
-                .collect(),
-        };
+        // Complete scope pipeline creation
+        let services: Vec<_> = cfg
+            .into_services()
+            .into_iter()
+            .map(|(rdef, srv, guards, nested)| {
+                // case for scope prefix ends with '/' and
+                // resource is empty pattern
+                let mut rdef = if slash && rdef.pattern() == "" {
+                    ResourceDef::new("/")
+                } else {
+                    rdef
+                };
+                rmap.add(&mut rdef, nested);
+                (rdef, srv, RefCell::new(guards))
+            })
+            .collect();
 
-        // get guards
-        let guards = if self.guards.is_empty() {
-            None
-        } else {
-            Some(self.guards)
-        };
+        // Create router
+        let mut router = Router::builder();
+        if self.case_insensitive {
+            router.case_insensitive();
+        }
+        for (path, factory, guards) in services {
+            router
+                .resource(path.clone(), factory)
+                .set_check_value(guards.borrow_mut().take());
+        }
 
         // register final service
         config.register_service(
             ResourceDef::root_prefix(self.rdef),
-            guards,
-            ScopeServiceFactory {
-                middleware: self.middleware,
-                filter: self.filter,
-                routing: router_factory,
+            if self.guards.is_empty() {
+                None
+            } else {
+                Some(self.guards)
             },
             Some(Rc::new(rmap)),
+            ScopeServiceFactory {
+                default,
+                middleware: self.middleware,
+                filter: self.filter,
+                router: Rc::new(router.build()),
+            },
         );
     }
 }
 
 /// Scope service
-struct ScopeServiceFactory<M, F, Err: ErrorRenderer> {
+struct ScopeServiceFactory<St: State, In, Out, M, F> {
     middleware: M,
-    filter: F,
-    routing: ScopeRouterFactory<Err>,
+    filter: ServiceChainFactory<F, St, WebRequest<In>>,
+    router: Rc<Router<HttpService<St, Out>, Guards>>,
+    default: HttpService<St, Out>,
 }
 
-impl<M, F, Err> ServiceFactory<WebRequest<Err>, SharedCfg>
-    for ScopeServiceFactory<M, F, Err>
+impl<St, Outer, In, Out, M, F> ServiceFactory<St, WebRequest<Outer>>
+    for ScopeServiceFactory<St, In, Out, M, F>
 where
-    M: Middleware<ScopeService<F::Service, Err>, SharedCfg> + 'static,
-    M::Service: Service<WebRequest<Err>, Response = WebResponse, Error = Err::Container>,
+    St: State,
+    Outer: 'static,
+    In: 'static,
+    Out: 'static,
     F: ServiceFactory<
-            WebRequest<Err>,
-            SharedCfg,
-            Response = WebRequest<Err>,
-            Error = Err::Container,
-            InitError = (),
+            St,
+            WebRequest<In>,
+            Res = WebRequest<Out>,
+            Error = WebError<St, St::Error>,
+            InitError = Failure,
         > + 'static,
-    Err: ErrorRenderer,
+    M: Middleware<WebServiceRouter<St, In, Out, F::Service>, St> + 'static,
+    M::Service: Service<St, WebRequest<Outer>, Res = WebResponse, Error = WebError<St, St::Error>>,
 {
-    type Response = WebResponse;
-    type Error = Err::Container;
+    type Res = WebResponse;
+    type Error = WebError<St, St::Error>;
+
     type Service = M::Service;
-    type InitError = ();
+    type InitError = Failure;
 
-    async fn create(&self, cfg: SharedCfg) -> Result<Self::Service, Self::InitError> {
+    async fn create(&self, st: &St) -> Result<Self::Service, Self::InitError> {
+        let filter = self.filter.create(st).await?;
+
+        // router service
         Ok(self.middleware.create(
-            ScopeService {
-                filter: self.filter.create(cfg.clone()).await?,
-                routing: self.routing.create(cfg.clone()).await?,
-            },
-            cfg,
+            st,
+            WebServiceRouter::new(filter, self.router.clone(), self.default.clone()),
         ))
-    }
-}
-
-#[derive(derive_more::Debug)]
-#[debug("ScopeService")]
-pub struct ScopeService<F, Err: ErrorRenderer> {
-    filter: F,
-    routing: ScopeRouter<Err>,
-}
-
-impl<F, Err> Service<WebRequest<Err>> for ScopeService<F, Err>
-where
-    F: Service<WebRequest<Err>, Response = WebRequest<Err>, Error = Err::Container>,
-    Err: ErrorRenderer,
-{
-    type Response = WebResponse;
-    type Error = Err::Container;
-
-    #[inline]
-    async fn ready(&self, ctx: ServiceCtx<'_, Self>) -> Result<(), Self::Error> {
-        let (ready1, ready2) =
-            join(ctx.ready(&self.filter), ctx.ready(&self.routing)).await;
-        ready1?;
-        ready2
-    }
-
-    #[inline]
-    fn poll(&self, cx: &mut Context<'_>) -> Result<(), Self::Error> {
-        self.filter.poll(cx)?;
-        self.routing.poll(cx)
-    }
-
-    #[inline]
-    async fn call(
-        &self,
-        req: WebRequest<Err>,
-        ctx: ServiceCtx<'_, Self>,
-    ) -> Result<Self::Response, Self::Error> {
-        let req = ctx.call(&self.filter, req).await?;
-        ctx.call(&self.routing, req).await
-    }
-}
-
-struct ScopeRouterFactory<Err: ErrorRenderer> {
-    state: Option<AppState>,
-    services: Vec<(ResourceDef, HttpNewService<Err>, RefCell<Option<Guards>>)>,
-    default: Option<Rc<HttpNewService<Err>>>,
-    case_insensitive: bool,
-}
-
-impl<Err: ErrorRenderer> ServiceFactory<WebRequest<Err>, SharedCfg>
-    for ScopeRouterFactory<Err>
-{
-    type Response = WebResponse;
-    type Error = Err::Container;
-    type InitError = ();
-    type Service = ScopeRouter<Err>;
-
-    async fn create(&self, cfg: SharedCfg) -> Result<Self::Service, Self::InitError> {
-        // create http services
-        let mut router = Router::build();
-        if self.case_insensitive {
-            router.case_insensitive();
-        }
-        for (path, factory, guards) in &mut self.services.iter() {
-            let service = factory.create(cfg.clone()).await?;
-            router.rdef(path.clone(), service).2 = guards.borrow_mut().take();
-        }
-
-        let default = if let Some(ref default) = self.default {
-            Some(default.create(cfg).await?)
-        } else {
-            None
-        };
-
-        Ok(ScopeRouter {
-            default,
-            router: router.finish(),
-            state: self.state.clone(),
-        })
-    }
-}
-
-struct ScopeRouter<Err: ErrorRenderer> {
-    state: Option<AppState>,
-    router: Router<HttpService<Err>, Vec<Box<dyn Guard>>>,
-    default: Option<HttpService<Err>>,
-}
-
-impl<Err: ErrorRenderer> Service<WebRequest<Err>> for ScopeRouter<Err> {
-    type Response = WebResponse;
-    type Error = Err::Container;
-
-    async fn call(
-        &self,
-        mut req: WebRequest<Err>,
-        ctx: ServiceCtx<'_, Self>,
-    ) -> Result<Self::Response, Self::Error> {
-        let res = self.router.recognize_checked(&mut req, |req, guards| {
-            if let Some(guards) = guards {
-                for f in guards {
-                    if !f.check(req.head()) {
-                        return false;
-                    }
-                }
-            }
-            true
-        });
-
-        if let Some((srv, _info)) = res {
-            if let Some(ref state) = self.state {
-                req.set_state_container(state.clone());
-            }
-            ctx.call(srv, req).await
-        } else if let Some(ref default) = self.default {
-            ctx.call(default, req).await
-        } else {
-            let req = req.into_parts().0;
-            Ok(WebResponse::new(Response::NotFound().finish(), req))
-        }
     }
 }
 
 #[cfg(test)]
 mod tests {
+    use std::convert::Infallible;
+
     use crate::http::body::{Body, ResponseBody};
     use crate::http::header::{CONTENT_TYPE, HeaderValue};
     use crate::http::{Method, StatusCode};
-    use crate::service::fn_service;
-    use crate::util::{Bytes, Ready};
-    use crate::web::DefaultError;
+    use crate::util::Bytes;
     use crate::web::middleware::DefaultHeaders;
-    use crate::web::request::WebRequest;
     use crate::web::test::{TestRequest, call_service, init_service, read_body};
-    use crate::web::{self, App, HttpRequest, HttpResponse, guard};
+    use crate::web::{self, App, HttpRequest, HttpResponse, WebRequest, guard};
 
     #[crate::rt_test]
     async fn test_scope() {
-        let srv =
-            init_service(
-                App::new()
-                    .service(web::scope("/app").service(
-                        web::resource("/path1").to(|| async { HttpResponse::Ok() }),
-                    ))
-                    .service(web::scope("/app2").case_insensitive_routing().service(
-                        web::resource("/path1").to(|| async { HttpResponse::Ok() }),
-                    )),
-            )
-            .await;
+        let srv = init_service(
+            App::new()
+                .service(
+                    web::scope("/app")
+                        .service(web::resource("/path1").to(async || HttpResponse::Ok())),
+                )
+                .service(
+                    web::scope("/app2")
+                        .case_insensitive_routing()
+                        .service(web::resource("/path1").to(async || HttpResponse::Ok())),
+                ),
+        )
+        .await;
 
         let req = TestRequest::with_uri("/app/path1").to_request();
         let resp = srv.call(req).await.unwrap();
@@ -674,8 +695,8 @@ mod tests {
         let srv = init_service(
             App::new().service(
                 web::scope("/app")
-                    .service(web::resource("").to(|| async { HttpResponse::Ok() }))
-                    .service(web::resource("/").to(|| async { HttpResponse::Created() })),
+                    .service(web::resource("").to(async || HttpResponse::Ok()))
+                    .service(web::resource("/").to(async || HttpResponse::Created())),
             ),
         )
         .await;
@@ -694,8 +715,8 @@ mod tests {
         let srv = init_service(
             App::new().service(
                 web::scope(["/app", "/app2"])
-                    .service(web::resource("").to(|| async { HttpResponse::Ok() }))
-                    .service(web::resource("/").to(|| async { HttpResponse::Created() })),
+                    .service(web::resource("").to(async || HttpResponse::Ok()))
+                    .service(web::resource("/").to(async || HttpResponse::Created())),
             ),
         )
         .await;
@@ -715,12 +736,9 @@ mod tests {
 
     #[crate::rt_test]
     async fn test_scope_root2() {
-        let srv = init_service(
-            App::new().service(
-                web::scope("/app/")
-                    .service(web::resource("").to(|| async { HttpResponse::Ok() })),
-            ),
-        )
+        let srv = init_service(App::new().service(
+            web::scope("/app/").service(web::resource("").to(async || HttpResponse::Ok())),
+        ))
         .await;
 
         let req = TestRequest::with_uri("/app").to_request();
@@ -737,7 +755,7 @@ mod tests {
         let srv = init_service(
             App::new().service(
                 web::scope(["/app/", "/app2/"])
-                    .service(web::resource("").to(|| async { HttpResponse::Ok() })),
+                    .service(web::resource("").to(async || HttpResponse::Ok())),
             ),
         )
         .await;
@@ -757,12 +775,9 @@ mod tests {
 
     #[crate::rt_test]
     async fn test_scope_root3() {
-        let srv = init_service(
-            App::new().service(
-                web::scope("/app/")
-                    .service(web::resource("/").to(|| async { HttpResponse::Ok() })),
-            ),
-        )
+        let srv = init_service(App::new().service(
+            web::scope("/app/").service(web::resource("/").to(async || HttpResponse::Ok())),
+        ))
         .await;
 
         let req = TestRequest::with_uri("/app").to_request();
@@ -779,8 +794,8 @@ mod tests {
         let srv = init_service(
             App::new().service(
                 web::scope("app")
-                    .route("/path1", web::get().to(|| async { HttpResponse::Ok() }))
-                    .route("/path1", web::delete().to(|| async { HttpResponse::Ok() })),
+                    .route("/path1", web::get().to(async || HttpResponse::Ok()))
+                    .route("/path1", web::delete().to(async || HttpResponse::Ok())),
             ),
         )
         .await;
@@ -803,8 +818,8 @@ mod tests {
         let srv = init_service(
             App::new().service(
                 web::scope(["app", "app2"])
-                    .route("/path1", web::get().to(|| async { HttpResponse::Ok() }))
-                    .route("/path1", web::delete().to(|| async { HttpResponse::Ok() })),
+                    .route("/path1", web::get().to(async || HttpResponse::Ok()))
+                    .route("/path1", web::delete().to(async || HttpResponse::Ok())),
             ),
         )
         .await;
@@ -834,8 +849,8 @@ mod tests {
             App::new().service(
                 web::scope("app").service(
                     web::resource("path1")
-                        .route(web::get().to(|| async { HttpResponse::Ok() }))
-                        .route(web::delete().to(|| async { HttpResponse::Ok() })),
+                        .route(web::get().to(async || HttpResponse::Ok()))
+                        .route(web::delete().to(async || HttpResponse::Ok())),
                 ),
             ),
         )
@@ -863,16 +878,16 @@ mod tests {
         let srv = init_service(
             App::new()
                 .service(
-                    web::scope("/app").guard(guard::Get()).service(
-                        web::resource("/path1").to(|| async { HttpResponse::Ok() }),
-                    ),
+                    web::scope("/app")
+                        .guard(guard::Get())
+                        .service(web::resource("/path1").to(async || HttpResponse::Ok())),
                 )
-                .service(web::scope("/app").guard(guard::Post()).service(
-                    web::resource("/path1").to(|| async { HttpResponse::NotModified() }),
-                ))
                 .service(
-                    web::resource("/app/path1").to(|| async { HttpResponse::NoContent() }),
-                ),
+                    web::scope("/app")
+                        .guard(guard::Post())
+                        .service(web::resource("/path1").to(async || HttpResponse::NotModified())),
+                )
+                .service(web::resource("/app/path1").to(async || HttpResponse::NoContent())),
         )
         .await;
 
@@ -898,7 +913,7 @@ mod tests {
     #[crate::rt_test]
     async fn test_scope_variable_segment() {
         let srv = init_service(App::new().service(web::scope("/ab-{project}").service(
-            web::resource("/path1").to(|r: HttpRequest| async move {
+            web::resource("/path1").to(async move |r: HttpRequest| {
                 HttpResponse::Ok().body(format!("project: {}", &r.match_info()["project"]))
             }),
         )))
@@ -908,7 +923,7 @@ mod tests {
         let resp = srv.call(req).await.unwrap();
         assert_eq!(resp.status(), StatusCode::OK);
 
-        if let ResponseBody::Body(Body::Bytes(b)) = resp.response().body() {
+        if let ResponseBody::Body(Body::Bytes(b)) = resp.body() {
             let bytes: Bytes = b.clone();
             assert_eq!(bytes, Bytes::from_static(b"project: project1"));
         }
@@ -921,7 +936,7 @@ mod tests {
     #[crate::rt_test]
     async fn test_scope_variable_segment2() {
         let srv = init_service(App::new().service(web::scope("/ab-{project}").service(
-            web::resource(["", "/"]).to(|r: HttpRequest| async move {
+            web::resource(["", "/"]).to(async move |r: HttpRequest| {
                 HttpResponse::Ok().body(format!("project: {}", &r.match_info()["project"]))
             }),
         )))
@@ -931,7 +946,7 @@ mod tests {
         let resp = srv.call(req).await.unwrap();
         assert_eq!(resp.status(), StatusCode::OK);
 
-        if let ResponseBody::Body(Body::Bytes(b)) = resp.response().body() {
+        if let ResponseBody::Body(Body::Bytes(b)) = resp.body() {
             let bytes: Bytes = b.clone();
             assert_eq!(bytes, Bytes::from_static(b"project: project1"));
         }
@@ -940,7 +955,7 @@ mod tests {
         let resp = srv.call(req).await.unwrap();
         assert_eq!(resp.status(), StatusCode::OK);
 
-        if let ResponseBody::Body(Body::Bytes(b)) = resp.response().body() {
+        if let ResponseBody::Body(Body::Bytes(b)) = resp.body() {
             let bytes: Bytes = b.clone();
             assert_eq!(bytes, Bytes::from_static(b"project: project1"));
         }
@@ -952,13 +967,10 @@ mod tests {
 
     #[crate::rt_test]
     async fn test_nested_scope() {
-        let srv =
-            init_service(App::new().service(web::scope("/app").service(
-                web::scope("/t1").service(
-                    web::resource("/path1").to(|| async { HttpResponse::Created() }),
-                ),
-            )))
-            .await;
+        let srv = init_service(App::new().service(web::scope("/app").service(
+            web::scope("/t1").service(web::resource("/path1").to(async || HttpResponse::Created())),
+        )))
+        .await;
 
         let req = TestRequest::with_uri("/app/t1/path1").to_request();
         let resp = srv.call(req).await.unwrap();
@@ -967,13 +979,10 @@ mod tests {
 
     #[crate::rt_test]
     async fn test_nested_scope_no_slash() {
-        let srv =
-            init_service(App::new().service(web::scope("/app").service(
-                web::scope("t1").service(
-                    web::resource("/path1").to(|| async { HttpResponse::Created() }),
-                ),
-            )))
-            .await;
+        let srv = init_service(App::new().service(web::scope("/app").service(
+            web::scope("t1").service(web::resource("/path1").to(async || HttpResponse::Created())),
+        )))
+        .await;
 
         let req = TestRequest::with_uri("/app/t1/path1").to_request();
         let resp = srv.call(req).await.unwrap();
@@ -986,10 +995,8 @@ mod tests {
             App::new().service(
                 web::scope("/app").service(
                     web::scope("/t1")
-                        .service(web::resource("").to(|| async { HttpResponse::Ok() }))
-                        .service(
-                            web::resource("/").to(|| async { HttpResponse::Created() }),
-                        ),
+                        .service(web::resource("").to(async || HttpResponse::Ok()))
+                        .service(web::resource("/").to(async || HttpResponse::Created())),
                 ),
             ),
         )
@@ -1006,15 +1013,16 @@ mod tests {
 
     #[crate::rt_test]
     async fn test_nested_scope_filter() {
-        let srv =
-            init_service(App::new().service(
+        let srv = init_service(
+            App::new().service(
                 web::scope("/app").service(
-                    web::scope("/t1").guard(guard::Get()).service(
-                        web::resource("/path1").to(|| async { HttpResponse::Ok() }),
-                    ),
+                    web::scope("/t1")
+                        .guard(guard::Get())
+                        .service(web::resource("/path1").to(async || HttpResponse::Ok())),
                 ),
-            ))
-            .await;
+            ),
+        )
+        .await;
 
         let req = TestRequest::with_uri("/app/t1/path1")
             .method(Method::POST)
@@ -1033,7 +1041,7 @@ mod tests {
     async fn test_nested_scope_with_variable_segment() {
         let srv = init_service(App::new().service(web::scope("/app").service(
             web::scope("/{project_id}").service(web::resource("/path1").to(
-                |r: HttpRequest| async move {
+                async move |r: HttpRequest| {
                     HttpResponse::Created()
                         .body(format!("project: {}", &r.match_info()["project_id"]))
                 },
@@ -1045,7 +1053,7 @@ mod tests {
         let resp = srv.call(req).await.unwrap();
         assert_eq!(resp.status(), StatusCode::CREATED);
 
-        if let ResponseBody::Body(Body::Bytes(b)) = resp.response().body() {
+        if let ResponseBody::Body(Body::Bytes(b)) = resp.body() {
             let bytes: Bytes = b.clone();
             assert_eq!(bytes, Bytes::from_static(b"project: project_1"));
         }
@@ -1055,7 +1063,7 @@ mod tests {
     async fn test_nested2_scope_with_variable_segment() {
         let srv = init_service(App::new().service(web::scope("/app").service(
             web::scope("/{project}").service(web::scope("/{id}").service(
-                web::resource("/path1").to(|r: HttpRequest| async move {
+                web::resource("/path1").to(async move |r: HttpRequest| {
                     HttpResponse::Created().body(format!(
                         "project: {} - {}",
                         &r.match_info()["project"],
@@ -1070,7 +1078,7 @@ mod tests {
         let resp = srv.call(req).await.unwrap();
         assert_eq!(resp.status(), StatusCode::CREATED);
 
-        if let ResponseBody::Body(Body::Bytes(b)) = resp.response().body() {
+        if let ResponseBody::Body(Body::Bytes(b)) = resp.body() {
             let bytes: Bytes = b.clone();
             assert_eq!(bytes, Bytes::from_static(b"project: test - 1"));
         }
@@ -1085,9 +1093,9 @@ mod tests {
         let srv = init_service(
             App::new().service(
                 web::scope("/app")
-                    .service(web::resource("/path1").to(|| async { HttpResponse::Ok() }))
-                    .default_service(|r: WebRequest<DefaultError>| async move {
-                        Ok(r.into_response(HttpResponse::BadRequest()))
+                    .service(web::resource("/path1").to(async || HttpResponse::Ok()))
+                    .default_service(async move |r: WebRequest<()>| {
+                        Ok::<_, Infallible>(r.into_response(HttpResponse::BadRequest()))
                     }),
             ),
         )
@@ -1103,44 +1111,17 @@ mod tests {
     }
 
     #[crate::rt_test]
-    async fn test_default_resource_propagation() {
-        let srv = init_service(
-            App::new()
-                .service(web::scope("/app1").default_service(
-                    web::resource("").to(|| async { HttpResponse::BadRequest() }),
-                ))
-                .service(web::scope("/app2"))
-                .default_service(|r: WebRequest<DefaultError>| async move {
-                    Ok(r.into_response(HttpResponse::MethodNotAllowed()))
-                }),
-        )
-        .await;
-
-        let req = TestRequest::with_uri("/non-exist").to_request();
-        let resp = srv.call(req).await.unwrap();
-        assert_eq!(resp.status(), StatusCode::METHOD_NOT_ALLOWED);
-
-        let req = TestRequest::with_uri("/app1/non-exist").to_request();
-        let resp = srv.call(req).await.unwrap();
-        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
-
-        let req = TestRequest::with_uri("/app2/non-exist").to_request();
-        let resp = srv.call(req).await.unwrap();
-        assert_eq!(resp.status(), StatusCode::METHOD_NOT_ALLOWED);
-    }
-
-    #[crate::rt_test]
     async fn test_filter() {
         let filter = std::rc::Rc::new(std::cell::Cell::new(false));
         let filter2 = filter.clone();
         let srv = init_service(
             App::new().service(
                 web::scope("app")
-                    .filter(fn_service(move |req: WebRequest<_>| {
+                    .filter(async move |req: WebRequest<()>| {
                         filter2.set(true);
-                        Ready::Ok(req)
-                    }))
-                    .route("/test", web::get().to(|| async { HttpResponse::Ok() })),
+                        Ok::<_, Infallible>(req)
+                    })
+                    .route("/test", web::get().to(async || HttpResponse::Ok())),
             ),
         )
         .await;
@@ -1160,8 +1141,7 @@ mod tests {
                             .header(CONTENT_TYPE, HeaderValue::from_static("0001")),
                     )
                     .service(
-                        web::resource("/test")
-                            .route(web::get().to(|| async { HttpResponse::Ok() })),
+                        web::resource("/test").route(web::get().to(async || HttpResponse::Ok())),
                     ),
             ),
         )
@@ -1177,44 +1157,10 @@ mod tests {
     }
 
     #[crate::rt_test]
-    async fn test_scope_config() {
-        let srv = init_service(App::new().service(web::scope("/app").configure(|s| {
-            s.state("teat");
-            s.route("/path1", web::get().to(|| async { HttpResponse::Ok() }));
-        })))
-        .await;
-
-        let req = TestRequest::with_uri("/app/path1").to_request();
-        let resp = srv.call(req).await.unwrap();
-        assert_eq!(resp.status(), StatusCode::OK);
-    }
-
-    #[crate::rt_test]
-    async fn test_override_state() {
-        let srv = init_service(App::new().state(1usize).service(
-            web::scope("app").state(10usize).state(100u16).route(
-                "/t",
-                web::get().to(
-                    |data: web::types::State<usize>, data2: web::types::State<u16>| {
-                        assert_eq!(*data, 10);
-                        assert_eq!(*data2, 100);
-                        async { HttpResponse::Ok() }
-                    },
-                ),
-            ),
-        ))
-        .await;
-
-        let req = TestRequest::with_uri("/app/t").to_request();
-        let resp = call_service(&srv, req).await;
-        assert_eq!(resp.status(), StatusCode::OK);
-    }
-
-    #[crate::rt_test]
     async fn test_scope_config_2() {
         let srv = init_service(App::new().service(web::scope("/app").configure(|s| {
             s.service(web::scope("/v1").configure(|s| {
-                s.route("/", web::get().to(|| async { HttpResponse::Ok() }));
+                s.route("/", web::get().to(async || HttpResponse::Ok()));
             }));
         })))
         .await;
@@ -1224,7 +1170,6 @@ mod tests {
         assert_eq!(resp.status(), StatusCode::OK);
     }
 
-    #[cfg(feature = "url")]
     #[crate::rt_test]
     async fn test_url_for_external() {
         let srv = init_service(App::new().service(web::scope("/app").configure(|s| {
@@ -1232,7 +1177,7 @@ mod tests {
                 s.external_resource("youtube", "https://youtube.com/watch/{video_id}");
                 s.route(
                     "/",
-                    web::get().to(|req: HttpRequest| async move {
+                    web::get().to(async move |req: HttpRequest| {
                         HttpResponse::Ok().body(
                             req.url_for("youtube", ["xxxxxx"])
                                 .unwrap()
@@ -1252,16 +1197,14 @@ mod tests {
         assert_eq!(body, &b"https://youtube.com/watch/xxxxxx"[..]);
     }
 
-    #[cfg(feature = "url")]
     #[crate::rt_test]
     async fn test_url_for_nested() {
         let srv = init_service(App::new().service(web::scope("/a").service(
-            web::scope("/b").service(web::resource("/c/{stuff}").name("c").route(
-                web::get().to(|req: HttpRequest| async move {
-                    HttpResponse::Ok()
-                        .body(format!("{}", req.url_for("c", ["12345"]).unwrap()))
-                }),
-            )),
+            web::scope("/b").service(web::resource("/c/{stuff}").name("c").route(web::get().to(
+                async move |req: HttpRequest| {
+                    HttpResponse::Ok().body(format!("{}", req.url_for("c", ["12345"]).unwrap()))
+                },
+            ))),
         )))
         .await;
 
@@ -1273,5 +1216,64 @@ mod tests {
             body,
             Bytes::from_static(b"http://localhost:8080/a/b/c/12345")
         );
+    }
+
+    #[crate::rt_test]
+    async fn test_url_for_parent() {
+        async fn urls(req: HttpRequest) -> HttpResponse {
+            let index = req.url_for("index", ["1"]).unwrap();
+            let youtube = req.url_for("youtube", ["2"]).unwrap();
+            let sibling = req.url_for("sibling", ["3"]).unwrap();
+            HttpResponse::Ok().body(format!("{index} {youtube} {sibling}"))
+        }
+
+        let srv = init_service(
+            App::new()
+                .external_resource("youtube", "https://youtube.com/watch/{video_id}")
+                .service(
+                    web::resource("/index/{id}")
+                        .name("index")
+                        .to(async || HttpResponse::Ok()),
+                )
+                .service(
+                    web::scope("/sibling").service(
+                        web::resource("/{id}")
+                            .name("sibling")
+                            .to(async || HttpResponse::Ok()),
+                    ),
+                )
+                .service(
+                    web::scope("/a")
+                        .service(web::resource("/").to(urls))
+                        .service(web::scope("/b").service(web::resource("/").to(urls))),
+                ),
+        )
+        .await;
+
+        for uri in ["/a/", "/a/b/"] {
+            let req = TestRequest::with_uri(uri).to_request();
+            let resp = call_service(&srv, req).await;
+            assert_eq!(resp.status(), StatusCode::OK);
+            let body = read_body(resp).await;
+            assert_eq!(
+                body,
+                Bytes::from_static(
+                    b"http://localhost:8080/index/1 https://youtube.com/watch/2 http://localhost:8080/sibling/3"
+                ),
+                "{uri}"
+            );
+        }
+    }
+
+    #[crate::rt_test]
+    async fn test_scope_default_service_only() {
+        let srv = init_service(App::new().service(web::scope("/app").default_service(
+            async |r: WebRequest<()>| Ok::<_, Infallible>(r.into_response(HttpResponse::Created())),
+        )))
+        .await;
+        let resp = call_service(&srv, TestRequest::with_uri("/app/path").to_request()).await;
+        assert_eq!(resp.status(), StatusCode::CREATED);
+        let resp = call_service(&srv, TestRequest::with_uri("/other").to_request()).await;
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
     }
 }

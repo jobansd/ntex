@@ -6,7 +6,7 @@ use ntex_bytes::{BufMut, BytePage, BytePages, BytesMut};
 use ntex_io::{Handle, IoContext, IoStream, IoTaskStatus, Readiness, types};
 use ntex_util::future::{Either, select};
 
-use super::{TcpStream, UnixStream};
+use super::{TcpStream, UnixStream, map_socket_error};
 
 const MAX_WRITE_SIZE: usize = 64 * 1024;
 const MAX_WRITE_ITEMS: usize = 16;
@@ -47,18 +47,26 @@ impl Handle for HandleUnixWrapper {
     }
 }
 
+/// Read view over the spare capacity of a read buffer.
+///
+/// Compio receives into the whole `as_uninit()` slice and then sets the
+/// length it read with `advance_to()`, a no-op unless it exceeds `as_init()`.
+/// The buffer may already hold input the filters have not consumed yet, so
+/// compio is shown an empty buffer spanning just the spare capacity and the
+/// read is appended after that input.
 struct CompioBuf(BytesMut);
 
 impl IoBuf for CompioBuf {
     #[inline]
     fn as_init(&self) -> &[u8] {
-        self.0.as_ref()
+        &[]
     }
 }
 
 impl IoBufMut for CompioBuf {
     fn as_uninit(&mut self) -> &mut [mem::MaybeUninit<u8>] {
-        self.0.chunk_mut().as_mut()
+        // SAFETY: compio only writes bytes read from the socket
+        unsafe { self.0.chunk_mut().as_uninit_slice_mut() }
     }
 }
 
@@ -79,7 +87,48 @@ impl IoBuf for CompioPage {
     }
 }
 
-async fn run<T: AsyncRead + AsyncWrite + Clone + Unpin + 'static>(io: T, ctx: IoContext) {
+/// Closes both directions of the connection gracefully.
+///
+/// `AsyncWrite::shutdown()` only shuts down the write direction, but
+/// [`Readiness::Close`] must close the read direction as well. This is not used
+/// for [`Readiness::Terminate`], which releases the connection without a
+/// graceful close.
+trait Terminate {
+    /// Closes both directions gracefully, after draining the receive queue.
+    fn terminate(&self) -> io::Result<()>;
+
+    /// Arranges for the socket to be reset instead of closed gracefully.
+    fn abort(&self);
+}
+
+impl Terminate for compio_net::TcpStream {
+    fn terminate(&self) -> io::Result<()> {
+        let sock = socket2::SockRef::from(self);
+        crate::helpers::drain_socket(&sock);
+        crate::helpers::shutdown_result(sock.shutdown(std::net::Shutdown::Both))
+    }
+
+    fn abort(&self) {
+        crate::helpers::abort_socket(&socket2::SockRef::from(self));
+    }
+}
+
+impl Terminate for compio_net::UnixStream {
+    fn terminate(&self) -> io::Result<()> {
+        let sock = socket2::SockRef::from(self);
+        crate::helpers::drain_socket(&sock);
+        crate::helpers::shutdown_result(sock.shutdown(std::net::Shutdown::Both))
+    }
+
+    fn abort(&self) {
+        crate::helpers::abort_socket(&socket2::SockRef::from(self));
+    }
+}
+
+async fn run<T: AsyncRead + AsyncWrite + Clone + Terminate + Unpin + 'static>(
+    io: T,
+    ctx: IoContext,
+) {
     let wr_io = io.clone();
     let wr_ctx = ctx.clone();
     let wr_task = compio_runtime::spawn(async move {
@@ -99,7 +148,7 @@ async fn read<T>(io: T, ctx: &IoContext)
 where
     T: AsyncRead + AsyncWrite + Clone + Unpin,
 {
-    let mut read_fut = Some(Box::pin(read_buf(&io, ctx.get_read_buf())));
+    let mut read_fut = Some(Box::pin(read_buf(&io, ctx.take_read_buf())));
 
     loop {
         if read_ready(ctx).await {
@@ -108,25 +157,18 @@ where
 
         match select(read_fut.as_mut().unwrap(), not_read_ready(ctx)).await {
             Either::Left(BufResult(result, cbuf)) => {
-                if matches!(result, Ok(0)) {
-                    ctx.stop(None);
-                }
-                if ctx.update_read_status(cbuf.0, result) == IoTaskStatus::Stop {
+                let result = result.map_err(map_socket_error);
+                if ctx.release_read_buf(cbuf.0, Poll::Ready(result)) == IoTaskStatus::Stop {
                     break;
                 }
-                read_fut = Some(Box::pin(read_buf(&io, ctx.get_read_buf())));
+                read_fut = Some(Box::pin(read_buf(&io, ctx.take_read_buf())));
             }
             Either::Right(true) => break,
             Either::Right(false) => (),
         }
     }
 
-    log::trace!("{}: Shuting down io {:?}", ctx.tag(), ctx.is_stopped());
-    if !ctx.is_stopped() {
-        let result = poll_fn(|cx| ctx.shutdown(true, cx)).await;
-        log::trace!("{}: Shuting down complete {result:?}", ctx.tag());
-        ctx.stop(None);
-    }
+    log::trace!("{}: Read task shutdown", ctx.tag());
 }
 
 async fn read_buf<T>(io: &T, buf: BytesMut) -> BufResult<usize, CompioBuf>
@@ -156,31 +198,37 @@ async fn not_read_ready(ctx: &IoContext) -> bool {
 
 async fn write<T>(mut io: T, ctx: &IoContext)
 where
-    T: AsyncRead + AsyncWrite + Clone,
+    T: AsyncRead + AsyncWrite + Clone + Terminate,
 {
     loop {
         match poll_fn(|cx| ctx.poll_write_ready(cx)).await {
             Readiness::Ready => {
-                let bufs = ctx.with_write_buf(build_bufs);
+                let bufs = ctx.with_write_dst(build_bufs);
+
+                // The status is not actionable here. `Io` and `Pause` are
+                // resolved by the next `poll_write_ready()`, and `Stop` means
+                // the connection is already aborted, so that reports `Close`
+                // and the transport is torn down there.
                 if bufs.is_empty() {
-                    if ctx.update_write_status(Ok(false)) == IoTaskStatus::Stop {
-                        break;
-                    }
+                    ctx.update_write_status(Ok(0));
                 } else {
-                    if write_buf(&mut io, ctx, bufs).await == IoTaskStatus::Stop {
-                        let _ = io.shutdown().await;
-                        break;
-                    }
+                    write_buf(&mut io, ctx, bufs).await;
                 }
             }
-            Readiness::Shutdown => {
-                let bufs = ctx.with_write_buf(build_bufs);
-                write_buf(&mut io, ctx, bufs).await;
-                let res = io.shutdown().await;
-                ctx.stop(res.err());
+            Readiness::Close => {
+                ctx.stopped(io.terminate().err());
                 break;
             }
-            Readiness::Terminate => return,
+            Readiness::Terminate => {
+                // The connection was force-closed, so the socket is aborted
+                // rather than closed gracefully: the peer sees an RST and
+                // cannot mistake a truncated stream for a complete one.
+                // Dropping the transport releases the descriptor once both
+                // tasks are done with it.
+                io.abort();
+                ctx.stopped(None);
+                break;
+            }
         }
     }
 }
@@ -203,24 +251,31 @@ fn build_bufs(buf: &mut BytePages) -> Vec<CompioPage> {
     bufs
 }
 
-async fn write_buf<T>(
-    io: &mut T,
-    ctx: &IoContext,
-    mut bufs: Vec<CompioPage>,
-) -> IoTaskStatus
+async fn write_buf<T>(io: &mut T, ctx: &IoContext, mut bufs: Vec<CompioPage>)
 where
     T: AsyncRead + AsyncWrite,
 {
     while !bufs.is_empty() {
-        let result = if bufs.len() == 1 {
-            let BufResult(result, buf) = io.write(bufs.pop().unwrap()).await;
-            bufs.push(buf);
-            result
-        } else {
-            let BufResult(result, bufs1) = io.write_vectored(bufs).await;
-            bufs = bufs1;
-            result
+        let op = async {
+            if bufs.len() == 1 {
+                let BufResult(result, buf) = io.write(bufs.pop().unwrap()).await;
+                (result, vec![buf])
+            } else {
+                let BufResult(result, bufs) = io.write_vectored(bufs).await;
+                (result, bufs)
+            }
         };
+
+        // A peer that stops reading keeps the write pending indefinitely, so
+        // the connection state is watched as well: the shutdown deadline is
+        // only polled from `poll_write_ready()`, and a terminated connection
+        // must not wait for the write. Dropping the operation cancels it, the
+        // pages are released with it.
+        let (result, rest) = match select(op, write_closed(ctx)).await {
+            Either::Left(res) => res,
+            Either::Right(()) => return,
+        };
+        bufs = rest;
 
         let result = match result {
             Ok(0) => Err(io::Error::new(
@@ -243,13 +298,64 @@ where
                         break;
                     }
                 }
-                Ok(true)
+                Ok(n)
             }
-            Err(e) => Err(e),
+            Err(e) => Err(map_socket_error(e)),
         };
         if ctx.update_write_status(result) == IoTaskStatus::Stop {
-            return IoTaskStatus::Stop;
+            // Pages still held here are counted as in-flight output, hand
+            // back whatever did not reach the peer.
+            return_pages(ctx, bufs);
+            return;
         }
     }
-    IoTaskStatus::Io
+}
+
+/// Resolves once the connection no longer accepts output.
+async fn write_closed(ctx: &IoContext) {
+    poll_fn(|cx| match ctx.poll_write_ready(cx) {
+        Poll::Ready(Readiness::Terminate | Readiness::Close) => Poll::Ready(()),
+        _ => Poll::Pending,
+    })
+    .await;
+}
+
+fn return_pages(ctx: &IoContext, mut bufs: Vec<CompioPage>) {
+    if !bufs.is_empty() {
+        ctx.with_write_dst(|dst| {
+            while let Some(page) = bufs.pop() {
+                dst.prepend(page.0);
+            }
+        });
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Receives `data` the way compio does, into `as_uninit()` then `advance_to()`.
+    fn recv(buf: &mut CompioBuf, data: &[u8]) {
+        let dst = buf.as_uninit();
+        for (d, s) in dst.iter_mut().zip(data) {
+            d.write(*s);
+        }
+        unsafe { buf.advance_to(data.len()) };
+    }
+
+    #[test]
+    fn read_appends_to_unconsumed_input() {
+        let mut bytes = BytesMut::with_capacity(1024);
+        bytes.extend_from_slice(&[b'a'; 108]);
+        let mut buf = CompioBuf(bytes);
+
+        // shorter and longer than the input already in the buffer
+        recv(&mut buf, b"b");
+        recv(&mut buf, &[b'c'; 160]);
+
+        let mut expected = vec![b'a'; 108];
+        expected.push(b'b');
+        expected.extend_from_slice(&[b'c'; 160]);
+        assert_eq!(&buf.0[..], &expected[..]);
+    }
 }

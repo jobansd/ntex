@@ -1,20 +1,23 @@
-//! HTTP Client
+//! HTTP client.
 //!
-//! ```rust
+//! ```rust,no_run
 //! use ntex::client::Client;
 //!
 //! #[ntex::main]
 //! async fn main() {
-//!    let mut client = Client::new().await;
+//!     let client = Client::new();
 //!
-//!    let response = client.get("http://www.rust-lang.org") // <- Create request builder
-//!        .header("User-Agent", "ntex::web")
-//!        .send()                                           // <- Send http request
-//!        .await;
+//!     let response = client
+//!         .get("https://www.rust-lang.org")
+//!         .header("User-Agent", "ntex")
+//!         .send()
+//!         .await;
 //!
-//!     println!("Response: {:?}", response);
+//!     println!("Response: {response:?}");
 //! }
 //! ```
+use std::rc::Rc;
+
 mod builder;
 mod cfg;
 mod codec;
@@ -32,97 +35,136 @@ mod test;
 
 pub use self::builder::ClientBuilder;
 pub use self::cfg::ClientConfig;
-pub use self::connection::Connection;
-pub use self::connector::{Connector, ConnectorService};
 pub use self::request::ClientRequest;
 pub use self::response::{ClientResponse, JsonBody, MessageBody};
 pub use self::service::{ServiceRequest, ServiceResponse};
 pub use self::test::TestResponse;
 
 pub(crate) use self::codec::{ClientCodec, ClientPayloadCodec};
-use crate::http::{HeaderMap, Method, RequestHead, Uri, body::BodySize, error::HttpError};
-use crate::{Pipeline, SharedCfg, service::boxed};
+#[cfg(feature = "ws")]
+pub(crate) use self::h1proto::host_header;
+use urly::Url;
+
+use crate::client::error::{ConnectError, InvalidUrl};
+use crate::http::{HeaderMap, Method, RequestHead, body::BodySize};
+use crate::service::{cfg::SharedCfg, pipeline::PipelineState};
+use crate::{Cfg, Pipeline, error::Error, io::IoBoxed};
+
+type ConnectorPipeline = PipelineState<SharedCfg, Connect, IoBoxed, Error<ConnectError>>;
 
 #[derive(Debug, Clone)]
-pub struct Connect {
-    pub uri: Uri,
-    pub addr: Option<std::net::SocketAddr>,
+pub(crate) struct Connect {
+    pub(crate) uri: Url,
+    pub(crate) addr: Option<std::net::SocketAddr>,
 }
 
-type BoxedSender = boxed::BoxService<ServiceRequest, ServiceResponse, error::ClientError>;
-
-/// An HTTP Client
+/// An HTTP client.
 ///
-/// ```rust
+/// ```rust,no_run
 /// use ntex::client::Client;
 ///
 /// #[ntex::main]
 /// async fn main() {
-///     let mut client = Client::new().await;
+///     let client = Client::new();
 ///
-///     let res = client.get("http://www.rust-lang.org") // <- Create request builder
-///         .header("User-Agent", "ntex::web")
-///         .send()                             // <- Send http request
-///         .await;                             // <- send request and wait for response
+///     let response = client
+///         .get("https://www.rust-lang.org")
+///         .header("User-Agent", "ntex")
+///         .send()
+///         .await;
 ///
-///      println!("Response: {:?}", res);
+///     println!("Response: {response:?}");
 /// }
 /// ```
+///
+/// # Shutdown
+///
+/// Clones of a client share its connection pools. A pool is stopped once the
+/// last clone and every request created from it are dropped, and dropping does
+/// not wait for connections to close:
+///
+/// - Requests waiting for a connection fail with
+///   [`ConnectError::Disconnected`].
+/// - Idle HTTP/1 connections are shut down in the background, bounded by the
+///   I/O [shutdown timeout](crate::io::IoConfig::set_shutdown_timeout).
+/// - HTTP/2 connections stop accepting requests and are closed gracefully in
+///   the background once their in-flight requests have completed. Their
+///   closing is not bounded by a timeout.
+/// - Responses that are still being read keep their connections. An HTTP/1
+///   connection is closed instead of being returned to the stopped pool.
+/// - A connection that is still being established is closed once the
+///   connect completes.
 #[derive(Debug, Clone)]
 pub struct Client {
-    svc: Pipeline<BoxedSender>,
-    config: ClientConfig,
+    cfg: Cfg<ClientConfig>,
+    svc: Rc<Pipeline<ServiceRequest, ServiceResponse, Error<error::ClientError>>>,
+}
+
+impl Default for Client {
+    fn default() -> Self {
+        Client::new()
+    }
 }
 
 impl Client {
-    /// Create new client instance with default settings.
-    pub async fn new() -> Client {
-        ClientBuilder::new()
-            .build(SharedCfg::default())
-            .await
-            .unwrap()
+    /// Creates a client with default settings.
+    pub fn new() -> Client {
+        ClientBuilder::new().build(SharedCfg::default())
     }
 
-    /// Build client instance.
+    /// Creates a client builder.
     pub fn builder() -> ClientBuilder {
         ClientBuilder::new()
     }
 
-    pub(crate) fn with_service(svc: Pipeline<BoxedSender>, config: ClientConfig) -> Self {
-        Client { svc, config }
+    /// Creates a client with shared service configuration.
+    pub fn with_config(cfg: impl Into<SharedCfg>) -> Client {
+        ClientBuilder::new().build(cfg.into())
     }
 
-    /// Returns when the client is ready to process requests.
-    pub async fn ready(&self) -> Result<(), error::ClientError> {
+    pub(crate) fn with_service(
+        cfg: Cfg<ClientConfig>,
+        svc: Pipeline<ServiceRequest, ServiceResponse, Error<error::ClientError>>,
+    ) -> Self {
+        Client {
+            cfg,
+            svc: Rc::new(svc),
+        }
+    }
+
+    /// Waits until the client is ready to process requests.
+    pub async fn ready(&self) -> Result<(), Error<error::ClientError>> {
         self.svc.ready().await
     }
 
-    /// Construct HTTP request.
+    /// Creates an HTTP request with the specified method and URL.
     pub fn request<U>(&self, method: Method, url: U) -> ClientRequest
     where
-        Uri: TryFrom<U>,
-        <Uri as TryFrom<U>>::Error: Into<HttpError>,
+        Url: TryFrom<U>,
+        <Url as TryFrom<U>>::Error: Into<InvalidUrl>,
     {
-        let mut req = ClientRequest::new(method, url, self.svc.clone());
-
-        for (key, value) in self.config.headers() {
+        let mut req = ClientRequest::new(method, url, self.cfg.clone(), self.svc.bind());
+        for (key, value) in self.cfg.headers() {
             req = req.set_header_if_none(key.clone(), value.clone());
         }
         req
     }
 
-    /// Create `ClientRequest` from `RequestHead`
+    /// Creates a [`ClientRequest`] from a [`RequestHead`].
     ///
-    /// It is useful for proxy requests. This implementation
-    /// copies all headers and the method.
+    /// This is useful for proxy requests. The method and headers are copied
+    /// from `head`; existing client default headers are not overwritten.
     pub fn request_from<U>(&self, url: U, head: &RequestHead) -> ClientRequest
     where
-        Uri: TryFrom<U>,
-        <Uri as TryFrom<U>>::Error: Into<HttpError>,
+        Url: TryFrom<U>,
+        <Url as TryFrom<U>>::Error: Into<InvalidUrl>,
     {
         let mut req = self.request(head.method.clone(), url);
         for (key, value) in &head.headers {
-            req = req.set_header_if_none(key.clone(), value.clone());
+            // every value of a multi-value header is copied
+            if !self.cfg.headers().contains_key(key) {
+                req.headers_mut().append(key.clone(), value.clone());
+            }
         }
         req
     }
@@ -130,8 +172,8 @@ impl Client {
     /// Construct HTTP *GET* request.
     pub fn get<U>(&self, url: U) -> ClientRequest
     where
-        Uri: TryFrom<U>,
-        <Uri as TryFrom<U>>::Error: Into<HttpError>,
+        Url: TryFrom<U>,
+        <Url as TryFrom<U>>::Error: Into<InvalidUrl>,
     {
         self.request(Method::GET, url)
     }
@@ -139,8 +181,8 @@ impl Client {
     /// Construct HTTP *HEAD* request.
     pub fn head<U>(&self, url: U) -> ClientRequest
     where
-        Uri: TryFrom<U>,
-        <Uri as TryFrom<U>>::Error: Into<HttpError>,
+        Url: TryFrom<U>,
+        <Url as TryFrom<U>>::Error: Into<InvalidUrl>,
     {
         self.request(Method::HEAD, url)
     }
@@ -148,8 +190,8 @@ impl Client {
     /// Construct HTTP *PUT* request.
     pub fn put<U>(&self, url: U) -> ClientRequest
     where
-        Uri: TryFrom<U>,
-        <Uri as TryFrom<U>>::Error: Into<HttpError>,
+        Url: TryFrom<U>,
+        <Url as TryFrom<U>>::Error: Into<InvalidUrl>,
     {
         self.request(Method::PUT, url)
     }
@@ -157,8 +199,8 @@ impl Client {
     /// Construct HTTP *POST* request.
     pub fn post<U>(&self, url: U) -> ClientRequest
     where
-        Uri: TryFrom<U>,
-        <Uri as TryFrom<U>>::Error: Into<HttpError>,
+        Url: TryFrom<U>,
+        <Url as TryFrom<U>>::Error: Into<InvalidUrl>,
     {
         self.request(Method::POST, url)
     }
@@ -166,8 +208,8 @@ impl Client {
     /// Construct HTTP *PATCH* request.
     pub fn patch<U>(&self, url: U) -> ClientRequest
     where
-        Uri: TryFrom<U>,
-        <Uri as TryFrom<U>>::Error: Into<HttpError>,
+        Url: TryFrom<U>,
+        <Url as TryFrom<U>>::Error: Into<InvalidUrl>,
     {
         self.request(Method::PATCH, url)
     }
@@ -175,17 +217,26 @@ impl Client {
     /// Construct HTTP *DELETE* request.
     pub fn delete<U>(&self, url: U) -> ClientRequest
     where
-        Uri: TryFrom<U>,
-        <Uri as TryFrom<U>>::Error: Into<HttpError>,
+        Url: TryFrom<U>,
+        <Url as TryFrom<U>>::Error: Into<InvalidUrl>,
     {
         self.request(Method::DELETE, url)
+    }
+
+    /// Construct HTTP *QUERY* request.
+    pub fn query<U>(&self, url: U) -> ClientRequest
+    where
+        Url: TryFrom<U>,
+        <Url as TryFrom<U>>::Error: Into<InvalidUrl>,
+    {
+        self.request(Method::QUERY, url)
     }
 
     /// Construct HTTP *OPTIONS* request.
     pub fn options<U>(&self, url: U) -> ClientRequest
     where
-        Uri: TryFrom<U>,
-        <Uri as TryFrom<U>>::Error: Into<HttpError>,
+        Url: TryFrom<U>,
+        <Url as TryFrom<U>>::Error: Into<InvalidUrl>,
     {
         self.request(Method::OPTIONS, url)
     }
@@ -196,4 +247,40 @@ pub(crate) struct ClientRawRequest {
     pub(crate) head: crate::http::Message<RequestHead>,
     pub(crate) headers: Option<HeaderMap>,
     pub(crate) size: BodySize,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::http::header::{self, HeaderValue};
+
+    #[crate::rt_test]
+    async fn request_from_head() {
+        let client = Client::builder().build(
+            SharedCfg::new("TEST").add(ClientConfig::new().set_header("x-default", "cfg").unwrap()),
+        );
+        let mut head = RequestHead {
+            method: Method::PATCH,
+            ..Default::default()
+        };
+        head.headers
+            .insert(header::ACCEPT, HeaderValue::from_static("text/html"));
+        head.headers
+            .append(header::ACCEPT, HeaderValue::from_static("text/plain"));
+        head.headers.insert(
+            "x-default".try_into().unwrap(),
+            HeaderValue::from_static("head"),
+        );
+
+        let req = client.request_from("http://localhost/", &head);
+        assert_eq!(req.get_method(), Method::PATCH);
+        let accept: Vec<_> = req.headers().get_all(header::ACCEPT).collect();
+        assert_eq!(accept, ["text/html", "text/plain"]);
+        // client default headers are not overwritten
+        let default: Vec<_> = req.headers().get_all("x-default").collect();
+        assert_eq!(default, ["cfg"]);
+
+        let req = Client::default().request_from("http://localhost/", &head);
+        assert_eq!(req.headers().get("x-default").unwrap(), "head");
+    }
 }

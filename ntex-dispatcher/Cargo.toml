@@ -1,16 +1,16 @@
 [package]
 name = "ntex-dispatcher"
-version = "3.2.0"
+version = "4.4.0"
 authors = ["ntex contributors <team@ntex.rs>"]
 description = "Utilities for abstracting io streams dispatcher"
 keywords = ["network", "framework", "async", "futures"]
 homepage = "https://ntex.rs"
 repository = "https://github.com/ntex-rs/ntex.git"
-documentation = "https://docs.rs/ntex-io/"
+documentation = "https://docs.rs/ntex-dispatcher/"
 categories = ["network-programming", "asynchronous"]
 license = "MIT OR Apache-2.0"
 edition = "2024"
-rust-version = "1.88"
+rust-version = "1.97"
 
 [lib]
 name = "ntex_dispatcher"
@@ -25,9 +25,7 @@ ntex-codec = { workspace = true }
 ntex-util = { workspace = true }
 ntex-service = { workspace = true }
 
-bitflags = { workspace = true }
 log = { workspace = true }
-pin-project-lite = { workspace = true }
 
 [dev-dependencies]
 ntex = { workspace = true }

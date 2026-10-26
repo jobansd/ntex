@@ -1,11 +1,8 @@
 //! Provides abstractions for working with bytes.
 //!
-//! The `ntex-bytes` crate provides an efficient byte buffer structure
-//! ([`Bytes`](struct.Bytes.html)) and traits for working with buffer
-//! implementations ([`Buf`], [`BufMut`]).
-//!
-//! [`Buf`]: trait.Buf.html
-//! [`BufMut`]: trait.BufMut.html
+//! The crate provides immutable [`Bytes`] and mutable [`BytesMut`] buffers,
+//! UTF-8 [`ByteString`] values, paged buffers through [`BytePages`], and the
+//! [`Buf`] and [`BufMut`] traits.
 //!
 //! # `Bytes`
 //!
@@ -18,8 +15,8 @@
 //! using a reference count to track when the memory is no longer needed and can
 //! be freed.
 //!
-//! A `Bytes` handle can be created directly from an existing `BytesMut` store
-//! is used first and written to. For example:
+//! A common pattern is to write into a [`BytesMut`] and extract immutable
+//! [`Bytes`] views:
 //!
 //! ```rust
 //! use ntex_bytes::{BytesMut, BufMut};
@@ -39,45 +36,72 @@
 //! assert_eq!(buf.capacity(), 998);
 //! ```
 //!
-//! In the above example, only a single buffer of 1024 is allocated. The handles
-//! `a` and `b` will share the underlying buffer and maintain indices tracking
-//! the view into the buffer represented by the handle.
+//! In this example, a single 1,024-byte allocation is reused. The `a` and `b`
+//! handles retain immutable views into that allocation, while `buf` continues
+//! using its remaining capacity.
 //!
-//! See the [struct docs] for more details.
+//! See [`Bytes`] and [`BytesMut`] for details about sharing, splitting, and
+//! allocation behavior.
 //!
-//! [struct docs]: struct.Bytes.html
+//! # Interoperability
 //!
+//! [`Bytes`] and [`BytesMut`] implement the [`Buf`](::bytes::Buf) trait of the
+//! `bytes` crate, and [`BytesMut`] also implements its
+//! [`BufMut`](::bytes::BufMut) trait. [`Bytes`] and [`ByteString`] implement
+//! `serde`'s `Serialize` and `Deserialize`.
+//!
+//! # Crate features
+//!
+//! - `simd` enables SIMD-accelerated UTF-8 validation.
 #![doc(html_root_url = "https://docs.rs/ntex-bytes/")]
+#![cfg_attr(docsrs, feature(doc_cfg))]
 #![deny(clippy::pedantic)]
 #![allow(
     unsafe_op_in_unsafe_fn,
-    clippy::must_use_candidate,
     clippy::cast_sign_loss,
     clippy::cast_possible_wrap,
-    clippy::cast_possible_truncation
+    clippy::cast_possible_truncation,
+    clippy::must_use_candidate,
+    clippy::unnecessary_wraps
 )]
 
 extern crate alloc;
+
+#[macro_use]
+mod macros;
 
 pub mod buf;
 pub use crate::buf::{Buf, BufMut};
 
 mod bvec;
 mod bytes;
+mod cache;
 mod debug;
 mod hex;
 mod pages;
 mod serde;
+mod size;
 mod storage;
 mod string;
+mod stvec;
+#[cfg(feature = "tracker")]
+mod tracker;
+
+mod stext;
+mod stext_arc;
 
 pub use crate::bvec::BytesMut;
 pub use crate::bytes::Bytes;
+pub use crate::cache::{PageCacheMetrics, PageCacheSnapshot, PageCacheStats};
 pub use crate::pages::{BytePage, BytePages};
+pub use crate::size::BytePageSize;
+pub use crate::stext::{StorageExt, StorageExtStr, StorageVTable};
 pub use crate::string::ByteString;
+#[cfg(feature = "tracker")]
+pub use crate::tracker::{BytesTracker, BytesTrackerSnapshot};
 
 #[doc(hidden)]
-pub use crate::storage::METADATA_SIZE;
+pub use crate::stvec::METADATA_SIZE;
 
 #[doc(hidden)]
 #[deprecated]
@@ -98,77 +122,46 @@ pub mod info {
         Inline,
         Static,
         Vec,
+        StExt,
+    }
+
+    /// Storage backing a [`BytePage`](crate::BytePage).
+    #[derive(Copy, Clone, Debug, Eq, PartialEq)]
+    pub enum PageKind {
+        /// Backed by `Bytes`, cloning shares the data.
+        Bytes,
+        /// Backed by `BytesMut` storage, cloning shares the data.
+        Storage,
+        /// Backed by `Vec<u8>`, cloning or splitting copies the data.
+        Vec,
     }
 }
 
-#[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
-pub enum BytePageSize {
-    Size4 = 0,
-    Size8 = 1,
-    #[default]
-    Size16 = 2,
-    Size24 = 3,
-    Size32 = 4,
-    Size48 = 5,
-    Size64 = 6,
-    Unset = 7,
-}
-
-impl BytePageSize {
-    pub const fn capacity(self) -> usize {
-        match self {
-            BytePageSize::Size4 => 4 * 1024,
-            BytePageSize::Size8 => 8 * 1024,
-            BytePageSize::Size16 => 16 * 1024,
-            BytePageSize::Size24 => 24 * 1024,
-            BytePageSize::Size32 => 32 * 1024,
-            BytePageSize::Size48 => 48 * 1024,
-            BytePageSize::Size64 | BytePageSize::Unset => 64 * 1024,
-        }
-    }
-
-    pub const fn half_capacity(self) -> usize {
-        match self {
-            BytePageSize::Size4 => 2 * 1024,
-            BytePageSize::Size8 => 4 * 1024,
-            BytePageSize::Size16 => 8 * 1024,
-            BytePageSize::Size24 => 12 * 1024,
-            BytePageSize::Size32
-            | BytePageSize::Size48
-            | BytePageSize::Size64
-            | BytePageSize::Unset => 16 * 1024,
-        }
-    }
-}
-
-/// Set pages cache size
+/// Sets the maximum number of cached page allocations for every page size
+/// on the current thread. Cached pages above the limit are released.
 ///
-/// Size is set for current thread
+/// This setting affects only the thread on which it is called.
+#[deprecated(
+    since = "1.11.0",
+    note = "the cache limit depends on the page size, use `set_page_cache_size()`"
+)]
 pub fn set_pages_cache(size: usize) {
-    self::storage::set_pages_cache(size);
+    self::cache::set_pages_cache(size);
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn page_size() {
-        assert_eq!(BytePageSize::Size4.capacity(), 4 * 1024);
-        assert_eq!(BytePageSize::Size8.capacity(), 8 * 1024);
-        assert_eq!(BytePageSize::Size16.capacity(), 16 * 1024);
-        assert_eq!(BytePageSize::Size24.capacity(), 24 * 1024);
-        assert_eq!(BytePageSize::Size32.capacity(), 32 * 1024);
-        assert_eq!(BytePageSize::Size48.capacity(), 48 * 1024);
-        assert_eq!(BytePageSize::Size64.capacity(), 64 * 1024);
-        assert_eq!(BytePageSize::Unset.capacity(), 64 * 1024);
-        assert_eq!(BytePageSize::Size4.half_capacity(), 2 * 1024);
-        assert_eq!(BytePageSize::Size8.half_capacity(), 4 * 1024);
-        assert_eq!(BytePageSize::Size16.half_capacity(), 8 * 1024);
-        assert_eq!(BytePageSize::Size24.half_capacity(), 12 * 1024);
-        assert_eq!(BytePageSize::Size32.half_capacity(), 16 * 1024);
-        assert_eq!(BytePageSize::Size48.half_capacity(), 16 * 1024);
-        assert_eq!(BytePageSize::Size64.half_capacity(), 16 * 1024);
-        assert_eq!(BytePageSize::Unset.half_capacity(), 16 * 1024);
-    }
+/// Sets the maximum number of cached page allocations of page size `size` on
+/// the current thread.
+///
+/// By default fewer pages are cached for larger page sizes:
+///
+/// | Page size | 4K  | 8K | 16K | 24K | 32K | 48K | 64K | 128K | 256K |
+/// |-----------|-----|----|-----|-----|-----|-----|-----|------|------|
+/// | Pages     | 128 | 64 | 64  | 32  | 16  | 8   | 16  | 2    | 1    |
+///
+/// Cached pages above the new limit are released. Buffers of
+/// [`BytePageSize::Unset`] are never cached, the call does nothing for it.
+///
+/// This setting affects only the thread on which it is called.
+pub fn set_page_cache_size(size: BytePageSize, count: usize) {
+    self::cache::set_page_cache_size(size, count);
 }

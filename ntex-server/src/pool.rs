@@ -1,18 +1,22 @@
 use ntex_util::time::Millis;
 
-use crate::{Server, ServerConfiguration};
+use crate::{Affinity, LoadBalancing, Server, ServerConfiguration, manager::ServerManager};
 
 const DEFAULT_SHUTDOWN_TIMEOUT: Millis = Millis::from_secs(30);
 
+#[allow(clippy::struct_excessive_bools)]
 #[derive(Debug, Clone)]
-/// Server builder
+/// Builder for a pool of server workers.
 pub struct WorkerPool {
     pub(crate) num: usize,
     pub(crate) name: String,
     pub(crate) no_signals: bool,
     pub(crate) stop_runtime: bool,
-    pub(crate) shutdown_timeout: Millis,
-    pub(crate) affinity: bool,
+    pub(crate) stop_on_panic: bool,
+    pub(crate) graceful_shutdown: bool,
+    pub(crate) graceful_shutdown_timeout: Millis,
+    pub(crate) affinity: Affinity,
+    pub(crate) balancing: LoadBalancing,
 }
 
 impl Default for WorkerPool {
@@ -23,84 +27,140 @@ impl Default for WorkerPool {
 
 impl WorkerPool {
     #[must_use]
-    /// Create new Server builder instance
+    /// Creates a worker pool with default settings.
     pub fn new() -> Self {
-        let num = core_affinity::get_core_ids().map_or_else(
-            || std::thread::available_parallelism().map_or(2, std::num::NonZeroUsize::get),
-            |v| v.len(),
-        );
+        let num = crate::affinity::cpu_count();
 
         WorkerPool {
             num,
             name: "ntex".to_string(),
             no_signals: false,
             stop_runtime: false,
-            shutdown_timeout: DEFAULT_SHUTDOWN_TIMEOUT,
-            affinity: false,
+            stop_on_panic: false,
+            graceful_shutdown: false,
+            graceful_shutdown_timeout: DEFAULT_SHUTDOWN_TIMEOUT,
+            affinity: Affinity::default(),
+            balancing: LoadBalancing::IncomingCpu,
         }
     }
 
     #[must_use]
-    /// Set workers name.
+    /// Sets the worker thread name prefix.
     ///
-    /// Name is used for worker thread name
+    /// The configured name is used for worker thread names.
     pub fn name<T: AsRef<str>>(mut self, name: T) -> Self {
         self.name = name.as_ref().to_string();
         self
     }
 
     #[must_use]
-    /// Set number of workers to start.
+    /// Sets the number of worker threads to start.
     ///
-    /// By default server uses number of available logical cpu as workers
-    /// count.
+    /// By default, the server uses the number of available logical CPUs.
     pub fn workers(mut self, num: usize) -> Self {
         self.num = num;
         self
     }
 
     #[must_use]
-    /// Stop current ntex runtime when manager get dropped.
+    /// Stops the current ntex runtime after the server has stopped.
     ///
-    /// By default "stop runtime" is disabled.
+    /// By default, "stop runtime" is disabled.
     pub fn stop_runtime(mut self) -> Self {
         self.stop_runtime = true;
         self
     }
 
     #[must_use]
-    /// Disable signal handling.
+    /// Stops the server when one of the workers fails.
     ///
-    /// By default signal handling is enabled.
+    /// A worker fails when it panics or its service cannot be created. The
+    /// stop is graceful only if [`graceful_shutdown`](Self::graceful_shutdown)
+    /// is enabled. Without this option, a failed worker is restarted.
+    ///
+    /// By default, "stop on panic" is disabled.
+    pub fn stop_on_panic(mut self) -> Self {
+        self.stop_on_panic = true;
+        self
+    }
+
+    #[must_use]
+    /// Disables signal handling.
+    ///
+    /// By default, the server stops on SIGINT, SIGTERM, and SIGQUIT.
     pub fn disable_signals(mut self) -> Self {
         self.no_signals = true;
         self
     }
 
     #[must_use]
-    /// Timeout for graceful workers shutdown.
+    /// Enables graceful shutdown on SIGQUIT, fatal signals, and panics.
     ///
-    /// After receiving a stop signal, workers have this much time to finish
-    /// serving requests. Workers still alive after the timeout are force
-    /// dropped.
+    /// When enabled, SIGQUIT, SIGSEGV, SIGABRT, application panics, and
+    /// worker failures with "stop on panic" stop the server gracefully.
+    /// SIGTERM always stops gracefully and SIGINT always stops immediately.
     ///
-    /// By default shutdown timeout sets to 30 seconds.
-    pub fn shutdown_timeout<T: Into<Millis>>(mut self, timeout: T) -> Self {
-        self.shutdown_timeout = timeout.into();
+    /// By default, these events stop the server immediately.
+    pub fn graceful_shutdown(mut self) -> Self {
+        self.graceful_shutdown = true;
         self
     }
 
     #[must_use]
-    /// Enable core affinity
+    /// Timeout for graceful worker shutdown.
     ///
-    /// By default affinity is disabled.
-    pub fn enable_affinity(mut self) -> Self {
-        self.affinity = true;
+    /// After receiving a stop signal, workers have this much time to finish
+    /// serving requests. Workers that are still alive after the timeout are
+    /// forcefully dropped.
+    ///
+    /// This bounds the worker as a whole, not an individual connection. Each
+    /// connection is bound separately by `IoConfig::set_shutdown_timeout`, so
+    /// this value should leave room for the connections a worker is still
+    /// draining to shut down themselves.
+    ///
+    /// By default, the timeout is set to 30 seconds.
+    pub fn graceful_shutdown_timeout<T: Into<Millis>>(mut self, timeout: T) -> Self {
+        self.graceful_shutdown_timeout = timeout.into();
         self
     }
 
-    /// Starts processing incoming items and return server controller.
+    #[must_use]
+    #[deprecated(
+        since = "4.3.0",
+        note = "affinity is enabled by default, use `affinity()` to change it"
+    )]
+    /// Does nothing, affinity is enabled by default.
+    pub fn enable_affinity(self) -> Self {
+        self
+    }
+
+    #[must_use]
+    /// Sets the CPU affinity of worker threads.
+    ///
+    /// Workers are spread over physical cores first, see [`Affinity`].
+    ///
+    /// By default, [`Affinity::Soft`] is used on Windows and
+    /// [`Affinity::Core`] on other platforms.
+    pub fn affinity(mut self, affinity: Affinity) -> Self {
+        self.affinity = affinity;
+        self
+    }
+
+    #[must_use]
+    /// Sets how items are distributed between workers.
+    ///
+    /// By default, [`LoadBalancing::IncomingCpu`] sends new items to idle
+    /// workers, which helps when connections are long-lived or their load is
+    /// uneven, and prefers the worker on the CPU that receives a connection's
+    /// network packets. [`LoadBalancing::RoundRobin`] sends them to the
+    /// workers in turn.
+    pub fn load_balancing(mut self, balancing: LoadBalancing) -> Self {
+        self.balancing = balancing;
+        self
+    }
+
+    /// Starts processing incoming items and returns a server controller.
     pub fn run<F: ServerConfiguration>(self, factory: F) -> Server<F::Item> {
-        crate::manager::ServerManager::start(self, factory)
+        ServerManager::start(self, factory)
     }
 }

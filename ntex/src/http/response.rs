@@ -1,5 +1,5 @@
 //! Http response
-use std::{cell::Ref, cell::RefMut, error::Error, fmt, str};
+use std::{cell::Ref, cell::RefMut, error::Error, fmt, fmt::Write, str};
 
 use serde::Serialize;
 
@@ -13,22 +13,22 @@ use crate::http::header::{self, HeaderMap, HeaderName, HeaderValue};
 use crate::http::message::{ConnectionType, Message, ResponseHead};
 use crate::util::{Bytes, BytesMut, Extensions, Stream};
 
-/// An HTTP Response
+/// An HTTP response.
 pub struct Response<B = Body> {
     body: ResponseBody<B>,
     head: Message<ResponseHead>,
 }
 
 impl Response<Body> {
-    /// Create http response builder with specific status.
+    /// Creates a response builder with the given status.
     #[inline]
-    pub fn build(status: StatusCode) -> ResponseBuilder {
+    pub fn builder(status: StatusCode) -> ResponseBuilder {
         ResponseBuilder::new(status)
     }
 
-    /// Create http response builder.
+    /// Creates a response builder from another compatible value.
     #[inline]
-    pub fn build_from<T: Into<ResponseBuilder>>(source: T) -> ResponseBuilder {
+    pub fn builder_from<T: Into<ResponseBuilder>>(source: T) -> ResponseBuilder {
         source.into()
     }
 
@@ -41,7 +41,20 @@ impl Response<Body> {
         }
     }
 
-    /// Convert response to response with body.
+    /// Renders a displayable value as a plain-text response body.
+    #[inline]
+    pub fn render_with<B: fmt::Display>(status: StatusCode, body: &B) -> Response {
+        let mut resp = Response::new(status);
+        let mut buf = BytesMut::new();
+        let _ = write!(&mut buf, "{body}");
+        resp.headers_mut().insert(
+            header::CONTENT_TYPE,
+            header::HeaderValue::from_static("text/plain; charset=utf-8"),
+        );
+        resp.set_body(Body::from(buf))
+    }
+
+    /// Converts the default body into a custom response body type.
     pub fn into_body<B>(self) -> Response<B> {
         let b = match self.body {
             ResponseBody::Body(b) | ResponseBody::Other(b) => b,
@@ -54,7 +67,7 @@ impl Response<Body> {
 }
 
 impl<B> Response<B> {
-    /// Constructs a response with body.
+    /// Creates a response with the given status and body.
     #[inline]
     pub fn with_body(status: StatusCode, body: B) -> Response<B> {
         Response {
@@ -64,36 +77,36 @@ impl<B> Response<B> {
     }
 
     #[inline]
-    /// Http message part of the response.
+    /// Returns the response head.
     pub fn head(&self) -> &ResponseHead {
         &self.head
     }
 
     #[inline]
-    /// Mutable reference to a http message part of the response.
+    /// Returns mutable access to the response head.
     pub fn head_mut(&mut self) -> &mut ResponseHead {
         &mut self.head
     }
 
-    /// Get the response status code.
+    /// Returns the response status code.
     #[inline]
     pub fn status(&self) -> StatusCode {
         self.head.status
     }
 
-    /// Set the `StatusCode` for this response.
+    /// Returns mutable access to the response status code.
     #[inline]
     pub fn status_mut(&mut self) -> &mut StatusCode {
         &mut self.head.status
     }
 
-    /// Get the headers from the response.
+    /// Returns the response headers.
     #[inline]
     pub fn headers(&self) -> &HeaderMap {
         &self.head.headers
     }
 
-    /// Get a mutable reference to the headers.
+    /// Returns mutable access to the response headers.
     #[inline]
     pub fn headers_mut(&mut self) -> &mut HeaderMap {
         &mut self.head.headers
@@ -162,25 +175,25 @@ impl<B> Response<B> {
         self.head.keep_alive()
     }
 
-    /// Responses extensions.
+    /// Returns the response extensions.
     #[inline]
     pub fn extensions(&self) -> Ref<'_, Extensions> {
         self.head.extensions.borrow()
     }
 
-    /// Mutable reference to a the response's extensions.
+    /// Returns mutable access to the response extensions.
     #[inline]
     pub fn extensions_mut(&self) -> RefMut<'_, Extensions> {
         self.head.extensions.borrow_mut()
     }
 
-    /// Get body of this response.
+    /// Returns the response body.
     #[inline]
     pub fn body(&self) -> &ResponseBody<B> {
         &self.body
     }
 
-    /// Set a body.
+    /// Replaces the response body with a different body type.
     pub fn set_body<B2>(self, body: B2) -> Response<B2> {
         Response {
             head: self.head,
@@ -188,7 +201,7 @@ impl<B> Response<B> {
         }
     }
 
-    /// Split response and body.
+    /// Splits the response into its metadata and body.
     pub fn into_parts(self) -> (Response<()>, ResponseBody<B>) {
         (
             Response {
@@ -199,7 +212,7 @@ impl<B> Response<B> {
         )
     }
 
-    /// Drop request's body.
+    /// Drops the response body while preserving the response head.
     pub fn drop_body(self) -> Response<()> {
         Response {
             head: self.head,
@@ -207,7 +220,7 @@ impl<B> Response<B> {
         }
     }
 
-    /// Set a body and return previous body value.
+    /// Transforms the response body and allows its metadata to be updated.
     pub fn map_body<F, B2>(mut self, f: F) -> Response<B2>
     where
         F: FnOnce(&mut ResponseHead, ResponseBody<B>) -> ResponseBody<B2>,
@@ -220,7 +233,7 @@ impl<B> Response<B> {
         }
     }
 
-    /// Extract response body.
+    /// Takes the response body, leaving an empty body behind.
     pub fn take_body(&mut self) -> ResponseBody<B> {
         self.body.take_body()
     }
@@ -233,6 +246,33 @@ impl Response<Body> {
             ResponseBody::Body(ref b) | ResponseBody::Other(ref b) => b,
         };
         if let Body::Bytes(bin) = b { bin } else { panic!() }
+    }
+}
+
+impl Response<Body> {
+    #[must_use]
+    /// Takes the response body while preserving its metadata.
+    ///
+    /// The returned response contains the original body and a copy of the
+    /// response head without its extensions. This response is left with an
+    /// empty body, both responses can be modified independently.
+    pub fn take(&mut self) -> Response {
+        Response {
+            head: self.head.copy(),
+            body: self.body.take_body(),
+        }
+    }
+}
+
+impl<B: MessageBody> fmt::Display for Response<B> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        writeln!(
+            f,
+            "Response<{:?} {}{}>",
+            self.head.version,
+            self.head.status,
+            self.head.reason.unwrap_or(""),
+        )
     }
 }
 
@@ -256,6 +296,9 @@ impl<B: MessageBody> fmt::Debug for Response<B> {
 
 #[cfg(feature = "cookie")]
 #[derive(Debug)]
+/// Iterator over valid `Set-Cookie` header values in a response.
+///
+/// Malformed header values are skipped.
 pub struct CookieIter<'a> {
     iter: header::GetAll<'a>,
 }
@@ -279,6 +322,13 @@ impl<'a> Iterator for CookieIter<'a> {
 ///
 /// This type can be used to construct an instance of `Response` through a
 /// builder-like pattern.
+///
+/// Header conversion errors are stored by the builder. A later call to
+/// [`ResponseBuilder::body`], [`ResponseBuilder::message_body`],
+/// [`ResponseBuilder::streaming`], [`ResponseBuilder::json`], or
+/// [`ResponseBuilder::build`] converts the stored error into an error response.
+/// After an error is stored, subsequent configuration does not affect the
+/// returned response.
 pub struct ResponseBuilder {
     head: Option<Message<ResponseHead>>,
     err: Option<HttpError>,
@@ -289,7 +339,7 @@ pub struct ResponseBuilder {
 impl ResponseBuilder {
     #[inline]
     #[must_use]
-    /// Create response builder
+    /// Creates a response builder with the supplied status.
     pub fn new(status: StatusCode) -> Self {
         ResponseBuilder {
             head: Some(Message::with_status(status)),
@@ -299,7 +349,7 @@ impl ResponseBuilder {
         }
     }
 
-    /// Set HTTP status code of this response.
+    /// Sets the response status code.
     #[inline]
     pub fn status(&mut self, status: StatusCode) -> &mut Self {
         if let Some(parts) = parts(&mut self.head, self.err) {
@@ -317,7 +367,7 @@ impl ResponseBuilder {
     ///     Response::Ok()
     ///         .header("X-TEST", "value")
     ///         .header(header::CONTENT_TYPE, "application/json")
-    ///         .finish()
+    ///         .build()
     /// }
     /// ```
     pub fn header<K, V>(&mut self, key: K, value: V) -> &mut Self
@@ -341,7 +391,7 @@ impl ResponseBuilder {
         self
     }
 
-    /// Set a header.
+    /// Sets a header, replacing any existing values with the same name.
     ///
     /// ```rust
     /// use ntex::http::{header, Request, Response};
@@ -350,7 +400,7 @@ impl ResponseBuilder {
     ///     Response::Ok()
     ///         .set_header("X-TEST", "value")
     ///         .set_header(header::CONTENT_TYPE, "application/json")
-    ///         .finish()
+    ///         .build()
     /// }
     /// ```
     pub fn set_header<K, V>(&mut self, key: K, value: V) -> &mut Self
@@ -374,7 +424,7 @@ impl ResponseBuilder {
         self
     }
 
-    /// Set the custom reason for the response.
+    /// Sets a custom HTTP/1 reason phrase.
     #[inline]
     pub fn reason(&mut self, reason: &'static str) -> &mut Self {
         if let Some(parts) = parts(&mut self.head, self.err) {
@@ -383,7 +433,10 @@ impl ResponseBuilder {
         self
     }
 
-    /// Set connection type to `KeepAlive`
+    /// Marks the response connection as persistent.
+    ///
+    /// Has no effect if the response connection is already marked to be
+    /// closed, see [`ResponseHead::set_connection_type()`].
     #[inline]
     pub fn keep_alive(&mut self) -> &mut Self {
         if let Some(parts) = parts(&mut self.head, self.err) {
@@ -392,7 +445,7 @@ impl ResponseBuilder {
         self
     }
 
-    /// Set connection type to `Upgrade`
+    /// Marks the connection as upgraded and sets the `Upgrade` header.
     #[inline]
     pub fn upgrade<V>(&mut self, value: V) -> &mut Self
     where
@@ -405,7 +458,7 @@ impl ResponseBuilder {
         self.set_header(header::UPGRADE, value)
     }
 
-    /// Force close connection, even if it is marked as keep-alive
+    /// Forces the connection to close after this response.
     #[inline]
     pub fn force_close(&mut self) -> &mut Self {
         if let Some(parts) = parts(&mut self.head, self.err) {
@@ -423,7 +476,7 @@ impl ResponseBuilder {
         self
     }
 
-    /// Set response content type.
+    /// Sets the `Content-Type` header.
     #[inline]
     pub fn content_type<V>(&mut self, value: V) -> &mut Self
     where
@@ -441,7 +494,7 @@ impl ResponseBuilder {
         self
     }
 
-    /// Set content length.
+    /// Appends a `Content-Length` header.
     #[inline]
     pub fn content_length(&mut self, len: u64) -> &mut Self {
         self.header(header::CONTENT_LENGTH, len)
@@ -463,7 +516,7 @@ impl ResponseBuilder {
     ///                 .secure(true)
     ///                 .http_only(true)
     ///         )
-    ///         .finish()
+    ///         .build()
     /// }
     /// ```
     pub fn cookie<C>(&mut self, cookie: C) -> &mut Self
@@ -493,7 +546,7 @@ impl ResponseBuilder {
     ///         builder.del_cookie(cookie);
     ///     }
     ///
-    ///     builder.finish()
+    ///     builder.build()
     /// }
     /// ```
     pub fn del_cookie(&mut self, cookie: &Cookie<'_>) -> &mut Self {
@@ -507,14 +560,22 @@ impl ResponseBuilder {
         self
     }
 
-    /// Responses extensions.
+    /// Returns the response extensions.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the builder has already produced or transferred a response.
     #[inline]
     pub fn extensions(&self) -> Ref<'_, Extensions> {
         let head = self.head.as_ref().expect("cannot reuse response builder");
         head.extensions.borrow()
     }
 
-    /// Mutable reference to a the response's extensions.
+    /// Returns mutable access to the response extensions.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the builder has already produced or transferred a response.
     #[inline]
     pub fn extensions_mut(&self) -> RefMut<'_, Extensions> {
         let head = self.head.as_ref().expect("cannot reuse response builder");
@@ -522,16 +583,20 @@ impl ResponseBuilder {
     }
 
     #[inline]
-    /// Set a body and generate `Response`.
+    /// Sets a body and creates the response.
     ///
-    /// `ResponseBuilder` can not be used after this call.
+    /// # Panics
+    ///
+    /// Panics if the builder has already produced or transferred a response.
     pub fn body<B: Into<Body>>(&mut self, body: B) -> Response {
         self.message_body(body.into())
     }
 
-    /// Set a body and generate `Response`.
+    /// Sets a typed body and creates the response.
     ///
-    /// `ResponseBuilder` can not be used after this call.
+    /// # Panics
+    ///
+    /// Panics if the builder has already produced or transferred a response.
     pub fn message_body<B>(&mut self, body: B) -> Response<B> {
         if let Some(e) = self.err.take() {
             return Response::from(e).into_body();
@@ -560,9 +625,11 @@ impl ResponseBuilder {
 
     #[inline]
     #[must_use]
-    /// Set a streaming body and generate `Response`.
+    /// Sets a streaming body and creates the response.
     ///
-    /// `ResponseBuilder` can not be used after this call.
+    /// # Panics
+    ///
+    /// Panics if the builder has already produced or transferred a response.
     pub fn streaming<S, E>(&mut self, stream: S) -> Response
     where
         S: Stream<Item = Result<Bytes, E>> + Unpin + 'static,
@@ -572,11 +639,18 @@ impl ResponseBuilder {
     }
 
     #[must_use]
-    /// Set a json body and generate `Response`.
+    /// Serializes `value` as JSON and creates the response.
     ///
-    /// `ResponseBuilder` can not be used after this call.
+    /// Sets `Content-Type: application/json` unless a content type is already
+    /// present. If serialization fails, the serialization error is converted
+    /// into an HTTP error response.
+    ///
+    /// # Panics
+    ///
+    /// Panics if serialization succeeds after the builder has already
+    /// produced or transferred a response.
     pub fn json<T: Serialize>(&mut self, value: &T) -> Response {
-        match serde_json::to_string(value) {
+        match super::helpers::json_body(value) {
             Ok(body) => {
                 let contains = if let Some(parts) = parts(&mut self.head, self.err) {
                     parts.headers.contains_key(header::CONTENT_TYPE)
@@ -595,15 +669,19 @@ impl ResponseBuilder {
 
     #[inline]
     #[must_use]
-    /// Set an empty body and generate `Response`.
+    /// Creates the response with an empty body.
     ///
-    /// `ResponseBuilder` can not be used after this call.
-    pub fn finish(&mut self) -> Response {
+    /// # Panics
+    ///
+    /// Panics if the builder has already produced or transferred a response.
+    pub fn build(&mut self) -> Response {
         self.body(Body::Empty)
     }
 
     #[must_use]
-    /// This method construct new `ResponseBuilder`
+    /// Transfers the builder state into a new builder.
+    ///
+    /// The current builder is left consumed and cannot produce a response.
     pub fn take(&mut self) -> ResponseBuilder {
         ResponseBuilder {
             head: self.head.take(),
@@ -744,7 +822,7 @@ where
 
 impl From<ResponseBuilder> for Response {
     fn from(mut builder: ResponseBuilder) -> Self {
-        builder.finish()
+        builder.build()
     }
 }
 
@@ -796,17 +874,45 @@ impl From<BytesMut> for Response {
     }
 }
 
+impl<B: MessageBody> Error for Response<B> {}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::http::header::{CONTENT_TYPE, COOKIE};
 
     #[test]
+    fn test_take_copies_head() {
+        let mut resp = Response::NotFound()
+            .header(CONTENT_TYPE, "text/plain")
+            .reason("Nope")
+            .body("body");
+        resp.extensions_mut().insert(1u8);
+
+        let mut taken = resp.take();
+        assert_eq!(taken.status(), StatusCode::NOT_FOUND);
+        assert_eq!(taken.head().reason, Some("Nope"));
+        assert_eq!(taken.headers().get(CONTENT_TYPE).unwrap(), "text/plain");
+        assert_eq!(taken.get_body_ref(), b"body");
+        assert!(taken.extensions().get::<u8>().is_none());
+
+        // both responses can be modified
+        *taken.status_mut() = StatusCode::OK;
+        taken.headers_mut().remove(CONTENT_TYPE);
+        resp.headers_mut()
+            .insert(COOKIE, HeaderValue::from_static("a=b"));
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+        assert!(resp.headers().contains_key(CONTENT_TYPE));
+        assert!(!taken.headers().contains_key(COOKIE));
+        assert_eq!(resp.extensions().get::<u8>(), Some(&1));
+    }
+
+    #[test]
     fn test_debug() {
         let resp = Response::Ok()
             .header(COOKIE, HeaderValue::from_static("cookie1=value1; "))
             .header(COOKIE, HeaderValue::from_static("cookie2=value2; "))
-            .finish();
+            .build();
         let dbg = format!("{resp:?}");
         assert!(dbg.contains("Response"));
         let dbg = format!("{:?}", resp.head());
@@ -828,7 +934,7 @@ mod tests {
         let req = crate::http::test::TestRequest::default()
             .header(COOKIE, "cookie1=value1")
             .header(COOKIE, "cookie2=value2")
-            .finish();
+            .build();
         let cookies = req.cookies().unwrap();
 
         let resp = Response::Ok()
@@ -840,7 +946,7 @@ mod tests {
                     .max_age(time::Duration::days(1)),
             )
             .del_cookie(&cookies[0])
-            .finish();
+            .build();
 
         let mut val: Vec<_> = resp
             .headers()
@@ -860,7 +966,7 @@ mod tests {
     fn test_update_response_cookies() {
         let mut r = Response::Ok()
             .cookie(coo_kie::Cookie::new("original", "val100"))
-            .finish();
+            .build();
 
         r.add_cookie(coo_kie::Cookie::new("cookie2", "val200"))
             .unwrap();
@@ -881,15 +987,15 @@ mod tests {
 
     #[test]
     fn test_basic_builder() {
-        let resp = Response::Ok().header("X-TEST", "value").finish();
+        let resp = Response::Ok().header("X-TEST", "value").build();
         assert_eq!(resp.status(), StatusCode::OK);
     }
 
     #[test]
     fn test_upgrade() {
-        let resp = Response::build(StatusCode::OK)
+        let resp = Response::builder(StatusCode::OK)
             .upgrade("websocket")
-            .finish();
+            .build();
         assert!(resp.upgrade());
         assert_eq!(
             resp.headers().get(header::UPGRADE).unwrap(),
@@ -899,13 +1005,13 @@ mod tests {
 
     #[test]
     fn test_force_close() {
-        let resp = Response::build(StatusCode::OK).force_close().finish();
+        let resp = Response::builder(StatusCode::OK).force_close().build();
         assert!(!resp.keep_alive());
     }
 
     #[test]
     fn test_content_type() {
-        let resp = Response::build(StatusCode::OK)
+        let resp = Response::builder(StatusCode::OK)
             .content_type("text/plain")
             .body(Body::Empty);
         assert_eq!(resp.headers().get(CONTENT_TYPE).unwrap(), "text/plain");
@@ -913,7 +1019,7 @@ mod tests {
 
     #[test]
     fn test_json() {
-        let resp = Response::build(StatusCode::OK).json(&vec!["v1", "v2", "v3"]);
+        let resp = Response::builder(StatusCode::OK).json(&vec!["v1", "v2", "v3"]);
         let ct = resp.headers().get(CONTENT_TYPE).unwrap();
         assert_eq!(ct, HeaderValue::from_static("application/json"));
         assert_eq!(resp.get_body_ref(), b"[\"v1\",\"v2\",\"v3\"]");
@@ -921,7 +1027,7 @@ mod tests {
 
     #[test]
     fn test_json_ct() {
-        let resp = Response::build(StatusCode::OK)
+        let resp = Response::builder(StatusCode::OK)
             .header(CONTENT_TYPE, "text/json")
             .json(&vec!["v1", "v2", "v3"]);
         let ct = resp.headers().get(CONTENT_TYPE).unwrap();
@@ -998,7 +1104,7 @@ mod tests {
         assert_eq!(resp.status(), StatusCode::OK);
         assert_eq!(resp.get_body_ref(), b"test");
 
-        let builder = Response::build_from(ResponseBuilder::new(StatusCode::OK))
+        let builder = Response::builder_from(ResponseBuilder::new(StatusCode::OK))
             .keep_alive()
             .take();
         let _ = builder.extensions();
@@ -1018,7 +1124,7 @@ mod tests {
         let (resp, _) = resp.into_parts();
 
         let mut builder: ResponseBuilder = resp.head().into();
-        let resp = builder.status(StatusCode::BAD_REQUEST).finish();
+        let resp = builder.status(StatusCode::BAD_REQUEST).build();
         assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
 
         #[cfg(feature = "cookie")]
@@ -1028,7 +1134,7 @@ mod tests {
         }
 
         let mut builder: ResponseBuilder = resp.into();
-        let resp = builder.status(StatusCode::BAD_REQUEST).finish();
+        let resp = builder.status(StatusCode::BAD_REQUEST).build();
         assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
 
         #[cfg(feature = "cookie")]
@@ -1036,5 +1142,63 @@ mod tests {
             let cookie = resp.cookies().next().unwrap();
             assert_eq!((cookie.name(), cookie.value()), ("cookie1", "val100"));
         }
+    }
+
+    #[test]
+    fn test_display() {
+        let resp = Response::NotFound().reason(" Nope").build();
+        assert_eq!(resp.to_string(), "Response<HTTP/1.1 404 Not Found Nope>\n");
+    }
+
+    #[test]
+    fn test_builder_invalid_headers() {
+        let resp = Response::Ok().header("bad name", "value").build();
+        assert_eq!(resp.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        let resp = Response::Ok().header("x-name", "bad\nvalue").build();
+        assert_eq!(resp.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        let resp = Response::Ok().set_header("bad name", "value").build();
+        assert_eq!(resp.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        let resp = Response::Ok().set_header("x-name", "bad\nvalue").build();
+        assert_eq!(resp.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        let resp = Response::Ok().content_type("bad\nvalue").build();
+        assert_eq!(resp.status(), StatusCode::INTERNAL_SERVER_ERROR);
+
+        // json does not replace the error
+        let resp = Response::Ok().header("bad name", "value").json(&vec![1, 2]);
+        assert_eq!(resp.status(), StatusCode::INTERNAL_SERVER_ERROR);
+    }
+
+    #[test]
+    fn test_json_error() {
+        let mut map = std::collections::HashMap::new();
+        map.insert(vec![1u8], 1);
+        let resp = Response::Ok().json(&map);
+        assert_eq!(resp.status(), StatusCode::INTERNAL_SERVER_ERROR);
+    }
+
+    #[cfg(feature = "cookie")]
+    #[test]
+    fn test_cookies() {
+        let cookie = Cookie::new("name", "value");
+        let resp = Response::Ok().del_cookie(&cookie).build();
+        let c = resp.cookies().next().unwrap();
+        assert_eq!(c.name(), "name");
+        assert_eq!(c.value(), "");
+
+        let resp = Response::Ok()
+            .cookie(Cookie::new("name", "bad\nvalue"))
+            .build();
+        assert_eq!(resp.status(), StatusCode::INTERNAL_SERVER_ERROR);
+
+        let resp = Response::Ok()
+            .cookie(Cookie::new("c1", "v1"))
+            .cookie(Cookie::new("c2", "v2"))
+            .build();
+        let mut builder = ResponseBuilder::from(resp.head());
+        let resp2 = builder.build();
+        assert_eq!(resp2.cookies().count(), 2);
+        let mut builder = ResponseBuilder::from(resp);
+        let resp3 = builder.build();
+        assert_eq!(resp3.cookies().count(), 2);
     }
 }

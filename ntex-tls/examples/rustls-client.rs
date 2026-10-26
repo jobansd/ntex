@@ -1,7 +1,8 @@
 use std::{io, sync::Arc};
 
+use ntex::io::types::PeerAddr;
 use ntex::util::{Bytes, Either};
-use ntex::{Pipeline, ServiceFactory, SharedCfg, codec, connect, io::types::PeerAddr};
+use ntex::{Pipeline, SharedCfg, codec, connect};
 use ntex_tls::TlsConfig;
 use tls_rustls::ClientConfig;
 use tls_rustls::pki_types::{CertificateDer, ServerName, UnixTime};
@@ -17,21 +18,15 @@ async fn main() -> io::Result<()> {
         .with_no_client_auth();
 
     // rustls connector
-    let connector = Pipeline::new(
-        connect::rustls::TlsConnector::new(config.clone())
-            .create(
-                SharedCfg::new("CLIENT")
-                    .add(TlsConfig::new().set_handshake_timeout(10))
-                    .into(),
-            )
-            .await
-            .unwrap(),
-    );
+    let cfg = SharedCfg::new("CLIENT")
+        .add(TlsConfig::new().set_handshake_timeout(10))
+        .build();
 
-    //let io = connector.call("www.rust-lang.org:443").await.unwrap();
+    let connector = Pipeline::new(cfg, connect::rustls::TlsConnector::new(config));
+
     let io = connector.call("127.0.0.1:8443".into()).await.unwrap();
     println!("Connected to tls server {:?}", io.query::<PeerAddr>().get());
-    io.send(Bytes::from_static(b"GET /\r\n\r\n"), &codec::BytesCodec)
+    io.send(Bytes::from_static(b"hello"), &codec::BytesCodec)
         .await
         .map_err(Either::into_inner)?;
 
@@ -66,8 +61,7 @@ impl tls_rustls::client::danger::ServerCertVerifier for NoCertificateVerificatio
         _message: &[u8],
         _cert: &CertificateDer<'_>,
         _dss: &tls_rustls::DigitallySignedStruct,
-    ) -> Result<tls_rustls::client::danger::HandshakeSignatureValid, tls_rustls::Error>
-    {
+    ) -> Result<tls_rustls::client::danger::HandshakeSignatureValid, tls_rustls::Error> {
         Ok(tls_rustls::client::danger::HandshakeSignatureValid::assertion())
     }
 
@@ -76,8 +70,7 @@ impl tls_rustls::client::danger::ServerCertVerifier for NoCertificateVerificatio
         _message: &[u8],
         _cert: &CertificateDer<'_>,
         _dss: &tls_rustls::DigitallySignedStruct,
-    ) -> Result<tls_rustls::client::danger::HandshakeSignatureValid, tls_rustls::Error>
-    {
+    ) -> Result<tls_rustls::client::danger::HandshakeSignatureValid, tls_rustls::Error> {
         Ok(tls_rustls::client::danger::HandshakeSignatureValid::assertion())
     }
 

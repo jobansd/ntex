@@ -1,4 +1,3 @@
-#![allow(deprecated)]
 use std::sync::{Arc, atomic::AtomicUsize, atomic::Ordering};
 use std::{sync::mpsc, thread};
 
@@ -20,15 +19,11 @@ async fn test_join_handle() {
     let (tx, rx) = oneshot::channel();
 
     thread::spawn(move || {
-        let runner = crate::System::build()
-            .stop_on_panic(true)
-            .build(ntex::rt::DefaultRuntime);
+        let runner = crate::System::build().build(ntex::rt::DefaultRuntime);
         let result = runner.block_on(f).unwrap();
         assert_eq!(result, "test");
 
-        let runner = crate::System::build()
-            .stop_on_panic(true)
-            .build(ntex::rt::DefaultRuntime);
+        let runner = crate::System::build().build(ntex::rt::DefaultRuntime);
         let result = runner.block_on(hnd.spawn(async { "test2" })).unwrap();
         let _ = tx.send(result);
     });
@@ -44,9 +39,7 @@ fn test_async() {
     let (tx, rx) = mpsc::channel();
 
     thread::spawn(move || {
-        let runner = crate::System::build()
-            .stop_on_panic(true)
-            .build(ntex::rt::DefaultRuntime);
+        let runner = crate::System::build().build(ntex::rt::DefaultRuntime);
 
         let _ = runner.run(move || {
             tx.send(System::current()).unwrap();
@@ -58,7 +51,7 @@ fn test_async() {
     let sys = rx.recv().unwrap();
     let id = sys.id();
     let (tx, rx) = mpsc::channel();
-    sys.arbiter().exec_fn(move || {
+    sys.handle().spawn(async move {
         let _ = tx.send(System::current().id());
     });
     let id2 = rx.recv().unwrap();
@@ -79,12 +72,12 @@ fn test_async() {
     assert_eq!(id, id2);
 
     let id2 = s
-        .block_on(sys.arbiter().exec(|| System::current().id()))
+        .block_on(sys.handle().spawn(async { System::current().id() }))
         .unwrap();
     assert_eq!(id, id2);
 
     let (tx, rx) = mpsc::channel();
-    sys.arbiter().spawn(Box::pin(async move {
+    sys.handle().spawn(Box::pin(async move {
         let _ = tx.send(System::current().id());
     }));
     let id2 = rx.recv().unwrap();
@@ -99,20 +92,21 @@ fn test_block_on() {
     struct Custom;
 
     impl ntex::rt::Runner for Custom {
-        fn block_on(&self, fut: ntex::rt::BlockFuture) {
+        fn block_on(
+            &self,
+            fut: ntex::rt::BlockFuture,
+        ) -> Result<(), Box<dyn std::any::Any + Send>> {
             let rt = ntex::rt::tokio::internal::runtime::Builder::new_current_thread()
                 .enable_all()
                 .build()
                 .unwrap();
             ntex::rt::tokio::internal::task::LocalSet::new().block_on(&rt, fut);
+            Ok(())
         }
     }
 
     thread::spawn(move || {
-        let runner = crate::System::build()
-            .stop_on_panic(true)
-            .ping_interval(25)
-            .build(Custom);
+        let runner = crate::System::build().ping_interval(25).build(Custom);
 
         let _ = runner.run(move || {
             tx.send(System::current()).unwrap();
@@ -124,25 +118,21 @@ fn test_block_on() {
     let sys = rx.recv().unwrap();
     let id = sys.id();
     let (tx, rx) = mpsc::channel();
-    sys.arbiter().exec_fn(move || {
+    sys.arbiter().handle().spawn(async move {
         let _ = tx.send(System::current().id());
     });
     let id2 = rx.recv().unwrap();
     assert_eq!(id, id2);
 
     let id2 = s
-        .block_on(sys.arbiter().exec(|| System::current().id()))
+        .block_on(sys.handle().spawn(async { System::current().id() }))
         .unwrap();
     assert_eq!(id, id2);
 
     let (tx, rx) = mpsc::channel();
-    sys.arbiter().spawn(async move {
+    sys.handle().spawn(async move {
         ntex::time::sleep(std::time::Duration::from_millis(100)).await;
-
-        let recs = System::list_arbiter_pings(Arbiter::current().id(), |recs| {
-            recs.unwrap().clone()
-        });
-        let _ = tx.send(recs);
+        System::list_arbiter_pings(|_, recs| tx.send(recs.clone()).unwrap());
     });
     let recs = rx.recv().unwrap();
 
@@ -153,9 +143,6 @@ fn test_block_on() {
 #[test]
 fn test_arbiter_local_storage() {
     let _s = System::new("test", ntex::rt::DefaultRuntime);
-    Arbiter::set_item("test");
-    assert!(Arbiter::get_item::<&'static str, _, _>(|s| *s == "test"));
-    assert!(Arbiter::contains_item::<&'static str>());
     assert!(Arbiter::get_value(|| 64u64) == 64);
 
     ntex::rt::set_item(100u32);
@@ -230,6 +217,64 @@ fn test_spawn_cb() {
     assert!(val > 0);
 }
 
+/// `Arbiter::on_shutdown()` callbacks run on stop request, while the arbiter
+/// is still running, including callbacks registered by callbacks.
+#[test]
+fn test_on_shutdown_arbiter() {
+    System::new("test", ntex::rt::DefaultRuntime).block_on(async {
+        let (tx, rx) = oneshot::channel();
+        let mut arb = Arbiter::new();
+        arb.handle()
+            .spawn(async move {
+                Arbiter::on_shutdown(move || {
+                    Arbiter::on_shutdown(move || {
+                        let _ = tx.send(Arbiter::current().is_running());
+                    });
+                });
+            })
+            .await
+            .unwrap();
+
+        arb.stop();
+        assert!(
+            rx.await.unwrap(),
+            "callback ran after the event loop exited"
+        );
+        arb.join().unwrap();
+    });
+}
+
+/// The system arbiter runs them on `System::stop()`, and on exit of an event
+/// loop that ends without a stop request.
+#[test]
+fn test_on_shutdown_system() {
+    thread::spawn(|| {
+        let ran = std::rc::Rc::new(std::cell::Cell::new(0));
+
+        let ran2 = ran.clone();
+        System::build()
+            .build(ntex::rt::DefaultRuntime)
+            .run(move || {
+                Arbiter::on_shutdown(move || ran2.set(ran2.get() + 1));
+                System::current().stop();
+                Ok(())
+            })
+            .unwrap();
+        assert_eq!(ran.get(), 1);
+
+        let ran2 = ran.clone();
+        System::new("test", ntex::rt::DefaultRuntime).block_on(async move {
+            let ran3 = ran2.clone();
+            Arbiter::on_shutdown(move || ran3.set(ran3.get() + 1));
+            sleep(Millis(10)).await;
+            assert_eq!(ran2.get(), 1, "callback ran before shutdown");
+        });
+        assert_eq!(ran.get(), 2);
+    })
+    .join()
+    .unwrap();
+}
+
 #[ntex::test]
 async fn system_storage() {
     let val = System::current().get_value::<usize>(|| 10);
@@ -244,71 +289,15 @@ async fn system_storage() {
     assert_eq!(val2, 10);
 }
 
-#[cfg(all(target_os = "linux", feature = "neon-polling"))]
-#[ntex::test]
-async fn idle_disconnect_polling() {
-    use std::sync::Mutex;
-
-    use ntex::connect::Connect;
-    use ntex::{SharedCfg, io::Io, io::IoConfig, time::Millis, time::sleep, util::Bytes};
-
-    const DATA: &[u8] = b"Hello World Hello World Hello World Hello World Hello World \
-                          Hello World Hello World Hello World Hello World Hello World \
-                          Hello World Hello World Hello World Hello World Hello World \
-                          Hello World Hello World Hello World Hello World Hello World \
-                          Hello World Hello World Hello World Hello World Hello World \
-                          Hello World Hello World Hello World Hello World Hello World \
-                          Hello World Hello World Hello World Hello World Hello World \
-                          Hello World Hello World Hello World Hello World Hello World \
-                          Hello World Hello World Hello World Hello World Hello World \
-                          Hello World Hello World Hello World Hello World Hello World \
-                          Hello World Hello World Hello World Hello World Hello World \
-                          Hello World Hello World Hello World Hello World Hello World \
-                          Hello World Hello World Hello World Hello World Hello World \
-                          Hello World Hello World Hello World Hello World Hello World \
-                          Hello World Hello World Hello World Hello World Hello World \
-                          Hello World Hello World Hello World Hello World Hello World \
-                          Hello World Hello World Hello World Hello World Hello World \
-                          Hello World Hello World Hello World Hello World Hello World \
-                          Hello World Hello World Hello World Hello World Hello World \
-                          Hello World Hello World Hello World Hello World Hello World \
-                          Hello World Hello World Hello World Hello World Hello World";
-
-    let (tx, rx) = ::oneshot::channel();
-    let tx = Arc::new(Mutex::new(Some(tx)));
-
-    let server = ntex::server::test_server(async move || {
-        let tx = tx.clone();
-        ntex::fn_service(move |io: Io<_>| {
-            tx.lock().unwrap().take().unwrap().send(()).unwrap();
-
-            async move {
-                io.encode_bytes(Bytes::from_static(DATA)).unwrap();
-                sleep(Millis(250)).await;
-                io.close();
-                Ok::<_, ()>(())
-            }
-        })
-    });
-
-    let cfg = SharedCfg::new("NEON")
-        .add(IoConfig::new().set_read_buf(24, 12, 16))
-        .into();
-
-    let msg = Connect::new(server.addr());
-    let io = ntex::connect::connect_with(msg, cfg).await.unwrap();
-    rx.await.unwrap();
-
-    io.on_disconnect().await;
-}
-
 #[cfg(all(target_os = "linux", feature = "neon-uring"))]
 #[ntex::test]
 async fn idle_disconnect_uring() {
     use std::sync::Mutex;
 
     use ntex::io::{Io, IoConfig};
-    use ntex::{SharedCfg, connect::Connect, time::Millis, time::sleep, util::Bytes};
+    use ntex::util::{BytePageSize, Bytes};
+    use ntex::{SharedCfg, codec::BytesCodec, connect::Connect};
+    use ntex::{time::Millis, time::sleep, time::timeout};
 
     const DATA: &[u8] = b"Hello World Hello World Hello World Hello World Hello World \
                           Hello World Hello World Hello World Hello World Hello World \
@@ -352,12 +341,76 @@ async fn idle_disconnect_uring() {
     });
 
     let cfg = SharedCfg::new("NEON-URING")
-        .add(IoConfig::new().set_read_buf(24, 12, 16))
-        .into();
+        .add(
+            IoConfig::new()
+                .set_read_size(BytePageSize::Size4, BytePageSize::Size4)
+                .set_read_backpressure(BytePageSize::Size4.capacity()),
+        )
+        .build();
 
     let msg = Connect::new(server.addr());
-    let io = ntex::connect::connect_with(msg, cfg).await.unwrap();
+    let io = ntex::connect::connect_with(msg, &cfg).await.unwrap();
     rx.await.unwrap();
 
-    io.on_disconnect().await;
+    // Server close is a FIN, which is indistinguishable from a half-close, so
+    // it is observed as eof once all input is read
+    let mut total = 0;
+    let res = timeout(Millis(5000), async {
+        while let Ok(Some(item)) = io.recv(&BytesCodec).await {
+            total += item.len();
+        }
+    })
+    .await;
+    assert!(res.is_ok(), "eof is not observed");
+    assert_eq!(total, DATA.len() * 2);
+}
+
+#[cfg(any(target_os = "linux", windows))]
+#[test]
+fn test_log_backtrace() {
+    use std::{sync::atomic::AtomicBool, time::Duration};
+
+    fn run(tx: oneshot::Sender<()>) {
+        thread::spawn(move || {
+            crate::System::build()
+                .signals(true)
+                .ping_interval(1000)
+                .ping_threshold(500)
+                .build(ntex::rt::DefaultRuntime)
+                .block_on(async move {
+                    let (tx, rx) = oneshot::channel();
+                    Arbiter::with_name("ttttt".to_string())
+                        .handle()
+                        .spawn(async {
+                            thread::sleep(Duration::from_secs(2));
+                            let _ = tx.send(());
+                        });
+
+                    let _ = rx.await;
+                });
+            let _ = tx.send(());
+        });
+    }
+
+    let (tx, rx) = oneshot::channel();
+    run(tx);
+    let _ = rx.recv();
+
+    let tag = Arc::new(AtomicBool::new(false));
+    let tag2 = tag.clone();
+    let task = Arc::new(std::sync::Mutex::new(None));
+    let task2 = task.clone();
+    System::set_latency_callback(move |_, loc| {
+        *task2.lock().unwrap() = loc;
+        tag2.store(true, Ordering::Relaxed);
+    });
+
+    let (tx, rx) = oneshot::channel();
+    run(tx);
+    let _ = rx.recv();
+    assert!(tag.load(Ordering::Relaxed));
+    // neon reports the spawn location, tokio and compio report none
+    if let Some(loc) = *task.lock().unwrap() {
+        assert_eq!(loc.file(), file!());
+    }
 }

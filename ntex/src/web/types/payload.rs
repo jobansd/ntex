@@ -1,15 +1,23 @@
 //! Payload/Bytes/String extractors
-use std::{borrow::Cow, future::Future, pin::Pin, str, task::Context, task::Poll};
+use std::{
+    borrow::Cow, convert::Infallible, fmt, future::Future, pin::Pin, str, sync::Arc, task::Context,
+    task::Poll,
+};
 
 use encoding_rs::UTF_8;
 use mime::Mime;
 
 use crate::http::{HttpMessage, error, header};
-use crate::util::{BoxFuture, Bytes, BytesMut, Stream, stream_recv};
-use crate::web::error::{ErrorRenderer, PayloadError};
-use crate::web::{FromRequest, HttpRequest};
+use crate::util::{BoxFuture, Bytes, Stream};
+use crate::web::{FromRequest, HttpRequest, State, error::PayloadError};
 
-/// Payload extractor returns request 's payload stream.
+/// Payload extractor returns request's payload stream.
+///
+/// The stream is not decompressed: with `Content-Encoding: gzip`, `deflate` or
+/// `zstd`, it yields the encoded bytes. The `Bytes`, `String`, `Json` and `Form`
+/// extractors decode the body. To decode this stream, wrap it with
+/// `ntex::http::encoding::Decoder::from_headers()` (requires the `compress`
+/// feature).
 ///
 /// ## Example
 ///
@@ -27,11 +35,11 @@ use crate::web::{FromRequest, HttpRequest};
 ///     }
 ///
 ///     format!("Body {:?}!", bytes);
-///     Ok(HttpResponse::Ok().finish())
+///     Ok(HttpResponse::Ok().build())
 /// }
 ///
 /// fn main() {
-///     let app = App::new().service(
+///     let app = App::default().service(
 ///         web::resource("/index.html").route(
 ///             web::get().to(index))
 ///     );
@@ -69,10 +77,7 @@ impl Stream for Payload {
     type Item = Result<Bytes, error::PayloadError>;
 
     #[inline]
-    fn poll_next(
-        mut self: Pin<&mut Self>,
-        cx: &mut Context<'_>,
-    ) -> Poll<Option<Self::Item>> {
+    fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
         self.poll_recv(cx)
     }
 }
@@ -84,7 +89,7 @@ impl Stream for Payload {
 /// ```rust
 /// use std::future::Future;
 /// use ntex::util::{BytesMut, Stream};
-/// use ntex::web::{self, error, App, Error, HttpResponse};
+/// use ntex::web::{self, error, App, HttpResponse};
 ///
 /// /// extract binary data from request
 /// async fn index(mut body: web::types::Payload) -> Result<HttpResponse, error::PayloadError>
@@ -95,21 +100,22 @@ impl Stream for Payload {
 ///     }
 ///
 ///     format!("Body {:?}!", bytes);
-///     Ok(HttpResponse::Ok().finish())
+///     Ok(HttpResponse::Ok().build())
 /// }
 ///
 /// fn main() {
-///     let app = App::new().service(
+///     let app = App::default().service(
 ///         web::resource("/index.html").route(
 ///             web::get().to(index))
 ///     );
 /// }
 /// ```
-impl<Err: ErrorRenderer> FromRequest<Err> for Payload {
-    type Error = Err::Container;
+impl<St: State> FromRequest<St> for Payload {
+    type Error = Infallible;
 
     #[inline]
     async fn from_request(
+        _: &St,
         _: &HttpRequest,
         payload: &mut crate::http::Payload,
     ) -> Result<Payload, Self::Error> {
@@ -121,7 +127,7 @@ impl<Err: ErrorRenderer> FromRequest<Err> for Payload {
 ///
 /// Loads request's payload and construct Bytes instance.
 ///
-/// [**`PayloadConfig`**](struct.PayloadConfig.html) allows to configure
+/// [`PayloadConfig`] allows to configure
 /// extraction process.
 ///
 /// ## Example
@@ -135,16 +141,17 @@ impl<Err: ErrorRenderer> FromRequest<Err> for Payload {
 /// }
 ///
 /// fn main() {
-///     let app = web::App::new().service(
+///     let app = web::App::default().service(
 ///         web::resource("/index.html").route(
 ///             web::get().to(index))
 ///     );
 /// }
 /// ```
-impl<Err: ErrorRenderer> FromRequest<Err> for Bytes {
+impl<St: State> FromRequest<St> for Bytes {
     type Error = PayloadError;
 
     async fn from_request(
+        _: &St,
         req: &HttpRequest,
         payload: &mut crate::http::Payload,
     ) -> Result<Bytes, Self::Error> {
@@ -169,13 +176,13 @@ impl<Err: ErrorRenderer> FromRequest<Err> for Bytes {
 ///
 /// Text extractor automatically decode body according to the request's charset.
 ///
-/// [**`PayloadConfig`**](struct.PayloadConfig.html) allows to configure
+/// [`PayloadConfig`] allows to configure
 /// extraction process.
 ///
 /// ## Example
 ///
 /// ```rust
-/// use ntex::web::{self, App, FromRequest};
+/// use ntex::web::{self, App, FromRequest, WebAppConfig};
 ///
 /// /// extract text data from request
 /// async fn index(text: String) -> String {
@@ -183,19 +190,22 @@ impl<Err: ErrorRenderer> FromRequest<Err> for Bytes {
 /// }
 ///
 /// fn main() {
-///     let app = App::new().service(
-///         web::resource("/index.html")
-///             .state(
-///                 web::types::PayloadConfig::new(4096)  // <- limit size of the payload
-///             )
-///             .route(web::get().to(index))  // <- register handler with extractor params
+///     let cfg = WebAppConfig::new()
+///         .set_state(web::types::PayloadConfig::new(4096)); // <- limit size of the payload
+///
+///     let app = App::default()
+///         .with_config(cfg)
+///         .service(
+///             web::resource("/index.html")
+///                 .route(web::get().to(index))  // <- register handler with extractor params
 ///     );
 /// }
 /// ```
-impl<Err: ErrorRenderer> FromRequest<Err> for String {
+impl<St: State> FromRequest<St> for String {
     type Error = PayloadError;
 
     async fn from_request(
+        _: &St,
         req: &HttpRequest,
         payload: &mut crate::http::Payload,
     ) -> Result<String, Self::Error> {
@@ -232,10 +242,10 @@ impl<Err: ErrorRenderer> FromRequest<Err> for String {
 }
 
 /// Payload configuration for request's payload.
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub struct PayloadConfig {
     limit: usize,
-    mimetype: Option<Mime>,
+    content_type: Option<Arc<dyn Fn(Mime) -> bool + Send + Sync>>,
 }
 
 impl PayloadConfig {
@@ -258,23 +268,36 @@ impl PayloadConfig {
     }
 
     #[must_use]
+    /// Set predicate for allowed content types.
+    ///
+    /// The predicate receives the request's parsed `Content-Type`. A request
+    /// without a `Content-Type` header, or one the predicate rejects, fails
+    /// with a content-type error. By default the content type is not checked.
+    pub fn content_type<F>(mut self, predicate: F) -> Self
+    where
+        F: Fn(Mime) -> bool + Send + Sync + 'static,
+    {
+        self.content_type = Some(Arc::new(predicate));
+        self
+    }
+
+    #[must_use]
     /// Set required mime-type of the request.
     ///
-    /// By default mime type is not enforced.
-    pub fn mimetype(mut self, mt: Mime) -> Self {
-        self.mimetype = Some(mt);
-        self
+    /// This is a shorthand for [`content_type`](Self::content_type) with a
+    /// predicate that accepts only `mt`. The comparison includes parameters,
+    /// such as `charset`. By default mime type is not enforced.
+    pub fn mimetype(self, mt: Mime) -> Self {
+        self.content_type(move |req_mt| req_mt == mt)
     }
 
     fn check_mimetype(&self, req: &HttpRequest) -> Result<(), PayloadError> {
         // check content-type
-        if let Some(ref mt) = self.mimetype {
+        if let Some(ref predicate) = self.content_type {
             match req.mime_type() {
-                Ok(Some(ref req_mt)) => {
-                    if mt != req_mt {
-                        return Err(PayloadError::from(
-                            error::ContentTypeError::Unexpected,
-                        ));
+                Ok(Some(req_mt)) => {
+                    if !predicate(req_mt) {
+                        return Err(PayloadError::from(error::ContentTypeError::Unexpected));
                     }
                 }
                 Ok(None) => {
@@ -293,8 +316,23 @@ impl Default for PayloadConfig {
     fn default() -> Self {
         PayloadConfig {
             limit: 262_144,
-            mimetype: None,
+            content_type: None,
         }
+    }
+}
+
+impl fmt::Debug for PayloadConfig {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("PayloadConfig")
+            .field("limit", &self.limit)
+            .field(
+                "content_type",
+                &self
+                    .content_type
+                    .as_ref()
+                    .map(|_| "Arc<dyn Fn(mime::Mime) -> bool + Send + Sync>"),
+            )
+            .finish()
     }
 }
 
@@ -303,7 +341,7 @@ impl Default for PayloadConfig {
 /// Load http message body.
 ///
 /// By default only 256Kb payload reads to a memory, then
-/// `PayloadError::Overflow` get returned. Use `MessageBody::limit()`
+/// `PayloadError::Overflow` is returned. Use `HttpMessageBody::limit()`
 /// method to change upper limit.
 struct HttpMessageBody {
     limit: usize,
@@ -325,14 +363,10 @@ impl HttpMessageBody {
                 if let Ok(l) = s.parse::<usize>() {
                     len = Some(l);
                 } else {
-                    return Self::err(PayloadError::Payload(
-                        error::PayloadError::UnknownLength,
-                    ));
+                    return Self::err(PayloadError::Payload(error::PayloadError::UnknownLength));
                 }
             } else {
-                return Self::err(PayloadError::Payload(
-                    error::PayloadError::UnknownLength,
-                ));
+                return Self::err(PayloadError::Payload(error::PayloadError::UnknownLength));
             }
         }
 
@@ -382,26 +416,20 @@ impl Future for HttpMessageBody {
             return Poll::Ready(Err(err));
         }
 
-        if let Some(len) = self.length.take()
+        if let Some(len) = self.length
             && len > self.limit
         {
             return Poll::Ready(Err(PayloadError::from(error::PayloadError::Overflow)));
         }
 
         // future
-        let limit = self.limit;
+        let (limit, length) = (self.limit, self.length);
         let mut stream = self.stream.take().unwrap();
         self.fut = Some(Box::pin(async move {
-            let mut body = BytesMut::with_capacity(8192);
-
-            while let Some(item) = stream_recv(&mut stream).await {
-                let chunk = item?;
-                if body.len() + chunk.len() > limit {
-                    return Err(PayloadError::from(error::PayloadError::Overflow));
-                }
-                body.extend_from_slice(&chunk);
-            }
-            Ok(body.freeze())
+            super::read_body(&mut stream, limit, length, |_| {
+                PayloadError::from(error::PayloadError::Overflow)
+            })
+            .await
         }));
         self.poll(cx)
     }
@@ -420,82 +448,95 @@ mod tests {
             .mimetype(mime::APPLICATION_JSON);
         assert!(cfg.check_mimetype(&req).is_err());
 
-        let req = TestRequest::with_header(
-            header::CONTENT_TYPE,
-            "application/x-www-form-urlencoded",
-        )
-        .to_http_request();
+        let req =
+            TestRequest::with_header(header::CONTENT_TYPE, "application/x-www-form-urlencoded")
+                .to_http_request();
         assert!(cfg.check_mimetype(&req).is_err());
 
-        let req = TestRequest::with_header(header::CONTENT_TYPE, "application/json")
+        let req =
+            TestRequest::with_header(header::CONTENT_TYPE, "application/json").to_http_request();
+        assert!(cfg.check_mimetype(&req).is_ok());
+
+        let cfg = PayloadConfig::default()
+            .content_type(|mt| mt.type_() == mime::TEXT && mt.subtype() == mime::PLAIN);
+        let req =
+            TestRequest::with_header(header::CONTENT_TYPE, "application/json").to_http_request();
+        assert!(cfg.check_mimetype(&req).is_err());
+
+        let req = TestRequest::with_header(header::CONTENT_TYPE, "text/plain; charset=utf-8")
             .to_http_request();
         assert!(cfg.check_mimetype(&req).is_ok());
+        assert!(format!("{cfg:?}").contains("PayloadConfig"));
     }
 
     #[crate::rt_test]
     async fn test_payload() {
-        let (req, mut pl) = TestRequest::with_header(header::CONTENT_LENGTH, "11")
-            .set_payload(Bytes::from_static(b"hello=world"))
+        let (req, mut pl, ()) = TestRequest::with_header(header::CONTENT_LENGTH, "11")
+            .payload(Bytes::from_static(b"hello=world"))
             .to_http_parts();
 
-        let mut s = from_request::<Payload>(&req, &mut pl).await.unwrap();
-        let b = stream_recv(&mut s).await.unwrap().unwrap();
+        let mut s = from_request::<_, Payload>(&(), &req, &mut pl)
+            .await
+            .unwrap();
+        let b = crate::util::stream_recv(&mut s).await.unwrap().unwrap();
         assert_eq!(b, Bytes::from_static(b"hello=world"));
     }
 
     #[crate::rt_test]
     async fn test_payload_recv() {
-        let (req, mut pl) = TestRequest::with_header(header::CONTENT_LENGTH, "11")
-            .set_payload(Bytes::from_static(b"hello=world"))
+        let (req, mut pl, ()) = TestRequest::with_header(header::CONTENT_LENGTH, "11")
+            .payload(Bytes::from_static(b"hello=world"))
             .to_http_parts();
 
-        let mut s = from_request::<Payload>(&req, &mut pl).await.unwrap();
+        let mut s = from_request::<_, Payload>(&(), &req, &mut pl)
+            .await
+            .unwrap();
         let b = s.recv().await.unwrap().unwrap();
         assert_eq!(b, Bytes::from_static(b"hello=world"));
     }
 
     #[crate::rt_test]
     async fn test_bytes() {
-        let (req, mut pl) = TestRequest::with_header(header::CONTENT_LENGTH, "11")
-            .set_payload(Bytes::from_static(b"hello=world"))
+        let (req, mut pl, ()) = TestRequest::with_header(header::CONTENT_LENGTH, "11")
+            .payload(Bytes::from_static(b"hello=world"))
             .to_http_parts();
 
-        let s = from_request::<Bytes>(&req, &mut pl).await.unwrap();
+        let s = from_request::<_, Bytes>(&(), &req, &mut pl).await.unwrap();
         assert_eq!(s, Bytes::from_static(b"hello=world"));
 
-        let (req, mut pl) = TestRequest::with_header(header::CONTENT_LENGTH, "11")
-            .set_payload(Bytes::from_static(b"hello=world"))
-            .state(PayloadConfig::default().mimetype(mime::APPLICATION_JSON))
+        let (req, mut pl, ()) = TestRequest::with_header(header::CONTENT_LENGTH, "11")
+            .payload(Bytes::from_static(b"hello=world"))
+            .app_state(PayloadConfig::default().mimetype(mime::APPLICATION_JSON))
             .to_http_parts();
-        assert!(from_request::<Bytes>(&req, &mut pl).await.is_err());
+        assert!(from_request::<_, Bytes>(&(), &req, &mut pl).await.is_err());
     }
 
     #[crate::rt_test]
     async fn test_string() {
-        let (req, mut pl) = TestRequest::with_header(header::CONTENT_LENGTH, "11")
-            .set_payload(Bytes::from_static(b"hello=world"))
+        let (req, mut pl, ()) = TestRequest::with_header(header::CONTENT_LENGTH, "11")
+            .payload(Bytes::from_static(b"hello=world"))
             .to_http_parts();
 
-        let s = from_request::<String>(&req, &mut pl).await.unwrap();
+        let s = from_request::<_, String>(&(), &req, &mut pl).await.unwrap();
         assert_eq!(s, "hello=world");
 
-        let (req, mut pl) = TestRequest::with_header(header::CONTENT_LENGTH, "11")
+        let (req, mut pl, ()) = TestRequest::with_header(header::CONTENT_LENGTH, "11")
             .header(header::CONTENT_TYPE, "text/plain; charset=cp1251")
-            .set_payload(Bytes::from_static(b"hello=world"))
+            .payload(Bytes::from_static(b"hello=world"))
             .to_http_parts();
-        let s = from_request::<String>(&req, &mut pl).await.unwrap();
+        let s = from_request::<_, String>(&(), &req, &mut pl).await.unwrap();
         assert_eq!(s, "hello=world");
 
-        let (req, mut pl) = TestRequest::with_header(header::CONTENT_LENGTH, "11")
-            .set_payload(Bytes::from_static(b"hello=world"))
-            .state(PayloadConfig::default().mimetype(mime::APPLICATION_JSON))
+        let (req, mut pl, ()) = TestRequest::with_header(header::CONTENT_LENGTH, "11")
+            .payload(Bytes::from_static(b"hello=world"))
+            .app_state(PayloadConfig::default().mimetype(mime::APPLICATION_JSON))
             .to_http_parts();
-        assert!(from_request::<String>(&req, &mut pl).await.is_err());
+        assert!(from_request::<_, String>(&(), &req, &mut pl).await.is_err());
     }
 
     #[crate::rt_test]
     async fn test_message_body() {
-        let (req, mut pl) = TestRequest::with_header(header::CONTENT_LENGTH, "xxxx")
+        let (req, mut pl, ()) = TestRequest::with_header(header::CONTENT_LENGTH, "xxxx")
             .to_srv_request()
             .into_parts();
         let res = HttpMessageBody::new(&req, &mut pl).await;
@@ -504,7 +545,7 @@ mod tests {
             _ => unreachable!("error"),
         }
 
-        let (req, mut pl) = TestRequest::with_header(header::CONTENT_LENGTH, "1000000")
+        let (req, mut pl, ()) = TestRequest::with_header(header::CONTENT_LENGTH, "1000000")
             .to_srv_request()
             .into_parts();
         let res = HttpMessageBody::new(&req, &mut pl).await;
@@ -513,19 +554,52 @@ mod tests {
             _ => unreachable!("error"),
         }
 
-        let (req, mut pl) = TestRequest::default()
-            .set_payload(Bytes::from_static(b"test"))
+        let (req, mut pl, ()) = TestRequest::default()
+            .payload(Bytes::from_static(b"test"))
             .to_http_parts();
         let res = HttpMessageBody::new(&req, &mut pl).await;
         assert_eq!(res.ok().unwrap(), Bytes::from_static(b"test"));
 
-        let (req, mut pl) = TestRequest::default()
-            .set_payload(Bytes::from_static(b"11111111111111"))
+        let (req, mut pl, ()) = TestRequest::default()
+            .payload(Bytes::from_static(b"11111111111111"))
             .to_http_parts();
         let res = HttpMessageBody::new(&req, &mut pl).limit(5).await;
         match res.err().unwrap() {
             PayloadError::Payload(error::PayloadError::Overflow) => (),
             _ => unreachable!("error"),
         }
+    }
+
+    #[crate::rt_test]
+    async fn test_payload_errors() {
+        let cfg = PayloadConfig::new(5);
+        assert_eq!(cfg.limit, 5);
+
+        // invalid charset
+        let (req, mut pl, ()) = TestRequest::with_header(header::CONTENT_LENGTH, "11")
+            .header(header::CONTENT_TYPE, "text/plain; charset=unknown")
+            .payload(Bytes::from_static(b"hello=world"))
+            .to_http_parts();
+        assert!(from_request::<_, String>(&(), &req, &mut pl).await.is_err());
+
+        // invalid mime type
+        let cfg = PayloadConfig::default().mimetype(mime::APPLICATION_JSON);
+        let req = TestRequest::with_header(header::CONTENT_TYPE, "invalid").to_http_request();
+        assert!(matches!(
+            cfg.check_mimetype(&req),
+            Err(PayloadError::ContentType(_))
+        ));
+
+        // non-ascii content-length
+        let (req, mut pl, ()) = TestRequest::with_header(
+            header::CONTENT_LENGTH,
+            header::HeaderValue::from_bytes(b"1\xff").unwrap(),
+        )
+        .to_http_parts();
+        let res = HttpMessageBody::new(&req, &mut pl).await;
+        assert!(matches!(
+            res,
+            Err(PayloadError::Payload(error::PayloadError::UnknownLength))
+        ));
     }
 }

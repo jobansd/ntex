@@ -1,52 +1,59 @@
-use std::{fmt, future::Future, io, rc::Rc};
+use std::{cell::Cell, fmt, io, rc::Rc};
 
 use crate::http::message::CurrentIo;
 use crate::http::{Request, Response, ResponseError, body::Body, h1::Codec};
 use crate::io::{Filter, Io, IoBoxed, IoRef};
 
+/// A lifecycle event sent to an HTTP/1 control service.
+///
+/// Return [`Control::ack`] to accept the default action, or use the methods on
+/// the individual message type to reject or take ownership of the operation.
 pub enum Control<F, Err> {
-    /// New connection
+    /// A transport connection has been accepted.
     Connect(Connection<F>),
-    /// New request is loaded
+    /// A complete request head has been decoded.
     Request(NewRequest),
-    /// Handle `Connection: UPGRADE`
+    /// A request asks to upgrade the HTTP/1 connection.
     Upgrade(Upgrade<F>),
-    /// Handle `EXPECT` header
+    /// A request contains `Expect: 100-continue`.
     Expect(Expect),
-    /// Connection is prepared to disconnect
+    /// The connection is preparing to stop.
     Disconnect(Reason<Err>),
 }
 
 #[derive(Debug)]
-/// Disconnect reason
+/// Reason supplied with an HTTP/1 disconnect notification.
 pub enum Reason<Err> {
-    /// Disconnect initiated by service
+    /// The HTTP service initiated the disconnect.
     Service(ServiceDisconnect),
-    /// Application level error
+    /// The application service returned an error.
     Error(Error<Err>),
-    /// Protocol level error
+    /// HTTP/1 decoding, encoding, or timeout processing failed.
     ProtocolError(ProtocolError),
-    /// Peer is gone
+    /// The peer closed the connection or an I/O error occurred.
     PeerGone(PeerGone),
-    /// Keep-alive timeout
+    /// The keep-alive timer expired.
     KeepAlive(KeepAlive),
 }
 
+/// The reason the HTTP service is disconnecting.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub enum ServiceDisconnectReason {
-    /// Server is shutting down
+    /// The server is shutting down.
     Shutdown,
-    /// Upgrade request is handled by Upgrade service
+    /// The HTTP/1 dispatcher relinquished the connection after an upgrade was
+    /// handed to the application or control service.
     UpgradeHandled,
-    /// Upgrade handling failed
+    /// Upgrade handling failed.
     UpgradeFailed,
-    /// Expect control message handling failed
+    /// Expectation handling failed.
     ExpectFailed,
-    /// Service is not interested in payload, it is not possible to continue
+    /// The application dropped an unread request payload, preventing reuse of
+    /// the connection.
     PayloadDropped,
 }
 
-/// Control message handling result
+/// The control service's response to an HTTP/1 lifecycle event.
 #[derive(Debug)]
 pub struct ControlAck<F> {
     pub(super) result: ControlResult<F>,
@@ -123,7 +130,7 @@ impl<F, Err> Control<F, Err> {
     }
 
     #[inline]
-    /// Ack control message
+    /// Accepts the event and applies its default action.
     pub fn ack(self) -> ControlAck<F>
     where
         F: Filter,
@@ -149,14 +156,13 @@ where
             Control::Request(msg) => f.debug_tuple("Control::Request").field(msg).finish(),
             Control::Upgrade(msg) => f.debug_tuple("Control::Upgrade").field(msg).finish(),
             Control::Expect(msg) => f.debug_tuple("Control::Expect").field(msg).finish(),
-            Control::Disconnect(msg) => {
-                f.debug_tuple("Control::Disconnect").field(msg).finish()
-            }
+            Control::Disconnect(msg) => f.debug_tuple("Control::Disconnect").field(msg).finish(),
         }
     }
 }
 
 impl<Err: ResponseError> Reason<Err> {
+    /// Acknowledges the disconnect notification and stops the connection.
     pub fn ack<F>(self) -> ControlAck<F> {
         match self {
             Reason::Error(msg) => msg.ack(),
@@ -168,6 +174,7 @@ impl<Err: ResponseError> Reason<Err> {
     }
 }
 
+/// Notification that a connection has been accepted.
 #[derive(Debug)]
 pub struct Connection<F> {
     id: usize,
@@ -176,24 +183,25 @@ pub struct Connection<F> {
 
 impl<F> Connection<F> {
     #[inline]
-    pub fn id(self) -> usize {
+    /// Returns the connection identifier.
+    pub fn id(&self) -> usize {
         self.id
     }
 
     #[inline]
-    /// Returns reference to Io
+    /// Returns the connection I/O object.
     pub fn get_ref(&self) -> &Io<F> {
         &self.io
     }
 
     #[inline]
-    /// Returns mut reference to Io
+    /// Returns mutable access to the connection I/O object.
     pub fn get_mut(&mut self) -> &mut Io<F> {
         &mut self.io
     }
 
     #[inline]
-    /// Ack new request and continue handling process
+    /// Accepts the connection and starts HTTP request processing.
     pub fn ack(self) -> ControlAck<F> {
         ControlAck {
             result: ControlResult::Connect(self.io),
@@ -201,24 +209,26 @@ impl<F> Connection<F> {
     }
 }
 
+/// Notification that a complete request head has been received.
 #[derive(Debug)]
 pub struct NewRequest(Request);
 
 impl NewRequest {
     #[inline]
-    /// Returns reference to http request
+    /// Returns the HTTP request.
     pub fn get_ref(&self) -> &Request {
         &self.0
     }
 
     #[inline]
-    /// Returns mut reference to http request
+    /// Returns mutable access to the HTTP request.
     pub fn get_mut(&mut self) -> &mut Request {
         &mut self.0
     }
 
     #[inline]
-    /// Ack new request and continue handling process
+    /// Accepts the request and continues with expectation handling, upgrade
+    /// handling, or the application service as appropriate.
     pub fn ack<F>(self) -> ControlAck<F> {
         let result = if self.0.head().expect() {
             ControlResult::Expect(self.0)
@@ -231,7 +241,7 @@ impl NewRequest {
     }
 
     #[inline]
-    /// Fail request handling
+    /// Rejects the request with the response generated from `err`.
     pub fn fail<E: ResponseError, F>(self, err: E) -> ControlAck<F> {
         let res: Response = (&err).into();
         let (res, body) = res.into_parts();
@@ -242,7 +252,7 @@ impl NewRequest {
     }
 
     #[inline]
-    /// Fail request and send custom response
+    /// Rejects the request with a custom response.
     pub fn fail_with<F>(self, res: Response) -> ControlAck<F> {
         let (res, body) = res.into_parts();
 
@@ -252,6 +262,7 @@ impl NewRequest {
     }
 }
 
+/// A request to upgrade the HTTP/1 connection.
 pub struct Upgrade<F> {
     req: Request,
     io: Rc<Io<F>>,
@@ -260,13 +271,16 @@ pub struct Upgrade<F> {
 
 struct RequestIoAccess<F> {
     io: Rc<Io<F>>,
+    // `get()` must not borrow `io`, it is taken through a shared reference
+    ioref: IoRef,
     codec: Codec,
+    taken: Cell<bool>,
 }
 
 impl<F> fmt::Debug for RequestIoAccess<F> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("RequestIoAccess")
-            .field("io", self.io.as_ref())
+            .field("io", &self.ioref)
             .field("codec", &self.codec)
             .finish()
     }
@@ -274,40 +288,52 @@ impl<F> fmt::Debug for RequestIoAccess<F> {
 
 impl<F: Filter> crate::http::message::IoAccess for RequestIoAccess<F> {
     fn get(&self) -> Option<&IoRef> {
-        Some(self.io.as_ref())
+        if self.taken.get() { None } else { Some(&self.ioref) }
     }
 
     fn take(&self) -> Option<(IoBoxed, Codec)> {
-        Some((self.io.take().into(), self.codec.clone()))
+        if self.taken.replace(true) {
+            None
+        } else {
+            // SAFETY: `io` is shared with the dispatcher only, which does not
+            // keep borrows of it, `get()` borrows the separate `ioref`
+            let io = unsafe { self.io.take() };
+            Some((io.into(), self.codec.clone()))
+        }
     }
 }
 
 impl<F: Filter> Upgrade<F> {
     #[inline]
-    /// Returns reference to Io
+    /// Returns the connection I/O object.
     pub fn io(&self) -> &Io<F> {
         &self.io
     }
 
     #[inline]
-    /// Returns reference to http request
+    /// Returns the upgrade request.
     pub fn get_ref(&self) -> &Request {
         &self.req
     }
 
     #[inline]
-    /// Returns mut reference to http request
+    /// Returns mutable access to the upgrade request.
     pub fn get_mut(&mut self) -> &mut Request {
         &mut self.req
     }
 
     #[inline]
-    /// Ack upgrade request and continue handling process
+    /// Passes the upgrade request to the application service.
+    ///
+    /// The application can take ownership of the connection and codec through
+    /// [`RequestHead::take_io`](crate::http::RequestHead::take_io).
     pub fn ack(mut self) -> ControlAck<F> {
         // Move io into request
         let io = Rc::new(RequestIoAccess {
+            ioref: self.io.get_ref(),
             io: self.io,
             codec: self.codec,
+            taken: Cell::new(false),
         });
         self.req.head_mut().io = CurrentIo::new(io);
 
@@ -317,23 +343,26 @@ impl<F: Filter> Upgrade<F> {
     }
 
     #[inline]
-    /// Handle upgrade request
-    pub fn handle<H, R, O>(self, f: H) -> ControlAck<F>
-    where
-        H: FnOnce(Request, Io<F>, Codec) -> R + 'static,
-        R: Future<Output = O>,
-    {
-        let io = self.io.take();
-        crate::rt::spawn(async move {
-            let _ = f(self.req, io, self.codec).await;
-        });
-        ControlAck {
-            result: ControlResult::UpgradeHandled,
-        }
+    /// Takes ownership of the connection, request, and codec.
+    ///
+    /// Returning this acknowledgement tells the dispatcher that the control
+    /// service is responsible for the upgraded connection.
+    pub fn handle(self) -> (ControlAck<F>, Io<F>, Request, Codec) {
+        // SAFETY: `handle` consumes `self`, borrows from `io()` are gone and
+        // the dispatcher does not keep borrows of its `io`
+        let io = unsafe { self.io.take() };
+        (
+            ControlAck {
+                result: ControlResult::UpgradeHandled,
+            },
+            io,
+            self.req,
+            self.codec,
+        )
     }
 
     #[inline]
-    /// Fail request handling
+    /// Rejects the upgrade with the response generated from `err`.
     pub fn fail<E: ResponseError>(self, err: E) -> ControlAck<F> {
         let res: Response = (&err).into();
         let (res, body) = res.into_parts();
@@ -344,7 +373,7 @@ impl<F: Filter> Upgrade<F> {
     }
 
     #[inline]
-    /// Fail request and send custom response
+    /// Rejects the upgrade with a custom response.
     pub fn fail_with(self, res: Response) -> ControlAck<F> {
         let (res, body) = res.into_parts();
 
@@ -364,7 +393,7 @@ impl<F> fmt::Debug for Upgrade<F> {
     }
 }
 
-/// Service disconnect initiated by server
+/// Notification that the server is closing the connection.
 #[derive(Debug)]
 pub struct ServiceDisconnect(ServiceDisconnectReason);
 
@@ -374,13 +403,13 @@ impl ServiceDisconnect {
     }
 
     #[inline]
-    /// Service disconnect reason
+    /// Returns why the connection is being closed.
     pub fn reason(&self) -> ServiceDisconnectReason {
         self.0
     }
 
     #[inline]
-    /// Ack controk message
+    /// Acknowledges the notification and closes the connection.
     pub fn ack<F>(self) -> ControlAck<F> {
         ControlAck {
             result: ControlResult::Stop,
@@ -388,7 +417,7 @@ impl ServiceDisconnect {
     }
 }
 
-/// `KeepAlive` control message
+/// Notification that a keep-alive connection is being closed.
 #[derive(Debug)]
 pub struct KeepAlive {
     enabled: bool,
@@ -400,13 +429,13 @@ impl KeepAlive {
     }
 
     #[inline]
-    /// Connection keep-alive is enabled
+    /// Returns whether keep-alive was enabled for the connection.
     pub fn is_enabled(&self) -> bool {
         self.enabled
     }
 
     #[inline]
-    /// Ack controk message
+    /// Acknowledges the notification and closes the connection.
     pub fn ack<F>(self) -> ControlAck<F> {
         ControlAck {
             result: ControlResult::Stop,
@@ -414,7 +443,7 @@ impl KeepAlive {
     }
 }
 
-/// Service level error
+/// An application service error and its generated response.
 #[derive(Debug)]
 pub struct Error<Err> {
     err: Err,
@@ -430,13 +459,19 @@ impl<Err: ResponseError> Error<Err> {
     }
 
     #[inline]
-    /// Returns reference to http error
+    /// Returns the application service error.
     pub fn get_ref(&self) -> &Err {
         &self.err
     }
 
     #[inline]
-    /// Ack service error and close connection.
+    /// Returns mutable access to the application service error.
+    pub fn get_mut(&mut self) -> &mut Err {
+        &mut self.err
+    }
+
+    #[inline]
+    /// Sends the response generated from the service error.
     pub fn ack<F>(self) -> ControlAck<F> {
         let (res, body) = self.pkt.into_parts();
         ControlAck {
@@ -445,7 +480,7 @@ impl<Err: ResponseError> Error<Err> {
     }
 
     #[inline]
-    /// Fail error handling
+    /// Replaces the generated response with a response produced from `err`.
     pub fn fail<E: ResponseError, F>(self, err: E) -> ControlAck<F> {
         let res: Response = (&err).into();
         let (res, body) = res.into_parts();
@@ -456,7 +491,7 @@ impl<Err: ResponseError> Error<Err> {
     }
 
     #[inline]
-    /// Fail error handling
+    /// Replaces the generated response with a custom response.
     pub fn fail_with<F>(self, res: Response) -> ControlAck<F> {
         let (res, body) = res.into_parts();
 
@@ -466,18 +501,19 @@ impl<Err: ResponseError> Error<Err> {
     }
 }
 
+/// A protocol error reported to the control service.
 #[derive(Debug)]
 pub struct ProtocolError(super::ProtocolError);
 
 impl ProtocolError {
     #[inline]
-    /// Returns error reference
-    pub fn err(&self) -> &super::ProtocolError {
+    /// Returns the protocol error.
+    pub fn get_ref(&self) -> &super::ProtocolError {
         &self.0
     }
 
     #[inline]
-    /// Ack `ProtocolError` message
+    /// Sends the response generated from the protocol error.
     pub fn ack<F>(self) -> ControlAck<F> {
         let (res, body) = self.0.error_response().into_parts();
 
@@ -487,7 +523,7 @@ impl ProtocolError {
     }
 
     #[inline]
-    /// Fail error handling
+    /// Replaces the generated response with a response produced from `err`.
     pub fn fail<E: ResponseError, F>(self, err: E) -> ControlAck<F> {
         let res: Response = (&err).into();
         let (res, body) = res.into_parts();
@@ -498,7 +534,7 @@ impl ProtocolError {
     }
 
     #[inline]
-    /// Fail error handling
+    /// Replaces the generated response with a custom response.
     pub fn fail_with<F>(self, res: Response) -> ControlAck<F> {
         let (res, body) = res.into_parts();
 
@@ -508,24 +544,31 @@ impl ProtocolError {
     }
 }
 
+/// Notification that the peer closed the connection.
 #[derive(Debug)]
 pub struct PeerGone(Option<io::Error>);
 
 impl PeerGone {
     #[inline]
-    /// Returns error reference
-    pub fn err(&self) -> Option<&io::Error> {
+    /// Returns the underlying I/O error, if one was reported.
+    pub fn get_ref(&self) -> Option<&io::Error> {
         self.0.as_ref()
     }
 
     #[inline]
-    /// Take error
+    /// Returns mutable access to the underlying I/O error, if one was reported.
+    pub fn get_mut(&mut self) -> Option<&mut io::Error> {
+        self.0.as_mut()
+    }
+
+    #[inline]
+    /// Takes the underlying I/O error, if one was reported.
     pub fn take(&mut self) -> Option<io::Error> {
         self.0.take()
     }
 
     #[inline]
-    /// Ack `PeerGone` message
+    /// Acknowledges the notification and stops the connection.
     pub fn ack<F>(self) -> ControlAck<F> {
         ControlAck {
             result: ControlResult::Stop,
@@ -533,18 +576,25 @@ impl PeerGone {
     }
 }
 
+/// A request containing an `Expect: 100-continue` header.
 #[derive(Debug)]
 pub struct Expect(Request);
 
 impl Expect {
     #[inline]
-    /// Returns reference to http request
+    /// Returns the HTTP request.
     pub fn get_ref(&self) -> &Request {
         &self.0
     }
 
     #[inline]
-    /// Ack expect request
+    /// Returns mutable access to the HTTP request.
+    pub fn get_mut(&mut self) -> &mut Request {
+        &mut self.0
+    }
+
+    #[inline]
+    /// Sends `100 Continue` and passes the request to the application service.
     pub fn ack<F>(self) -> ControlAck<F> {
         ControlAck {
             result: ControlResult::Continue(self.0),
@@ -552,7 +602,7 @@ impl Expect {
     }
 
     #[inline]
-    /// Fail expect request
+    /// Rejects the expectation with the response generated from `err`.
     pub fn fail<E: ResponseError, F>(self, err: E) -> ControlAck<F> {
         let res: Response = (&err).into();
         let (res, body) = res.into_parts();
@@ -563,12 +613,177 @@ impl Expect {
     }
 
     #[inline]
-    /// Fail expect request and send custom response
+    /// Rejects the expectation with a custom response.
     pub fn fail_with<F>(self, res: Response) -> ControlAck<F> {
         let (res, body) = res.into_parts();
 
         ControlAck {
             result: ControlResult::ExpectFailed(res, body.into()),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::http::HttpServiceConfig;
+    use crate::http::message::IoAccess;
+    use crate::service::cfg::SharedCfg;
+    use crate::testing::IoTest;
+
+    #[crate::rt_test]
+    async fn request_io_access_is_one_shot() {
+        let (_, server) = IoTest::create();
+        let cfg: SharedCfg = SharedCfg::new("TEST").add(HttpServiceConfig::new()).into();
+        let io = Rc::new(Io::new(server, cfg.clone()));
+        let access = RequestIoAccess {
+            ioref: io.get_ref(),
+            io,
+            codec: Codec::new(1, cfg.get()),
+            taken: Cell::new(false),
+        };
+
+        let ioref = access.get().unwrap();
+        let (io, _) = access.take().unwrap();
+        drop(io);
+        // `get()` result does not borrow the taken io
+        assert_eq!(ioref.tag(), "TEST");
+        assert!(access.get().is_none());
+        assert!(access.take().is_none());
+    }
+
+    type Ctl = Control<crate::io::Base, io::Error>;
+
+    fn io() -> Io {
+        let (_, server) = IoTest::create();
+        let cfg: SharedCfg = SharedCfg::new("TEST").add(HttpServiceConfig::new()).into();
+        Io::new(server, cfg)
+    }
+
+    #[test]
+    fn debug_fmt() {
+        let s = format!("{:?}", Ctl::request(Request::new()));
+        assert!(s.starts_with("Control::Request(NewRequest("), "{s}");
+        let s = format!("{:?}", Ctl::expect(Request::new()));
+        assert!(s.starts_with("Control::Expect(Expect("), "{s}");
+        let s = format!("{:?}", Ctl::keepalive(true));
+        assert!(s.contains("Control::Disconnect(KeepAlive("), "{s}");
+        let s = format!("{:?}", Ctl::err(io::Error::other("err")));
+        assert!(s.contains("Control::Disconnect(Error("), "{s}");
+    }
+
+    #[crate::rt_test]
+    async fn debug_fmt_io() {
+        let s = format!("{:?}", Ctl::connect(1, io()));
+        assert_eq!(s, "Control::Connect");
+
+        let cfg: SharedCfg = SharedCfg::new("TEST").add(HttpServiceConfig::new()).into();
+        let msg = Ctl::upgrade(Request::new(), Rc::new(io()), Codec::new(1, cfg.get()));
+        let s = format!("{msg:?}");
+        assert!(s.starts_with("Control::Upgrade(Upgrade"), "{s}");
+    }
+
+    #[crate::rt_test]
+    async fn connection() {
+        let Control::Connect(mut msg) = Ctl::connect(7, io()) else {
+            panic!()
+        };
+        assert_eq!(msg.id(), 7);
+        assert_eq!(msg.get_ref().tag(), "TEST");
+        assert_eq!(msg.get_mut().tag(), "TEST");
+        assert!(matches!(msg.ack().result, ControlResult::Connect(_)));
+    }
+
+    #[test]
+    fn new_request() {
+        let Control::Request(mut msg) = Ctl::request(Request::new()) else {
+            panic!()
+        };
+        msg.get_mut().head_mut().method = crate::http::Method::POST;
+        assert_eq!(msg.get_ref().method(), &crate::http::Method::POST);
+        assert!(matches!(
+            msg.ack::<crate::io::Base>().result,
+            ControlResult::Publish(_)
+        ));
+
+        let Control::Request(msg) = Ctl::request(Request::new()) else {
+            panic!()
+        };
+        let ControlResult::Response(res, _) = msg
+            .fail::<_, crate::io::Base>(super::super::ProtocolError::SlowRequestTimeout)
+            .result
+        else {
+            panic!()
+        };
+        assert_eq!(res.status(), crate::http::StatusCode::REQUEST_TIMEOUT);
+    }
+
+    #[test]
+    fn expect() {
+        let Control::Expect(mut msg) = Ctl::expect(Request::new()) else {
+            panic!()
+        };
+        msg.get_mut().head_mut().method = crate::http::Method::PUT;
+        assert_eq!(msg.get_ref().method(), &crate::http::Method::PUT);
+        assert!(matches!(
+            msg.ack::<crate::io::Base>().result,
+            ControlResult::Continue(_)
+        ));
+    }
+
+    #[test]
+    fn disconnect_reasons() {
+        let Control::Disconnect(Reason::Service(msg)) =
+            Ctl::svc_disconnect(ServiceDisconnectReason::PayloadDropped)
+        else {
+            panic!()
+        };
+        assert_eq!(msg.reason(), ServiceDisconnectReason::PayloadDropped);
+        assert!(matches!(
+            msg.ack::<crate::io::Base>().result,
+            ControlResult::Stop
+        ));
+
+        for enabled in [true, false] {
+            let Control::Disconnect(Reason::KeepAlive(msg)) = Ctl::keepalive(enabled) else {
+                panic!()
+            };
+            assert_eq!(msg.is_enabled(), enabled);
+            assert!(matches!(
+                msg.ack::<crate::io::Base>().result,
+                ControlResult::Stop
+            ));
+        }
+
+        let Control::Disconnect(Reason::Error(mut msg)) = Ctl::err(io::Error::other("err")) else {
+            panic!()
+        };
+        *msg.get_mut() = io::Error::other("changed");
+        assert_eq!(msg.get_ref().to_string(), "changed");
+        let ControlResult::Error(res, _) = msg.ack::<crate::io::Base>().result else {
+            panic!()
+        };
+        assert_eq!(res.status(), crate::http::StatusCode::INTERNAL_SERVER_ERROR);
+
+        let Control::Disconnect(Reason::ProtocolError(msg)) =
+            Ctl::proto_err(super::super::ProtocolError::SlowPayloadTimeout)
+        else {
+            panic!()
+        };
+        assert!(matches!(
+            msg.get_ref(),
+            super::super::ProtocolError::SlowPayloadTimeout
+        ));
+
+        let Control::Disconnect(Reason::PeerGone(mut msg)) = Ctl::peer_gone(None) else {
+            panic!()
+        };
+        assert!(msg.get_ref().is_none());
+        assert!(msg.get_mut().is_none());
+        assert!(msg.take().is_none());
+        assert!(matches!(
+            msg.ack::<crate::io::Base>().result,
+            ControlResult::Stop
+        ));
     }
 }

@@ -1,0 +1,204 @@
+# Changes
+
+## [2.1.0] - 2026-10-04
+
+* Implement `ResourcePath` for `urly::Url` instead of `http::Uri`, remove `http` feature
+
+* Decode path segments with `urly`. Escapes that do not decode to valid utf-8 are
+  kept percent-encoded, the rest of the segment is decoded
+
+## [2.0.0] - 2026-10-01
+
+* Fix deserialization of maps with string keys from `Path`, e.g. `HashMap<String, String>`
+  failed with "Unexpected" error
+
+* Fix `recognize_checked()` calling the check twice for a rejected tail resource,
+  e.g. `/files/{tail}*` for `/files/a`
+
+* Fix wrong type name in `Path` deserialization error for `i32` values
+
+* `IntoPattern` is implemented for arrays of any size and of any `AsRef<str>` item,
+  it was limited to `&str` and `String` arrays of up to 16 items
+
+* Fix panic in `Path::unprocessed()` and `Path::get("tail")` after a prefix resource
+  matched the whole path, e.g. prefix `/app` for `/app`. `Path::skip()` is limited
+  to the path length
+
+* Fix wrong segment values for paths longer than 64KiB, offsets were stored
+  as `u16` and wrapped. `Path::skip()` takes `u32`
+
+* Fix undefined behavior, percent-decoding of `http::Uri` path segments could
+  produce invalid utf-8, e.g. `%FF`. Such segments are kept percent-encoded
+
+* Fix static text in patterns being used as a regex, e.g. `/{name}.json` matched
+  `/fooXjson` and `/files(*` panicked
+
+* `ResourceDef` with several patterns uses the first one for `pattern()` and
+  resource path building, it used the last one. `Eq` and `Hash` compare all
+  patterns. Add `ResourceDef::patterns()`
+
+* Update API docs, document pattern syntax and percent-decoding of path segments
+
+* Rename `Router::recognize_mut_checked()` to `recognize_checked_mut()`
+
+* Rename `ResourceDef::resource_path()` and `resource_path_named()` to `build_path()`
+  and `build_path_named()`
+
+* Rename `RouterBuilder::rdef()` to `RouterBuilder::resource()`
+
+* `RouterBuilder::prefix()` accepts several patterns, same as `RouterBuilder::path()`
+
+* Remove `Path::unprocessed()`, use `Path::path()`. Remove `Path::query()`, use
+  `Path::get()`
+
+* Add `ResourceDef::set_name()` and `ResourceDef::is_prefix()`
+
+* Remove `ResourceDef::name_mut()`, use `ResourceDef::set_name()`
+
+* Add `ResourceId::new()`, `ResourceId::get()` and conversions from and to `u16`
+
+* `Path` index by position panics with a descriptive message
+
+* Remove deprecated `Router::build()` and `RouterBuilder::finish()`, and unused `ResourceInfo`
+
+* `ResourceDef::build_path()` accepts `IntoIterator`, an iterator can be passed by `&mut`.
+  `build_path()` and `build_path_named()` leave the path unchanged on failure
+
+* `RouterBuilder` registration methods return `&mut RouterEntry` instead of a tuple,
+  use `set_id()`, `set_name()`, `set_check_value()` and `resource_mut()`
+
+* Add `Path::into_inner()` and `IntoIterator` for `&Path`
+
+* Add `From<&String>`, `From<Vec<T>>` and `From<[T; N]>` for `ResourceDef`
+
+## [1.0.0] - 2025-11-24
+
+* Use ntex-bytes 1.0
+
+## [0.5.3] - 2024-01-16
+
+* Update http dependency
+
+## [0.5.2] - 2023-09-12
+
+* Add missing fmt::Debug impls
+
+## [0.5.1] - 2021-08-23
+
+* Fix: segments could be lost in case of immediate match
+
+## [0.5.0] - 2021-06-27
+
+* Use ntex-bytes instead of bytestring
+
+## [0.4.4] - 2021-06-14
+
+* Fix search order for normal and prefix paths
+
+## [0.4.3] - 2021-04-03
+
+* Disable some of regex features
+
+## [0.4.2] - 2021-03-16
+
+* Use `IntoPattern` for prefix resources
+
+## [0.4.1] - 2021-02-26
+
+* Fix: partial matches keep garbage in segments
+
+## [0.4.0] - 2021-02-23
+
+* Upgrade to bytestring 1.0
+
+## [0.3.8] - 2020-10-28
+
+* Router struct implements Clone trait
+
+## [0.3.7] - 2020-09-21
+
+* Fix hex conversion helper
+
+## [0.3.6] - 2020-09-11
+
+* Allow nested prefixed resources
+
+## [0.3.5] - 2020-05-09
+
+* Handle non-prefix and prefix resources combinations
+
+## [0.3.4] - 2020-04-17
+
+* Add ResourcePath impl for &T where T: ResourcePath
+
+## [0.3.3] - 2020-04-11
+
+* Fix `/` prefix match
+
+## [0.3.2] - 2020-04-06
+
+* Fix IdxSegment item for paths with no root
+
+## [0.3.1] - 2020-04-06
+
+* Fix url quoter
+
+* Add non-allocating path item
+
+## [0.3.0] - 2020-03-31
+
+* Case insensitive routing
+
+* Use prefix tree for underling data representation
+
+## [0.2.4] - 2019-12-31
+
+* Add `ResourceDef::resource_path_named()` path generation method
+
+## [0.2.3] - 2019-12-25
+
+* Add impl `IntoPattern` for `&String`
+
+## [0.2.2] - 2019-12-25
+
+* Use `IntoPattern` for `RouterBuilder::path()`
+
+## [0.2.1] - 2019-12-25
+
+* Add `IntoPattern` trait
+
+* Add multi-pattern resources
+
+## [0.2.0] - 2019-12-07
+
+* Update http to 0.2
+
+* Update regex to 1.3
+
+* Use bytestring instead of string
+
+## [0.1.5] - 2019-05-15
+
+* Remove debug prints
+
+## [0.1.4] - 2019-05-15
+
+* Fix checked resource match
+
+## [0.1.3] - 2019-04-22
+
+* Added support for `remainder match` (i.e "/path/{tail}*")
+
+## [0.1.2] - 2019-04-07
+
+* Export `Quoter` type
+
+* Allow to reset `Path` instance
+
+## [0.1.1] - 2019-04-03
+
+* Get dynamic segment by name instead of iterator.
+
+## [0.1.0] - 2019-03-09
+
+* Initial release

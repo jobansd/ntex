@@ -1,5 +1,195 @@
 # Changes
 
+## [1.14.0] - 2026-10-21
+
+* Add `tracker` feature for per-allocation memory attribution: `BytesTracker`, `BytesTrackerSnapshot`, `BytesMut::with_page_size_in()`, `BytesMut::set_tracker()` and `BytesMut::tracker()`. An attributed allocation stays charged until its last `Bytes`/`BytesMut` handle is dropped, on any thread; `set_tracker()` moves the charge, also for shared buffers; cached pages and copies made by `Bytes::trimdown()` are not charged. The feature grows the buffer header from 16 to 32 bytes (20 on 32-bit targets)
+
+* Fix out-of-bounds write in `BytePages::put_u8()` and `put_i8()` after `advance_mut()` filled the current page
+
+* Fix wrong buffer header for views 1 GiB or more into a shared buffer on 32-bit targets
+
+* Release cached pages above the new limit in `set_page_cache_size()` and `set_pages_cache()`
+
+* Copy only the requested range in `Bytes::slice()` of external storage
+
+* Remove `Buf` for `&str`, it panicked on reads that end inside a multi-byte char, use `str::as_bytes()`
+
+* Fix `Buf::advance(0)` panic for `io::Cursor` positioned past the end, check bounds without truncating the position on 32-bit targets
+
+* Remove `overuse` feature
+
+## [1.13.0] - 2026-10-17
+
+* Add `PageCacheMetrics`, per-thread page cache statistics: hits, misses, pages returned
+  to the cache, pages freed because the cache was full, cached pages and bytes per page size
+
+## [1.12.0] (2026-10-12)
+
+* Add `BytePages::iter()` and `BytePages::advance_to()`
+
+* `BytePages::move_to()` moves pages as is, small pages are no longer merged into the current page
+
+## [1.11.0] (2026-10-06)
+
+* Add `BytePageSize::Size128` and `BytePageSize::Size256` page sizes, `BytePageSize` is
+  `#[non_exhaustive]`
+
+* Add `BytePageSize::for_capacity()`, `BytePageSize::next()` and `BytePageSize::prev()`
+
+* Add `BytesMut::with_page_size()` and `BytesMut::page_size()`, a buffer with a page size returns
+  to the page cache when the last reference is dropped
+
+* A buffer with a page size grows into a page of the size that fits the new capacity, above the
+  largest page size it becomes a regular buffer. Buffers without a page size grow as before
+
+* The page cache limit depends on the page size, fewer pages are cached for larger sizes, add
+  `set_page_cache_size()` to set the limit of a single page size, deprecate `set_pages_cache()`.
+  More pages are cached for the 4 KiB to 16 KiB and 64 KiB page sizes, the read start, write and
+  read max page sizes of ntex-io
+
+* Remove `BytesMut::reserve_capacity()`, use `BytesMut::reserve_exact()`
+
+* `BytesMut::reserve_exact()` allocates exactly the new capacity plus the buffer header, a buffer
+  with a page size is not rounded up to a page
+
+* Add `BytePageSize::low()`, 2/32 of the page size
+
+* Add `BytesMut::reserve_more()`, if less than `BytePageSize::low()` remains, it compacts a buffer
+  that has room for half a page after its data, otherwise it grows the buffer to the next page size,
+  or by its capacity but at most 64 KiB
+
+## [1.10.0] (2026-10-01)
+
+* Remove deprecated `BufMut::writer()` and `buf::Writer`, `BytesMut` and `BytePages`
+  implement `io::Write`
+
+* `BytePages::append()` copies only data of up to 4 KiB, larger data is added as a page without
+  copying, and the spare capacity of the current page stays available for later writes
+
+* `BytePages::take()` and `BytePages::num_pages()` skip an empty current page, it keeps its
+  spare capacity
+
+* Add `BytesMut::reserve_exact()`, it reclaims or reallocates like `reserve()` but grows
+  to exactly the requested capacity
+
+* Fix reversed result of `PartialOrd<Bytes>` for slices, arrays, `str`, `Vec<u8>`
+  and `String`
+
+* Generate the shared `Bytes`/`BytesMut` trait impls and the `BufMut::put_*`
+  integer methods with macros
+
+* Reduce and narrow `unsafe` blocks in the buffer copy and storage code
+
+* `BytePage` implements `PartialEq` against `[u8]`, `[u8; N]`, `str`, `Vec<u8>`
+  and `String`, in both directions
+
+* Add `BytesMut::is_unique()`
+
+* Mark `StorageExt` as an `unsafe` trait, `Bytes` trusts the pointers and lengths
+  returned by its vtable
+
+* `Bytes::slice_checked()` returns `None` instead of overflowing for bounds
+  at `usize::MAX`
+
+* `BytePages::new()` and `BytePages::set_page_size()` panic on
+  `BytePageSize::Unset`, instead of panicking on the first write and disabling
+  the page cache of the thread
+
+* Add the `unsafe` `UninitSlice::as_uninit_slice_mut()` and deprecate
+  `AsMut<[MaybeUninit<u8>]>` for `UninitSlice`, which is unsound as safe code
+  could write uninitialized bytes into initialized memory
+
+* `BufMut::advance_mut()` for `Vec<u8>` panics when advancing past the capacity,
+  instead of exposing uninitialized memory
+
+* `BufMut::put()` for `BytesMut` grows the buffer instead of panicking when
+  the source is larger than the spare capacity
+
+* The page cache keeps at most 16 pages per page size by default, down from
+  128, use `set_pages_cache()` to change it
+
+* Sized pages allocate exactly their category size (4 KiB, 8 KiB, ...), the
+  page header is taken from the data capacity, so pages fit allocator size
+  classes. `BytePageSize::capacity()` reports the data capacity
+
+* Cached `BytePages` shrink their page list on drop, a large `BytePages` no
+  longer keeps its page list allocation in the thread-local cache
+
+* `BufMut` for `BytePages` treats the pages as growable: `remaining_mut()`
+  reports `usize::MAX - len`, `chunk_mut()` starts a new page when the current
+  one is full, `put()` copies across pages instead of panicking, and
+  `advance_mut(0)` no longer panics without a current page
+
+* `BytesMut` grows to at least twice its length when it reallocates, appending
+  in small steps no longer reallocates and copies the buffer on every write
+
+* `BytesMut::from(BytePages)` and `Bytes::from(BytePages)` take a single page
+  without copying
+
+* `BytePages::copy_to()` and `BytePages::clone()` share the current page instead
+  of copying it
+
+* `BytePages::split_to()` and `split_into()` keep the current page writable when
+  splitting inside it, the rest of the page is no longer wasted
+
+* Growing a `BytesMut` that is the only handle to an unpooled buffer uses `realloc`
+  instead of allocating and copying
+
+* `BytePages::len()` and `is_empty()` are O(1), the length of the pages is
+  tracked instead of summed on each call
+
+* `BytesMut::from(Bytes)` reuses the buffer instead of copying when the `Bytes`
+  is the only handle to it
+
+* Fix `Bytes::trimdown()` and `ByteString::trimdown()` for views near the end of a shared allocation,
+  such views retained the whole allocation
+
+* Add `BytePage::info()` to report the kind of storage backing a page
+
+* Add `BytePage::is_inline()` to report whether page data is stored inline
+
+* Deprecate and hide `BytePages::with_bytes_mut()`, it is not panic safe
+
+* Fix heap overflow in `BytesMut::reserve_capacity()` if capacity is less than length, it does nothing now
+
+* Fix `Buf::get_int()` and `Buf::get_int_le()` sign extension for less than 8 bytes
+
+* Fix missing synchronization when reusing a `BytePage` buffer released by another thread
+
+* Fix storage kind detection on big-endian platforms
+
+* Fix memory corruption with buffers of 4 GiB or more, capacity is limited to just under 4 GiB
+
+* Fix process abort when buffers are released or allocated during thread-local destruction
+
+* Fix `advance_to()` not panicking when advancing past the end of the buffer
+
+* Fix `Bytes::truncate()` and `Bytes::trimdown()` panics, and a data race, for `Bytes` split from a `BytesMut`
+
+* Fix `BytesMut::advance_to()` and `BytePage::advance_to()` truncating counts of 4 GiB or more
+
+* Fix clones of `BytePage` sharing mutable state, a clone is now an immutable view
+
+## [1.9.0] (2026-07-17)
+
+* Mark `BytePage::as_ptr()` as `unsafe`, as it has additional requirements that make it unsafe
+
+## [1.8.0] (2026-07-12)
+
+* Introduce external storage for Bytes and ByteString
+
+* Add support Arc<str> storage
+
+## [1.7.2] (2026-06-12)
+
+* Do not allocate default buffer for ButePages
+
+* Log pages overuse
+
+## [1.7.1] (2026-06-11)
+
+* Deprecate `Writer`
+
 ## [1.7.0] (2026-06-03)
 
 * Add From<ByteString> for Bytes impls

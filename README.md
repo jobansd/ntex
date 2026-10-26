@@ -1,48 +1,114 @@
-<div align="center">
- <p><h1>ntex</h1> </p>
-  <p><strong>Framework for composable network services.</strong> </p>
-  <p>
+<div>
+  <h1>ntex</h1>
+  <p><strong>Framework for composable network services.</strong></p>
 
-[![build status](https://github.com/ntex-rs/ntex/actions/workflows/linux.yml/badge.svg?branch=master&event=push)](https://github.com/ntex-rs/ntex/actions/workflows/linux.yml/badge.svg) 
-[![crates.io](https://img.shields.io/crates/v/ntex.svg)](https://crates.io/crates/ntex) 
-[![Documentation](https://img.shields.io/docsrs/ntex/latest)](https://docs.rs/ntex) 
-[![Version](https://img.shields.io/badge/rustc-1.88+-lightgray.svg)](https://releases.rs/docs/1.88.0/) 
-![License](https://img.shields.io/crates/l/ntex.svg) 
-[![codecov](https://codecov.io/gh/ntex-rs/ntex/branch/main/graph/badge.svg)](https://codecov.io/gh/ntex-rs/ntex/tree/main) 
-[![Chat on Discord](https://img.shields.io/discord/919288597826387979?label=chat&logo=discord)](https://discord.gg/4GtaeP5Uqu) 
- 
-  </p>
+[![Linux](https://github.com/ntex-rs/ntex/actions/workflows/linux.yml/badge.svg?branch=main)](https://github.com/ntex-rs/ntex/actions/workflows/linux.yml)
+[![crates.io](https://img.shields.io/crates/v/ntex.svg)](https://crates.io/crates/ntex)
+[![Documentation](https://img.shields.io/docsrs/ntex/latest)](https://docs.rs/ntex)
+[![MSRV](https://img.shields.io/badge/rustc-1.97+-lightgray.svg)](https://releases.rs/docs/1.97.0/)
+[![License](https://img.shields.io/crates/l/ntex.svg)](https://github.com/ntex-rs/ntex#license)
+[![codecov](https://codecov.io/gh/ntex-rs/ntex/branch/main/graph/badge.svg)](https://codecov.io/gh/ntex-rs/ntex/tree/main)
+[![Discord](https://img.shields.io/discord/919288597826387979?label=chat&logo=discord)](https://discord.gg/4GtaeP5Uqu)
 </div>
 
-## Build statuses
+ntex provides a strongly typed component for building
+asynchronous network applications. It includes HTTP/1, HTTP/2, WebSocket,
+TLS, and runtime-independent I/O support. MQTT, AMQP, and gRPC are provided
+by [related projects](#related-projects).
 
-| Platform         | Build Status |
-| ---------------- | ------------ |
-| Linux            | [![build status](https://github.com/ntex-rs/ntex/actions/workflows/linux.yml/badge.svg?branch=master&event=push)](https://github.com/ntex-rs/ntex/actions/workflows/linux.yml/badge.svg) |
-| macOS            | [![build status](https://github.com/ntex-rs/ntex/actions/workflows/osx.yml/badge.svg?branch=master&event=push)](https://github.com/ntex-rs/ntex/actions/workflows/osx.yml/badge.svg) |
-| Windows          | [![build status](https://github.com/ntex-rs/ntex/actions/workflows/windows.yml/badge.svg?branch=master&event=push)](https://github.com/ntex-rs/ntex/actions/workflows/windows.yml/badge.svg) |
+## Build status
+
+| Platform | Status |
+| --- | --- |
+| Linux | [![Linux](https://github.com/ntex-rs/ntex/actions/workflows/linux.yml/badge.svg?branch=main)](https://github.com/ntex-rs/ntex/actions/workflows/linux.yml) |
+| macOS | [![macOS](https://github.com/ntex-rs/ntex/actions/workflows/osx.yml/badge.svg?branch=main)](https://github.com/ntex-rs/ntex/actions/workflows/osx.yml) |
+| Windows | [![Windows](https://github.com/ntex-rs/ntex/actions/workflows/windows.yml/badge.svg?branch=main)](https://github.com/ntex-rs/ntex/actions/workflows/windows.yml) |
 
 ## Usage
 
-ntex supports multiple async runtimes, runtime must be selected as a feature. Available options are `compio`, `tokio`,
-`neon` or `neon-uring`.
+Add ntex to your project:
 
 ```toml
 [dependencies]
-ntex = { version = "2", features = ["tokio"] }
+ntex = "4"
 ```
 
-## Documentation & community resources
+A minimal web server looks like this:
 
-* [Documentation](https://ntex.rs)
-* [Docs.rs](https://docs.rs/ntex)
-* Minimum supported Rust version: 1.88 or later
+```rust
+use ntex::{SharedCfg, web};
+
+#[web::get("/")]
+async fn index() -> &'static str {
+    "Hello world!"
+}
+
+#[ntex::main]
+async fn main() -> std::io::Result<()> {
+    web::HttpServer::new(async |_| web::App::new().service(index))
+        .bind("127.0.0.1:8080", SharedCfg::new("hello-world"))?
+        .run()
+        .await
+}
+```
+
+## Runtime selection
+
+Without an explicit runtime feature, ntex uses its native single-threaded
+runtime and automatically selects a platform I/O reactor:
+
+- Linux tries `io_uring` and falls back to polling.
+- Other Unix platforms use polling.
+- Windows uses IOCP.
+
+Alternative runtimes and native reactors can be selected with Cargo features:
+
+| Feature | Runtime or reactor |
+| --- | --- |
+| `tokio` | Tokio local runtime and I/O driver |
+| `compio` | Compio runtime and completion-based I/O |
+| `neon-polling` | Native runtime with the polling reactor on Unix |
+| `neon-uring` | Native runtime with `io_uring` on Linux |
+
+Enable at most one runtime or native-reactor selection feature. For example:
+
+```toml
+[dependencies]
+ntex = { version = "4", features = ["tokio"] }
+```
+
+## Optional features
+
+- `openssl` and `rustls` enable the corresponding TLS integrations.
+- `compress` enables HTTP content compression (gzip, deflate and zstd).
+- `cookie` enables cookie support.
+- `ws` enables WebSocket APIs and is enabled by default.
+
+## Related projects
+
+| Project | Description |
+| --- | --- |
+| [ntex-mqtt](https://github.com/ntex-rs/ntex-mqtt) | Client and server framework for MQTT v5 and v3.1.1 |
+| [ntex-amqp](https://github.com/ntex-rs/ntex-amqp) | Client and server framework for AMQP 1.0 |
+| [ntex-grpc](https://github.com/ntex-rs/ntex-grpc) | Client and server framework for gRPC |
+
+## Documentation and community
+
+- [Framework guide](https://docs.ntex.rs/index.html)
+- [Web framework documentation](https://ntex.rs)
+- [API documentation](https://docs.ntex.rs/api/ntex/index.html)
+- [Examples](https://github.com/ntex-rs/examples)
+- [Release changes](https://github.com/ntex-rs/ntex/blob/main/ntex/CHANGES.md)
+- [Migrating from ntex 3 to ntex 4](https://docs.ntex.rs/migration_3to4.html)
+- Minimum supported Rust version: 1.97
 
 ## License
 
-This project is licensed under
+This project is licensed under either of:
 
-* Apache License, Version 2.0, ([LICENSE-APACHE](LICENSE-APACHE) or
-  [http://www.apache.org/licenses/LICENSE-2.0])
-* MIT license ([LICENSE-MIT](LICENSE-MIT) or
-  [http://opensource.org/licenses/MIT])
+- Apache License, Version 2.0
+  ([LICENSE-APACHE](https://github.com/ntex-rs/ntex/blob/main/LICENSE-APACHE) or
+  <https://www.apache.org/licenses/LICENSE-2.0>)
+- MIT license
+  ([LICENSE-MIT](https://github.com/ntex-rs/ntex/blob/main/LICENSE-MIT) or
+  <https://opensource.org/licenses/MIT>)

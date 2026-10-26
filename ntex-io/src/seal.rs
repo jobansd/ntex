@@ -1,8 +1,8 @@
 use std::{any::Any, any::TypeId, fmt, io, ops, task::Context, task::Poll};
 
-use crate::{Filter, FilterCtx, Io, Readiness};
+use crate::{Filter, FilterCtx, Io};
 
-/// Sealed filter type
+/// Type-erased filter chain used by [`IoBoxed`].
 pub struct Sealed(pub(crate) Box<dyn Filter>);
 
 impl fmt::Debug for Sealed {
@@ -33,34 +33,31 @@ impl Filter for Sealed {
     }
 
     #[inline]
-    fn poll_read_ready(&self, cx: &mut Context<'_>) -> Poll<Readiness> {
-        self.0.poll_read_ready(cx)
-    }
-
-    #[inline]
-    fn poll_write_ready(&self, cx: &mut Context<'_>) -> Poll<Readiness> {
-        self.0.poll_write_ready(cx)
+    fn poll_ready(&self, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        self.0.poll_ready(cx)
     }
 }
 
 #[derive(Debug)]
-/// Boxed `Io` object with erased filter type
-pub struct IoBoxed(Io<Sealed>);
+/// An [`Io`] object whose filter-chain type has been erased.
+pub struct IoBoxed(pub(crate) Io<Sealed>);
 
 impl IoBoxed {
     #[inline]
     #[must_use]
-    /// Clone current io object.
+    /// Transfers the live I/O state into a new object.
     ///
-    /// Current io object becomes closed.
+    /// This does not clone the connection. The current object is replaced with
+    /// a stopped placeholder and should no longer be used for I/O.
     pub fn take(&mut self) -> Self {
-        IoBoxed(self.0.take())
+        // SAFETY: `&mut self` rules out borrows of the inner `Io`
+        IoBoxed(unsafe { self.0.take() })
     }
 }
 
 impl<F: Filter> From<Io<F>> for IoBoxed {
     fn from(io: Io<F>) -> Self {
-        Self(io.seal())
+        io.boxed()
     }
 }
 
@@ -81,35 +78,79 @@ impl From<IoBoxed> for Io<Sealed> {
 
 #[cfg(test)]
 mod tests {
+    use std::any::TypeId;
+
     use ntex_bytes::Bytes;
     use ntex_codec::BytesCodec;
-    use ntex_service::{ServiceFactory, cfg::SharedCfg, fn_service};
 
     use super::*;
-    use crate::{testing::IoTest, utils::seal};
+    use crate::{FilterBuf, FilterLayer, filter::NullFilter, testing::IoTest};
+
+    #[derive(Debug)]
+    struct Tagged;
+
+    impl FilterLayer for Tagged {
+        fn query(&self, id: TypeId) -> Option<Box<dyn Any>> {
+            (id == TypeId::of::<&'static str>()).then(|| Box::new("tagged") as Box<dyn Any>)
+        }
+
+        fn process_read_buf(&self, buf: &FilterBuf<'_>) -> io::Result<()> {
+            buf.with_read_buffers(|src, dst| {
+                if let Some(src) = src.take() {
+                    dst.extend_from_slice(&src);
+                }
+            });
+            Ok(())
+        }
+
+        fn process_write_buf(&self, buf: &FilterBuf<'_>) -> io::Result<()> {
+            buf.with_write_buffers(ntex_bytes::BytePages::move_to);
+            Ok(())
+        }
+    }
+
+    /// Filter chain wrapper built from the forwarding macros.
+    struct Wrapper<F> {
+        inner: F,
+    }
+
+    impl<F: Filter> Filter for Wrapper<F> {
+        crate::forward_ready!(inner);
+        crate::forward_query!(inner);
+        crate::forward_shutdown!(inner);
+
+        fn process_read_buf(&self, ctx: &mut FilterCtx<'_>) -> io::Result<()> {
+            self.inner.process_read_buf(ctx)
+        }
+
+        fn process_write_buf(&self, ctx: &mut FilterCtx<'_>) -> io::Result<()> {
+            self.inner.process_write_buf(ctx)
+        }
+    }
 
     #[ntex::test]
-    async fn test_seal() {
+    async fn sealed_chain_delegates_to_inner_filter() {
+        assert_eq!(format!("{:?}", Sealed(Box::new(NullFilter))), "Sealed");
+
         let (client, server) = IoTest::create();
         client.remote_buffer_cap(1024);
-        client.write("REQ");
 
-        let svc = seal(fn_service(|io: IoBoxed| async move {
-            let t = io.recv(&BytesCodec).await.unwrap().unwrap();
-            assert_eq!(t, b"REQ".as_ref());
-            io.send(Bytes::from_static(b"RES"), &BytesCodec)
-                .await
-                .unwrap();
-            Ok::<_, ()>(())
-        }))
-        .pipeline(())
-        .await
-        .unwrap();
+        let io = Io::from(server).add_filter(Tagged).boxed();
+        let io: Io<Sealed> = io.into();
+        let io = io.map_filter(|inner| Wrapper { inner });
+        assert_eq!(io.query::<&'static str>().get(), Some("tagged"));
+        assert!(io.query::<u32>().get().is_none());
 
-        let srv: Io<Sealed> = Io::new(server, SharedCfg::default()).boxed().into();
-        let _ = svc.call(srv).await;
+        client.write("hello");
+        let item = io.recv(&BytesCodec).await.unwrap().unwrap();
+        assert_eq!(item, Bytes::from_static(b"hello"));
 
-        let buf = client.read().await.unwrap();
-        assert_eq!(buf, b"RES".as_ref());
+        io.send(Bytes::from_static(b"world"), &BytesCodec)
+            .await
+            .unwrap();
+        assert_eq!(client.read().await.unwrap(), Bytes::from_static(b"world"));
+
+        io.shutdown().await.unwrap();
+        assert!(io.is_closed());
     }
 }

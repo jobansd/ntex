@@ -1,6 +1,6 @@
 [package]
 name = "ntex-util"
-version = "3.6.1"
+version = "4.5.0"
 authors = ["ntex contributors <team@ntex.rs>"]
 description = "Utilities for ntex framework"
 keywords = ["network", "framework", "async", "futures"]
@@ -10,7 +10,7 @@ documentation = "https://docs.rs/ntex-util/"
 categories = ["network-programming", "asynchronous"]
 license = "MIT OR Apache-2.0"
 edition = "2024"
-rust-version = "1.88"
+rust-version = "1.97"
 
 [lib]
 name = "ntex_util"
@@ -25,16 +25,17 @@ ntex-error = { workspace = true }
 ntex-service = { workspace = true }
 ntex-rt = { workspace = true }
 
-foldhash = { workspace = true }
 bitflags = { workspace = true }
-log = { workspace = true }
-slab = { workspace = true }
+foldhash = { workspace = true }
 futures-timer = { workspace = true }
 futures-core = { workspace = true }
+hashbrown = { workspace = true, features = ["serde"] }
+log = { workspace = true }
 pin-project-lite = { workspace = true }
+slab = { workspace = true }
 thiserror = { workspace = true }
 
 [dev-dependencies]
 ntex = { workspace = true }
-futures-util = { workspace = true }
 async-channel = { workspace = true }
+futures-util = { workspace = true }

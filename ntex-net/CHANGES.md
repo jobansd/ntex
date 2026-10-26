@@ -1,5 +1,422 @@
 # Changes
 
+## [4.7.0] - Unreleased
+
+* compio: abort the process if dropping the runtime panics after the event loop panicked
+
+## [4.6.0] - 2026-10-21
+
+* Add `tracker` feature, enables `ntex-io/tracker`. io-uring charges a received ring page to
+  the connection's read buffer tracker
+
+* iocp: co-allocate each stream's read and write operations, removing one heap
+  allocation per connection while preserving their completion lifetimes
+
+* iocp: allocate the operations of a stream read through socket state
+  notifications without the unused read `OVERLAPPED`, 40 bytes less per
+  connection
+
+* iocp: reject handler registration during construction or dispatch with an
+  explicit panic instead of losing registrations
+
+* iocp: cancel abandoned connection attempts promptly while retaining operation
+  memory until Windows delivers the completion
+
+* **Breaking:** make IOCP `Handler`, `ReactorApi`, `Overlapped` and
+  `Reactor::register()` crate-private; `Reactor` remains public
+
+* iocp: queued blocking closes continue when shutdown is cancelled or the
+  runtime stops, without losing their sockets
+
+* iocp: keep operation-state borrows disjoint from kernel-owned `OVERLAPPED`
+  memory during submission, cancellation and completion
+
+* iocp: wait for input with socket state notifications (`ProcessSocketNotifications`)
+  instead of a zero-byte `WSARecv` per read, saves a recv post and its completion per
+  read. Windows builds before 20348 (Windows 10, Server 2019), blocking sockets and
+  sockets that fail to register keep using zero-byte recvs
+
+* io-uring: protect the notifier read buffer during errors and unwinding;
+  retain only the counter allocation if cancellation cannot establish its safety
+
+* compio: drive the runtime loop from ntex to track runtime busy time
+
+* polling, tokio: write a single page without building the `writev` slice array
+
+* polling, io-uring: dropping a pending connect future cancels the connect and closes
+  its socket, instead of keeping it until the connect completes
+
+* polling: keep read interest armed while reads are paused, it is disarmed by the next
+  readable event. A resume before new data needs neither an interest update nor a
+  speculative read
+
+## [4.5.0] - 2026-10-12
+
+* polling, tokio: keep writing within one write cycle until the socket stops
+  accepting data or 256 KB is written, instead of a single 64 KB `writev`
+
+* polling: keep reading while reads fill the read buffer, up to 256 KB or
+  read backpressure, instead of waiting for the next poll cycle
+
+* polling: connection teardown does not reset poll interest before detaching the socket,
+  saves an `epoll_ctl` per connection
+
+* polling: new connections are registered with read interest armed, saves an `epoll_ctl`
+  and a speculative read per connection
+
+* polling, tokio: write directly from the write buffer pages instead of
+  taking them out and returning the unwritten ones
+
+* polling, tokio: raise `writev` limits to 32 buffers and 256 KB
+
+* io-uring: register the ring fd to skip the fd lookup on every `io_uring_enter`
+
+* io-uring: rings are created with `IORING_SETUP_NO_SQARRAY` on Linux 6.6+
+
+* io-uring: the remote notifier is a re-armed eventfd read instead of a multishot poll,
+  a notification does not need a `read()` syscall
+
+* io-uring: receives that wait for input select 4 KB read pages from a per-reactor provided
+  buffer ring, idle connections do not hold read buffers. Received pages are passed to the
+  connection without a copy
+
+* io-uring: `ReactorApi::submit()` takes a closure that initializes the submission entry
+  in place, `submit_inline()` is removed. Requires ntex-io-uring 1.0
+
+* iocp: pausing reads leaves the zero-byte recv in flight instead of cancelling it, saves a
+  `CancelIoEx` and a completion per pause
+
+* iocp: keep unsent output in a `BytePages` instead of a fixed array of 32
+  pages, send up to 256 KB at once, and send the rest of a partial send
+  before newer output
+
+* iocp: store stream items inline in the slab and keep the peer address as
+  a `SocketAddr`, saving an allocation and ~100 bytes per connection
+
+* iocp: close sockets on the reactor thread instead of the blocking pool,
+  only a close that waits for an application-set linger timeout is moved
+  there
+
+* iocp: check that the socket provider returns IFS handles once per address
+  family instead of for every accepted or connected stream
+
+* polling: close sockets on the reactor thread instead of the blocking pool,
+  only a close that waits for an application-set linger timeout is moved
+  there
+
+## [4.4.0] - 2026-10-08
+
+* polling: drain deferred socket cleanup before waiting, even when no new
+  stream events arrive
+
+* Disable Nagle (`TCP_NODELAY`) on connected tcp streams for the polling, io-uring,
+  iocp and compio backends, as on accepted streams
+
+## [4.3.0] - 2026-10-07
+
+* Update to ntex-io 4.3 config api, iocp read buffers use the adaptive read page size
+
+## [4.2.1] - 2026-10-05
+
+* `Address::port()` for `urly::Url` uses the urly default ports, `ftp` gets port 21
+
+## [4.2.0] - 2026-10-04
+
+* Implement `Address` for `urly::Url`, remove `Address` impl for `http::Uri` and
+  `ntex-http` dependency
+
+* iocp: send up to 32 buffers per `WSASend`, was 16
+
+## [4.1.0] - 2026-10-01
+
+* polling: use level-triggered interest where supported and change it only
+  when it differs, instead of re-arming oneshot interest after every event
+
+* polling: queue interest changes and apply them with the next wait, avoids a
+  syscall per change on kqueue
+
+* polling: detach the stream on `EPOLLHUP`/`EPOLLERR`
+
+* polling: use the `ntex-polling` fork of `polling`
+
+* polling: wake the reactor with a `Notifier`, the poller is no longer shared
+  between threads
+
+* io-uring: publish consumed completions before waiting, the kernel counted
+  them as pending and the wait returned immediately, doubling loop iterations
+
+* Do not notify the driver for tasks woken while handling driver events,
+  avoids a wakeup syscall and an extra loop iteration per woken task
+
+* io-uring: push operations without synchronizing the submission queue for
+  every operation
+
+* io-uring: fix stalled I/O while tasks keep the runtime busy, deferred
+  completions were not posted until the runtime became idle; skip the submit
+  syscall when there is nothing to submit
+
+* io-uring: fix stalled I/O while tasks keep the runtime busy, deferred
+  completions were not posted until the runtime became idle; skip the submit
+  syscall when there is nothing to submit
+
+* io-uring: fix lost submissions when queued operations wrap around the end of
+  the pending queue storage, the wrapped part was dropped without being
+  submitted
+
+* Remove the `neon-iocp` feature, it had no effect, Windows always uses IOCP
+
+* IOCP: support unix domain socket connect, `ConnectEx` requires a bound socket
+  and only IP sockets were bound, so `unix_connect` failed with
+  "Unsupported address domain"
+
+* compio: map Win32 network errors of connect, read and write on Windows to
+  `WinSock` errors, a refused connect reported `ErrorKind::Uncategorized`
+
+* IOCP: failed socket completions report `WinSock` errors, a refused `ConnectEx`
+  returned `ERROR_CONNECTION_REFUSED` with `ErrorKind::Uncategorized` instead of
+  `ConnectionRefused`, resets, aborts and unreachable errors were also uncategorized
+
+* polling: shut the socket down inline instead of on the blocking pool; a
+  deferred shutdown could run after the runtime stopped and the descriptor was
+  closed and reused, shutting down an unrelated socket
+
+* IOCP: querying `PeerAddr` after the runtime stopped returns `None` instead of
+  panicking
+
+* IOCP: derive the `OVERLAPPED` pointer handed to the kernel from the pointer
+  owning the op, instead of a shared borrow of its first field
+
+* IOCP: refuse sockets from non-IFS layered service providers (LSPs), which can
+  post completions for synchronously completed operations and corrupt reused
+  operation slots
+
+* IOCP: close the sockets of connects still pending when the runtime stops, and
+  keep their `OVERLAPPED` allocated since the kernel still completes into it
+
+* The compio runtime start log reports the actual driver, it always reported `Poll`
+
+* Fix stalled I/O in the compio backend when the `block_on` future woke another task
+  whenever it was polled, e.g. while reading an h2 response body
+
+* Fix panic on compio runtime shutdown when a dropped task spawned a new task
+  from its destructor, e.g. an h2 stream sending RST_STREAM
+
+* IOCP reads wait for input with a zero-byte recv and then read it in place,
+  idle connections no longer hold a read buffer and input arriving while
+  earlier input is unconsumed is appended without a second buffer
+
+* Fix lost input in the compio backend, a read shorter than the unconsumed
+  input already in the read buffer was dropped
+
+* Do not report `NotConnected` from a graceful shutdown as a transport error, macOS
+  fails `shutdown()` with `ENOTCONN` once the peer has closed the connection
+
+* Fix aliasing violation in the IOCP backend when a write was issued while a
+  recv completed immediately, the operations are now boxed separately
+
+* Fix IOCP shutdown not cancelling an in-flight send while a recv was also
+  pending, the send could start another one after the close had begun
+
+* Fix compio graceful shutdown hanging past the shutdown timeout when the peer
+  stops reading. The write task waited on the in-flight write and never polled
+  the shutdown deadline; the write is now cancelled once the connection is
+  terminated
+
+* Fix IPv6 host handling in `Connect`: parse the port of `[v6]:port`, and
+  resolve `[v6]`, `[v6]:port` and bare `v6` hosts (including `Uri` hosts)
+  without DNS lookup
+
+* Fix `Connect` display repeating the port of `host:port` hosts, IPv6 hosts are
+  displayed in brackets
+
+* Resolve IPv6 hosts with a numeric zone id (`fe80::1%3`) without DNS lookup
+
+* Fix corrupted output in the polling backend when a write includes inline
+  pages. The write vector pointed into each page before it was moved into
+  place, so for a page stored inline it pointed at a reused local, and the
+  last such page was sent in place of the others
+
+* Fix corrupted output in the tokio backend when the write buffer holds
+  inline pages. The write slice was taken before the page was moved into
+  the pages array, so it pointed at the data's old location
+
+* Resend with a plain send when an io-uring zero-copy send fails with
+  `ENOMEM` or `ENOBUFS` and disable zero-copy for the connection. Pinned
+  pages are charged against `RLIMIT_MEMLOCK`, shared by all connections,
+  and exhausting it terminated the connection
+
+* Disable io-uring zero-copy sends for a connection once the kernel reports
+  that it copied the data anyway (loopback, veth, NICs without scatter-gather),
+  using `IORING_SEND_ZC_REPORT_USAGE`; kernels without it fall back to plain
+  zero-copy. Zero-copy is used only for sends of 16KiB or more
+
+* Send a single heap backed page with an io-uring `SendOne` operation that
+  stores the page itself, without allocating a boxed send buffer
+
+* Gather up to 16 write pages into one io-uring send with `SendMsg` /
+  `SendMsgZc`, up to 256KiB, or 128KiB for zero-copy. A send op per page
+  took a ring round-trip for every page and limited write throughput.
+  Send buffers are boxed, so the kernel no longer references pages stored
+  in the operations slab, which moves its entries when it grows
+
+* Fix reordered output after a partial io-uring zero-copy send. The next
+  chunk was sent right away while the unsent remainder was only returned to
+  the write buffer once the notification arrived, so it reached the peer
+  after later data. The remainder is now returned before the next send; it
+  shares the page's data, only `Vec` backed pages are copied, and the page
+  itself stays with the kernel until the notification
+
+* Fix a panic in the IOCP backend when a filter writes while processing
+  input, as a TLS server answering a ClientHello does. A recv that completed
+  immediately ran the read filters while the stream storage was taken, so a
+  direct write of their output, once it reached the write buffer threshold,
+  panicked and left the storage taken, breaking every stream on that thread
+
+* Bound io-uring reads chained on `IORING_CQE_F_SOCK_NONEMPTY` by the read
+  buffer's capacity. The chain grew the buffer while the peer kept sending
+  and ignored read backpressure; it now stops once the buffer is full and
+  releases it, so the high watermark applies
+
+* Keep io-uring zero-copy sends alive until their notification arrives. A
+  send that completed after its stream was closed, or was canceled, was
+  released before the notification, which then panicked with `invalid key`
+  and freed a buffer the kernel still referenced
+
+* Bound the IOCP socket close by the connection's shutdown timeout. The
+  close waits for cancelled operations to complete before closing the
+  socket, and a cancellation that never completed left the socket open and
+  `Io::shutdown()` pending forever. Once the timeout expires the socket is
+  now closed with a reset and the close fails with `TimedOut`; the stream
+  is released when the operations complete. No read or write is started
+  once the close has begun
+
+* Update the connect context of client sockets in the IOCP backend. Sockets
+  connected with `ConnectEx` stayed partially connected, so `shutdown` failed
+  with `WSAENOTCONN`: a graceful close skipped `closesocket`, leaking the
+  socket and never sending a `FIN`, and a force close ended with a `FIN`
+  instead of a reset
+
+* Always close the socket in the IOCP backend, even if the graceful
+  `shutdown` fails. The socket was released without `closesocket` on a
+  failed `shutdown`, leaking it. The close that follows pending operations
+  also reports its outcome only once the socket is closed, and with the
+  error, instead of reporting success before closing it
+
+* Close sockets that are still open when the runtime stops in the IOCP
+  backend. They were never closed. A socket with an operation still in
+  flight is closed, but its state is kept allocated, since the kernel
+  completes the cancelled operation into it after the reactor has stopped
+
+* Report the socket error on `EPOLLERR` in the polling backend. When no read or
+  write surfaced it, a reset was reported as a clean close
+
+* Treat peer half-close as read eof in the io-uring backend, as the polling
+  backend does. `POLLRDHUP` terminated the connection, so a response to a
+  peer that half-closed after its request was dropped and the peer saw a
+  clean close. The disconnect poll is removed, disconnects are detected by
+  reads and writes
+
+* Reset read cancel state when a canceled `Recv` completes normally in the
+  io-uring backend, the stale state disabled later read pauses
+
+* Cancel in-flight operations of a stream before closing it in the io-uring
+  backend. `Close` only removes the descriptor from the file table, pending
+  operations kept the socket open, so a
+  force-closed or dropped connection was neither reset nor closed until the
+  peer went away
+
+* Fix socket leak on runtime shutdown in the io-uring backend. Operations
+  queued during the last turn are submitted and all in-flight operations are
+  canceled before cleanup, then every socket still owned by the backend is
+  closed, which also breaks the `IoContext` reference cycle
+
+* Return the pages a failed write took to the write buffer in the polling and
+  tokio backends, they were dropped and stayed counted as in-flight output
+
+* Arm write interest from the out-of-band write path in the polling backend
+  instead of leaving it to the write task, which retried the write only to
+  have it block again
+
+* Treat `EPOLLERR` as terminal in the polling backend, it is reported whether
+  or not it was requested and re-arming on it makes no progress
+
+* Fix polling reactor cleanup leaking sockets whose primary handle was dropped
+  but whose secondary drop had not yet been processed
+
+* Reset the connection on a force close instead of closing it gracefully, the
+  receive queue drain and SHUT_RDWR turned a truncated response into a clean
+  FIN that a peer could not tell apart from a complete one
+
+* Drop poll interest before tearing a connection down in the polling backend,
+  and drain its receive queue on the reactor thread instead of the blocking
+  pool, the socket is still registered so the drain raced the reactor
+
+* Read into the io context buffer in place in the tokio and polling backends,
+  they read synchronously so they no longer need a detached buffer
+
+* Discard the socket receive queue before closing a connection, closing a
+  socket with unread input aborts it with an RST and loses the output that the
+  graceful shutdown just drained. The io-uring backend leaves this to a recv
+  that is already in flight rather than racing it
+
+* Report the number of bytes written to the peer from every backend, so that
+  output a completion based backend still owns is accounted for as outstanding
+
+* Return output that did not reach the peer back to the write buffer in the
+  io-uring backend, a partial send silently dropped the rest of the page
+
+* Close both directions of the connection at the end of a graceful shutdown in
+  the tokio and compio backends, previously they only shut down the write
+  direction
+
+* Fix compio backend hang, the io task could stop without reporting completion
+  to the io context if the write buffer was empty
+
+* Drop unreachable IoContext::shutdown() step from io task shutdown
+
+* Support eager writes with the IOCP backend
+
+* Update IoContext::take_read_buf()/release_read_buf() api usage
+
+* Update IoContext::update_write_status() api usage
+
+* Produce io::ErrorKind::WriteZero for backend impl
+
+* Update compio to 0.19
+
+## [4.0.1] - 2026-09-18
+
+* Api docs improvements
+
+## [4.0.0] - 2026-09-14
+
+* Migrate to ntex-service 5
+
+## [3.15.0] - 2026-08-09
+
+* Do not unwind reactor panics, forward handling to arbiter
+
+## [3.14.1] - 2026-08-06
+
+* IOCP driver cleanups
+
+## [3.14.0] - 2026-08-03
+
+* Add windows IOCP driver (neon-iocp)
+
+## [3.13.1] - 2026-07-17
+
+* io-ring driver could use invalid BytePage pointer #932
+
+## [3.13.0] - 2026-06-21
+
+* Cleanup io-uring requests before drop
+
+* polling (neon) driver: do not panic with "called `Option::unwrap()` on a `None`
+  value" when a filter emits a large (>= write_buf_threshold) write burst during
+  read processing; the reentrant write is now deferred until the streams slab is
+  released instead of re-taking it
+
 ## [3.12.0] - 2026-05-15
 
 * Update ntex-io

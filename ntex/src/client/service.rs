@@ -5,24 +5,43 @@ use serde::Serialize;
 use crate::http::body::{Body, BodyStream};
 use crate::http::header::{self, HeaderMap, HeaderName, HeaderValue};
 use crate::http::{Message, Payload, RequestHead, ResponseHead, error::HttpError};
-use crate::{time::Millis, util::Bytes, util::Stream};
+use crate::{Cfg, time::Millis, util::Bytes, util::Stream};
 
 use super::{ClientConfig, error::ClientError};
 
 #[derive(Debug)]
+/// HTTP response passed through client middleware.
 pub struct ServiceResponse {
     pub(super) head: ResponseHead,
     pub(super) payload: Payload,
-    pub(super) config: ClientConfig,
+    pub(super) config: Cfg<ClientConfig>,
+}
+
+impl ServiceResponse {
+    /// Returns mutable access to the response head.
+    pub fn head(&mut self) -> &mut ResponseHead {
+        &mut self.head
+    }
+
+    /// Returns mutable access to the response payload.
+    pub fn payload(&mut self) -> &mut Payload {
+        &mut self.payload
+    }
+
+    /// Takes the response payload, leaving an empty payload behind.
+    pub fn take_payload(&mut self) -> Payload {
+        std::mem::replace(&mut self.payload, Payload::None)
+    }
 }
 
 #[derive(Debug)]
+/// HTTP request passed through client middleware before it is sent.
 pub struct ServiceRequest {
     pub(super) head: Message<RequestHead>,
     pub(super) headers: Option<HeaderMap>,
     pub(super) addr: Option<net::SocketAddr>,
     pub(super) body: Body,
-    pub(super) timeout: Millis,
+    pub(super) timeout: Option<Millis>,
     pub(super) response_decompress: bool,
 }
 
@@ -33,18 +52,21 @@ impl ServiceRequest {
             headers: None,
             addr: None,
             body: Body::None,
-            timeout: Millis::ZERO,
+            timeout: None,
             response_decompress: true,
         }
     }
 
     #[inline]
-    /// Mutable reference to a http message part of the request
+    /// Returns mutable access to the request head.
     pub fn head(&mut self) -> &mut RequestHead {
         &mut self.head
     }
 
-    /// Mutable reference to the request's extra headers.
+    /// Returns mutable access to the request's extra headers.
+    ///
+    /// Extra headers override headers with the same name in the request head
+    /// when the request is encoded.
     pub fn headers(&mut self) -> &mut HeaderMap {
         if self.headers.is_none() {
             self.headers = Some(HeaderMap::new());
@@ -52,18 +74,18 @@ impl ServiceRequest {
         self.headers.as_mut().unwrap()
     }
 
-    /// Get request's body
+    /// Returns mutable access to the request body.
     pub fn body(&mut self) -> &mut Body {
         &mut self.body
     }
 
-    /// Get request's address
+    /// Returns mutable access to the pre-resolved server address.
     pub fn address(&mut self) -> &mut Option<net::SocketAddr> {
         &mut self.addr
     }
 
     pub(super) fn set_json<T: Serialize>(&mut self, value: &T) -> Result<(), ClientError> {
-        self.body = serde_json::to_string(value)
+        self.body = crate::http::helpers::json_body(value)
             .map_err(|e| ClientError::Error(Rc::new(e)))?
             .into();
         self.set_header_if_none(header::CONTENT_TYPE, "application/json")?;

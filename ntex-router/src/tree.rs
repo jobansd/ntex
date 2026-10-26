@@ -35,9 +35,7 @@ enum PathState {
 impl Value {
     fn value(&self) -> usize {
         match self {
-            Value::Val(v) | Value::Slash(v) | Value::Prefix(v) | Value::PrefixSlash(v) => {
-                *v
-            }
+            Value::Val(v) | Value::Slash(v) | Value::Prefix(v) | Value::PrefixSlash(v) => *v,
         }
     }
 }
@@ -201,9 +199,7 @@ impl Tree {
                     match val {
                         Item::Value(val) => {
                             let v = match val {
-                                Value::Slash(v)
-                                | Value::Prefix(v)
-                                | Value::PrefixSlash(v) => *v,
+                                Value::Slash(v) | Value::Prefix(v) | Value::PrefixSlash(v) => *v,
                                 Value::Val(_) => continue,
                             };
                             if check(v, resource) {
@@ -224,7 +220,7 @@ impl Tree {
                             if let Some((val, skip)) = result {
                                 let path = resource.resource_path();
                                 path.segments = segments;
-                                path.skip += skip as u16;
+                                path.skip(skip as u32);
                                 return Some(val);
                             }
                         }
@@ -276,7 +272,7 @@ impl Tree {
                             if let Some((val, skip)) = result {
                                 let path = resource.resource_path();
                                 path.segments = segments;
-                                path.skip += skip as u16;
+                                path.skip(skip as u32);
                                 return Some(val);
                             }
                         }
@@ -303,7 +299,7 @@ impl Tree {
             if let Some((val, skip)) = res {
                 let path = resource.resource_path();
                 path.segments = segments;
-                path.skip += skip as u16;
+                path.skip(skip as u32);
                 return Some(val);
             }
         }
@@ -419,8 +415,8 @@ impl Tree {
                                     PathItem::Segment(m.as_str().to_string())
                                 } else {
                                     PathItem::IdxSegment(
-                                        (base_skip + (skip + m.start()) as isize) as u16,
-                                        (base_skip + (skip + m.end()) as isize) as u16,
+                                        (base_skip + (skip + m.start()) as isize) as u32,
+                                        (base_skip + (skip + m.end()) as isize) as u32,
                                     )
                                 };
                                 segments.push((name, item));
@@ -443,6 +439,11 @@ impl Tree {
                                         return Some((v, skip + idx));
                                     }
                                 }
+                            }
+                            // tail consumed the rest of the path, values are
+                            // already checked
+                            if key.len() == 1 {
+                                return None;
                             }
                         }
 

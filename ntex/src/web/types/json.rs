@@ -6,10 +6,10 @@ use serde::{Serialize, de::DeserializeOwned};
 #[cfg(feature = "compress")]
 use crate::http::encoding::Decoder;
 use crate::http::header::CONTENT_LENGTH;
-use crate::http::{HttpMessage, Payload, Response, StatusCode};
-use crate::util::{BoxFuture, BytesMut, stream_recv};
-use crate::web::error::{ErrorRenderer, JsonError, JsonPayloadError, WebResponseError};
-use crate::web::{FromRequest, HttpRequest, Responder};
+use crate::http::{HttpMessage, Payload, Response, StatusCode, error::PayloadError};
+use crate::util::BoxFuture;
+use crate::web::error::{JsonError, JsonPayloadError, WebResponseError};
+use crate::web::{FromRequest, HttpRequest, Responder, State};
 
 /// Json helper
 ///
@@ -20,7 +20,7 @@ use crate::web::{FromRequest, HttpRequest, Responder};
 /// To extract typed information from request's body, the type `T` must
 /// implement the `Deserialize` trait from *serde*.
 ///
-/// [**`JsonConfig`**](struct.JsonConfig.html) allows to configure extraction
+/// [`JsonConfig`] allows to configure extraction
 /// process.
 ///
 /// ## Example
@@ -39,7 +39,7 @@ use crate::web::{FromRequest, HttpRequest, Responder};
 /// }
 ///
 /// fn main() {
-///     let app = web::App::new().service(
+///     let app = web::App::default().service(
 ///        web::resource("/index.html").route(
 ///            web::post().to(index))
 ///     );
@@ -107,17 +107,18 @@ where
     }
 }
 
-impl<T: Serialize, Err: ErrorRenderer> Responder<Err> for Json<T>
+impl<St, T: Serialize> Responder<St> for Json<T>
 where
-    Err::Container: From<JsonError>,
+    St: State,
+    JsonError: WebResponseError<St, St::Error>,
 {
-    async fn respond_to(self, req: &HttpRequest) -> Response {
-        let body = match serde_json::to_string(&self.0) {
+    async fn respond_to(self, st: &St, _: &HttpRequest) -> Response {
+        let body = match crate::http::helpers::json_body(&self.0) {
             Ok(body) => body,
-            Err(e) => return e.error_response(req),
+            Err(e) => return e.error_response(st),
         };
 
-        Response::build(StatusCode::OK)
+        Response::builder(StatusCode::OK)
             .content_type("application/json")
             .body(body)
     }
@@ -129,7 +130,7 @@ where
 /// To extract typed information from request's body, the type `T` must
 /// implement the `Deserialize` trait from *serde*.
 ///
-/// [**`JsonConfig`**](struct.JsonConfig.html) allows to configure extraction
+/// [`JsonConfig`] allows to configure extraction
 /// process.
 ///
 /// ## Example
@@ -148,19 +149,21 @@ where
 /// }
 ///
 /// fn main() {
-///     let app = web::App::new().service(
+///     let app = web::App::default().service(
 ///         web::resource("/index.html").route(
 ///            web::post().to(index))
 ///     );
 /// }
 /// ```
-impl<T, Err: ErrorRenderer> FromRequest<Err> for Json<T>
+impl<St, T> FromRequest<St> for Json<T>
 where
+    St: State,
     T: DeserializeOwned + 'static,
 {
     type Error = JsonPayloadError;
 
     async fn from_request(
+        _: &St,
         req: &HttpRequest,
         payload: &mut Payload,
     ) -> Result<Self, Self::Error> {
@@ -187,7 +190,7 @@ where
 ///
 /// ```rust
 /// use ntex::http::error;
-/// use ntex::web::{self, App, FromRequest, HttpResponse};
+/// use ntex::web::{self, App, FromRequest, HttpResponse, WebAppConfig};
 ///
 /// #[derive(serde::Deserialize)]
 /// struct Info {
@@ -200,16 +203,18 @@ where
 /// }
 ///
 /// fn main() {
-///     let app = App::new().service(
-///         web::resource("/index.html")
-///             .state(
-///                 // change json extractor configuration
-///                 web::types::JsonConfig::default()
-///                    .limit(4096)
-///                    .content_type(|mime| {  // <- accept text/plain content type
-///                        mime.type_() == mime::TEXT && mime.subtype() == mime::PLAIN
-///                    })
-///             )
+///     let cfg = WebAppConfig::new()
+///         .set_state(
+///             // change json extractor configuration
+///             web::types::JsonConfig::default()
+///                 .limit(4096)
+///                 .content_type(|mime| {  // <- accept text/plain content type
+///                     mime.type_() == mime::TEXT && mime.subtype() == mime::PLAIN
+///                 }));
+///
+///     let app = App::default()
+///         .with_config(cfg)
+///         .service(web::resource("/index.html")
 ///             .route(web::post().to(index))
 ///     );
 /// }
@@ -232,6 +237,9 @@ impl JsonConfig {
 
     #[must_use]
     /// Set predicate for allowed content types.
+    ///
+    /// JSON content types (`*/json` and `*/*+json`) are always accepted. The
+    /// predicate can accept additional types.
     pub fn content_type<F>(mut self, predicate: F) -> Self
     where
         F: Fn(mime::Mime) -> bool + Send + Sync + 'static,
@@ -270,8 +278,9 @@ impl fmt::Debug for JsonConfig {
 /// Returns error:
 ///
 /// * content type is not `application/json`
-///   (unless specified in [`JsonConfig`](struct.JsonConfig.html))
-/// * content length is greater than 256k
+///   (unless specified in [`JsonConfig`])
+/// * content length is greater than the limit (256k by default; the `Json`
+///   extractor sets it from [`JsonConfig`], 32k by default)
 struct JsonBody<U> {
     limit: usize,
     length: Option<usize>,
@@ -312,11 +321,24 @@ where
             };
         }
 
-        let len = req
-            .headers()
-            .get(&CONTENT_LENGTH)
-            .and_then(|l| l.to_str().ok())
-            .and_then(|s| s.parse::<usize>().ok());
+        let len = match req.headers().get(&CONTENT_LENGTH).map(|l| {
+            l.to_str()
+                .ok()
+                .and_then(|s| s.parse::<usize>().ok())
+                .ok_or(PayloadError::UnknownLength)
+        }) {
+            None => None,
+            Some(Ok(len)) => Some(len),
+            Some(Err(e)) => {
+                return JsonBody {
+                    limit: 262_144,
+                    length: None,
+                    stream: None,
+                    fut: None,
+                    err: Some(JsonPayloadError::Payload(e)),
+                };
+            }
+        };
 
         #[cfg(feature = "compress")]
         let payload = Decoder::from_headers(payload.take(), req.headers());
@@ -354,8 +376,8 @@ where
             return Poll::Ready(Err(err));
         }
 
-        let limit = self.limit;
-        if let Some(len) = self.length.take()
+        let (limit, length) = (self.limit, self.length);
+        if let Some(len) = length
             && len > limit
         {
             return Poll::Ready(Err(JsonPayloadError::Overflow));
@@ -363,15 +385,8 @@ where
         let mut stream = self.stream.take().unwrap();
 
         self.fut = Some(Box::pin(async move {
-            let mut body = BytesMut::with_capacity(8192);
-
-            while let Some(item) = stream_recv(&mut stream).await {
-                let chunk = item?;
-                if (body.len() + chunk.len()) > limit {
-                    return Err(JsonPayloadError::Overflow);
-                }
-                body.extend_from_slice(&chunk);
-            }
+            let body = super::read_body(&mut stream, limit, length, |_| JsonPayloadError::Overflow)
+                .await?;
             Ok(serde_json::from_slice::<U>(&body)?)
         }));
 
@@ -440,8 +455,23 @@ mod tests {
     }
 
     #[crate::rt_test]
+    async fn test_responder_serialize_error() {
+        struct Invalid;
+
+        impl Serialize for Invalid {
+            fn serialize<S: serde::Serializer>(&self, _: S) -> Result<S::Ok, S::Error> {
+                Err(serde::ser::Error::custom("invalid"))
+            }
+        }
+
+        let req = TestRequest::default().to_http_request();
+        let resp = respond_to(Json(Invalid), &req).await;
+        assert_eq!(resp.status(), StatusCode::INTERNAL_SERVER_ERROR);
+    }
+
+    #[crate::rt_test]
     async fn test_extract() {
-        let (req, mut pl) = TestRequest::default()
+        let (req, mut pl, ()) = TestRequest::default()
             .header(
                 header::CONTENT_TYPE,
                 header::HeaderValue::from_static("application/json"),
@@ -450,10 +480,12 @@ mod tests {
                 header::CONTENT_LENGTH,
                 header::HeaderValue::from_static("16"),
             )
-            .set_payload(Bytes::from_static(b"{\"name\": \"test\"}"))
+            .payload(Bytes::from_static(b"{\"name\": \"test\"}"))
             .to_http_parts();
 
-        let s = from_request::<Json<MyObject>>(&req, &mut pl).await.unwrap();
+        let s = from_request::<_, Json<MyObject>>(&(), &req, &mut pl)
+            .await
+            .unwrap();
         assert_eq!(s.name, "test");
         assert_eq!(
             s.into_inner(),
@@ -462,7 +494,7 @@ mod tests {
             }
         );
 
-        let (req, mut pl) = TestRequest::default()
+        let (req, mut pl, ()) = TestRequest::default()
             .header(
                 header::CONTENT_TYPE,
                 header::HeaderValue::from_static("application/json"),
@@ -471,17 +503,16 @@ mod tests {
                 header::CONTENT_LENGTH,
                 header::HeaderValue::from_static("16"),
             )
-            .set_payload(Bytes::from_static(b"{\"name\": \"test\"}"))
-            .state(JsonConfig::default().limit(10))
+            .payload(Bytes::from_static(b"{\"name\": \"test\"}"))
+            .app_state(JsonConfig::default().limit(10))
             .to_http_parts();
 
-        let s = from_request::<Json<MyObject>>(&req, &mut pl).await;
+        let s = from_request::<_, Json<MyObject>>(&(), &req, &mut pl).await;
         assert!(
-            format!("{}", s.err().unwrap())
-                .contains("Json payload size is bigger than allowed")
+            format!("{}", s.err().unwrap()).contains("Json payload size is bigger than allowed")
         );
 
-        let (req, mut pl) = TestRequest::default()
+        let (req, mut pl, ()) = TestRequest::default()
             .header(
                 header::CONTENT_TYPE,
                 header::HeaderValue::from_static("application/json"),
@@ -490,22 +521,22 @@ mod tests {
                 header::CONTENT_LENGTH,
                 header::HeaderValue::from_static("16"),
             )
-            .set_payload(Bytes::from_static(b"--name-: -test--"))
+            .payload(Bytes::from_static(b"--name-: -test--"))
             .to_http_parts();
-        let s = from_request::<Json<serde_json::Value>>(&req, &mut pl).await;
+        let s = from_request::<_, Json<serde_json::Value>>(&(), &req, &mut pl).await;
         assert!(format!("{:?}", s.err().unwrap()).contains("Deserialize(Error("));
     }
 
     #[crate::rt_test]
     async fn test_json_body() {
-        let (req, mut pl) = TestRequest::default().to_http_parts();
+        let (req, mut pl, ()) = TestRequest::default().to_http_parts();
         let json = JsonBody::<MyObject>::new(&req, &mut pl, None).await;
         assert!(json_eq(
             &json.err().unwrap(),
             &JsonPayloadError::ContentType
         ));
 
-        let (req, mut pl) = TestRequest::default()
+        let (req, mut pl, ()) = TestRequest::default()
             .header(
                 header::CONTENT_TYPE,
                 header::HeaderValue::from_static("application/text"),
@@ -517,7 +548,7 @@ mod tests {
             &JsonPayloadError::ContentType
         ));
 
-        let (req, mut pl) = TestRequest::default()
+        let (req, mut pl, ()) = TestRequest::default()
             .header(
                 header::CONTENT_TYPE,
                 header::HeaderValue::from_static("application/json"),
@@ -533,7 +564,7 @@ mod tests {
             .await;
         assert!(json_eq(&json.err().unwrap(), &JsonPayloadError::Overflow));
 
-        let (req, mut pl) = TestRequest::default()
+        let (req, mut pl, ()) = TestRequest::default()
             .header(
                 header::CONTENT_TYPE,
                 header::HeaderValue::from_static("application/json"),
@@ -542,7 +573,7 @@ mod tests {
                 header::CONTENT_LENGTH,
                 header::HeaderValue::from_static("16"),
             )
-            .set_payload(Bytes::from_static(b"{\"name\": \"test\"}"))
+            .payload(Bytes::from_static(b"{\"name\": \"test\"}"))
             .to_http_parts();
 
         let json = JsonBody::<MyObject>::new(&req, &mut pl, None).await;
@@ -552,11 +583,29 @@ mod tests {
                 name: "test".to_owned()
             }
         );
+
+        let (req, mut pl, ()) = TestRequest::default()
+            .header(
+                header::CONTENT_TYPE,
+                header::HeaderValue::from_static("application/json"),
+            )
+            .header(
+                header::CONTENT_LENGTH,
+                header::HeaderValue::from_static("16x"),
+            )
+            .payload(Bytes::from_static(b"{\"name\": \"test\"}"))
+            .to_http_parts();
+
+        let json = JsonBody::<MyObject>::new(&req, &mut pl, None).await;
+        assert!(matches!(
+            json.err().unwrap(),
+            JsonPayloadError::Payload(PayloadError::UnknownLength)
+        ));
     }
 
     #[crate::rt_test]
     async fn test_with_json_and_bad_content_type() {
-        let (req, mut pl) = TestRequest::with_header(
+        let (req, mut pl, ()) = TestRequest::with_header(
             header::CONTENT_TYPE,
             header::HeaderValue::from_static("text/plain"),
         )
@@ -564,17 +613,17 @@ mod tests {
             header::CONTENT_LENGTH,
             header::HeaderValue::from_static("16"),
         )
-        .set_payload(Bytes::from_static(b"{\"name\": \"test\"}"))
-        .state(JsonConfig::default().limit(4096))
+        .payload(Bytes::from_static(b"{\"name\": \"test\"}"))
+        .app_state(JsonConfig::default().limit(4096))
         .to_http_parts();
 
-        let s = from_request::<Json<MyObject>>(&req, &mut pl).await;
+        let s = from_request::<_, Json<MyObject>>(&(), &req, &mut pl).await;
         assert!(s.is_err());
     }
 
     #[crate::rt_test]
     async fn test_with_json_and_good_custom_content_type() {
-        let (req, mut pl) = TestRequest::with_header(
+        let (req, mut pl, ()) = TestRequest::with_header(
             header::CONTENT_TYPE,
             header::HeaderValue::from_static("text/plain"),
         )
@@ -582,19 +631,19 @@ mod tests {
             header::CONTENT_LENGTH,
             header::HeaderValue::from_static("16"),
         )
-        .set_payload(Bytes::from_static(b"{\"name\": \"test\"}"))
-        .state(JsonConfig::default().content_type(|mime: mime::Mime| {
+        .payload(Bytes::from_static(b"{\"name\": \"test\"}"))
+        .app_state(JsonConfig::default().content_type(|mime: mime::Mime| {
             mime.type_() == mime::TEXT && mime.subtype() == mime::PLAIN
         }))
         .to_http_parts();
 
-        let s = from_request::<Json<MyObject>>(&req, &mut pl).await;
+        let s = from_request::<_, Json<MyObject>>(&(), &req, &mut pl).await;
         assert!(s.is_ok());
     }
 
     #[crate::rt_test]
     async fn test_with_json_and_bad_custom_content_type() {
-        let (req, mut pl) = TestRequest::with_header(
+        let (req, mut pl, ()) = TestRequest::with_header(
             header::CONTENT_TYPE,
             header::HeaderValue::from_static("text/html"),
         )
@@ -602,13 +651,13 @@ mod tests {
             header::CONTENT_LENGTH,
             header::HeaderValue::from_static("16"),
         )
-        .set_payload(Bytes::from_static(b"{\"name\": \"test\"}"))
-        .state(JsonConfig::default().content_type(|mime: mime::Mime| {
+        .payload(Bytes::from_static(b"{\"name\": \"test\"}"))
+        .app_state(JsonConfig::default().content_type(|mime: mime::Mime| {
             mime.type_() == mime::TEXT && mime.subtype() == mime::PLAIN
         }))
         .to_http_parts();
 
-        let s = from_request::<Json<MyObject>>(&req, &mut pl).await;
+        let s = from_request::<_, Json<MyObject>>(&(), &req, &mut pl).await;
         assert!(s.is_err());
     }
 }

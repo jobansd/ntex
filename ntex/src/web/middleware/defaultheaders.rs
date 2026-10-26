@@ -3,7 +3,7 @@ use std::rc::Rc;
 
 use crate::http::error::HttpError;
 use crate::http::header::{CONTENT_TYPE, HeaderMap, HeaderName, HeaderValue};
-use crate::service::{Middleware, Service, ServiceCtx, cfg::SharedCfg};
+use crate::service::{Ctx, Middleware, Service};
 use crate::web::{WebRequest, WebResponse};
 
 /// `Middleware` for setting default response headers.
@@ -15,12 +15,12 @@ use crate::web::{WebRequest, WebResponse};
 /// use ntex::web::{self, middleware, App, HttpResponse};
 ///
 /// fn main() {
-///     let app = App::new()
+///     let app = App::default()
 ///         .middleware(middleware::DefaultHeaders::new().header("X-Version", "0.2"))
 ///         .service(
 ///             web::resource("/test")
-///                 .route(web::get().to(|| async { HttpResponse::Ok() }))
-///                 .route(web::method(http::Method::HEAD).to(|| async { HttpResponse::MethodNotAllowed() }))
+///                 .route(web::get().to(async || { HttpResponse::Ok() }))
+///                 .route(web::method(http::Method::HEAD).to(async || { HttpResponse::MethodNotAllowed() }))
 ///         );
 /// }
 /// ```
@@ -80,6 +80,8 @@ impl DefaultHeaders {
 
     #[must_use]
     /// Set *CONTENT-TYPE* header if response does not contain this header.
+    ///
+    /// The header is set to `application/octet-stream`.
     pub fn content_type(mut self) -> Self {
         Rc::get_mut(&mut self.inner)
             .expect("Multiple copies exist")
@@ -88,10 +90,10 @@ impl DefaultHeaders {
     }
 }
 
-impl<S> Middleware<S, SharedCfg> for DefaultHeaders {
+impl<S, St> Middleware<S, St> for DefaultHeaders {
     type Service = DefaultHeadersMiddleware<S>;
 
-    fn create(&self, service: S, _: SharedCfg) -> Self::Service {
+    fn create(&self, _: &St, service: S) -> Self::Service {
         DefaultHeadersMiddleware {
             service,
             inner: self.inner.clone(),
@@ -105,23 +107,19 @@ pub struct DefaultHeadersMiddleware<S> {
     inner: Rc<Inner>,
 }
 
-impl<S, E> Service<WebRequest<E>> for DefaultHeadersMiddleware<S>
+impl<S, St, In> Service<St, WebRequest<In>> for DefaultHeadersMiddleware<S>
 where
-    S: Service<WebRequest<E>, Response = WebResponse>,
+    S: Service<St, WebRequest<In>, Res = WebResponse>,
 {
-    type Response = WebResponse;
+    type Res = WebResponse;
     type Error = S::Error;
 
-    crate::forward_poll!(service);
-    crate::forward_ready!(service);
-    crate::forward_shutdown!(service);
+    crate::forward_bind!(St, service);
+    crate::forward_ready!(St, service);
+    crate::forward_shutdown!(St, service);
 
-    async fn call(
-        &self,
-        req: WebRequest<E>,
-        ctx: ServiceCtx<'_, Self>,
-    ) -> Result<Self::Response, Self::Error> {
-        let mut res = ctx.call(&self.service, req).await?;
+    async fn call(&self, r: WebRequest<In>, ctx: Ctx<'_, Self, St>) -> Result<Self::Res, S::Error> {
+        let mut res = ctx.call(&self.service, r).await?;
 
         // set response headers
         for (key, value) in &self.inner.headers {
@@ -143,20 +141,22 @@ where
 #[cfg(test)]
 #[allow(unused_must_use)]
 mod tests {
+    use std::convert::Infallible;
+
     use super::*;
-    use crate::service::{IntoService, Pipeline};
-    use crate::util::lazy;
-    use crate::web::test::{TestRequest, ok_service};
-    use crate::web::{DefaultError, Error, HttpResponse};
+    use crate::web::{HttpResponse, test::TestRequest, test::ok_service};
+    use crate::{Pipeline, fn_service, util::lazy};
 
     #[crate::rt_test]
     async fn test_default_headers() {
         let mw = Pipeline::new(
-            DefaultHeaders::new()
-                .header(CONTENT_TYPE, "0001")
-                .create(ok_service(), SharedCfg::default()),
-        )
-        .bind();
+            (),
+            Middleware::create(
+                &DefaultHeaders::new().header(CONTENT_TYPE, "0001"),
+                &(),
+                ok_service(),
+            ),
+        );
 
         assert!(lazy(|cx| mw.poll_ready(cx).is_ready()).await);
         assert!(lazy(|cx| mw.poll_shutdown(cx).is_ready()).await);
@@ -166,15 +166,18 @@ mod tests {
         assert_eq!(resp.headers().get(CONTENT_TYPE).unwrap(), "0001");
 
         let req = TestRequest::default().to_srv_request();
-        let srv = |req: WebRequest<DefaultError>| async move {
-            Ok::<_, Error>(
-                req.into_response(HttpResponse::Ok().header(CONTENT_TYPE, "0002").finish()),
+        let srv = fn_service(async move |req: WebRequest<()>| {
+            Ok::<_, Infallible>(
+                req.into_response(HttpResponse::Ok().header(CONTENT_TYPE, "0002").build()),
             )
-        };
+        });
         let mw = Pipeline::new(
-            DefaultHeaders::new()
-                .header(CONTENT_TYPE, "0001")
-                .create(srv.into_service(), SharedCfg::default()),
+            (),
+            Middleware::create(
+                &DefaultHeaders::new().header(CONTENT_TYPE, "0001"),
+                &(),
+                srv,
+            ),
         );
         let resp = mw.call(req).await.unwrap();
         assert_eq!(resp.headers().get(CONTENT_TYPE).unwrap(), "0002");
@@ -194,13 +197,12 @@ mod tests {
 
     #[crate::rt_test]
     async fn test_content_type() {
-        let srv = |req: WebRequest<DefaultError>| async move {
-            Ok::<_, Error>(req.into_response(HttpResponse::Ok().finish()))
-        };
+        let srv = fn_service(async move |req: WebRequest<()>| {
+            Ok::<_, Infallible>(req.into_response(HttpResponse::Ok().build()))
+        });
         let mw = Pipeline::new(
-            DefaultHeaders::new()
-                .content_type()
-                .create(srv.into_service(), SharedCfg::default()),
+            (),
+            Middleware::create(&DefaultHeaders::new().content_type(), &(), srv),
         );
 
         let req = TestRequest::default().to_srv_request();

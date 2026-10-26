@@ -8,12 +8,13 @@ use futures_core::{FusedStream, Stream};
 use super::cell::Cell;
 use crate::task::LocalWaker;
 
-/// Creates a unbounded in-memory channel with buffered storage.
+/// Creates an unbounded in-memory channel.
 pub fn channel<T>() -> (Sender<T>, Receiver<T>) {
     let shared = Cell::new(Shared {
         has_receiver: true,
         buffer: VecDeque::new(),
         blocked_recv: LocalWaker::new(),
+        closed: LocalWaker::new(),
     });
     let sender = Sender {
         shared: shared.clone(),
@@ -26,7 +27,16 @@ pub fn channel<T>() -> (Sender<T>, Receiver<T>) {
 struct Shared<T> {
     buffer: VecDeque<T>,
     blocked_recv: LocalWaker,
+    closed: LocalWaker,
     has_receiver: bool,
+}
+
+impl<T> Shared<T> {
+    fn close(&mut self) {
+        self.has_receiver = false;
+        self.blocked_recv.wake();
+        self.closed.wake();
+    }
 }
 
 /// The transmission end of a channel.
@@ -51,19 +61,39 @@ impl<T> Sender<T> {
         Ok(())
     }
 
-    /// Closes the sender half
+    /// Closes the channel for every sender.
     ///
-    /// This prevents any further messages from being sent on the channel while
-    /// still enabling the receiver to drain messages that are buffered.
+    /// This prevents any further messages from being sent on the channel, by
+    /// this sender or any of its clones, while still enabling the receiver to
+    /// drain messages that are buffered.
     pub fn close(&self) {
-        let shared = self.shared.get_mut();
-        shared.has_receiver = false;
-        shared.blocked_recv.wake();
+        self.shared.get_mut().close();
     }
 
-    /// Returns whether this channel is closed without needing a context.
+    /// Returns `true` if the channel is closed or the receiver has been dropped.
     pub fn is_closed(&self) -> bool {
         self.shared.strong_count() == 1 || !self.shared.get_ref().has_receiver
+    }
+
+    /// Polls whether the channel is closed or the receiver has been dropped.
+    ///
+    /// Only the task from the most recent call is woken, across this sender
+    /// and all of its clones.
+    pub fn poll_closed(&self, cx: &mut Context<'_>) -> Poll<()> {
+        let shared = self.shared.get_mut();
+        if shared.has_receiver {
+            shared.closed.register(cx.waker());
+            Poll::Pending
+        } else {
+            Poll::Ready(())
+        }
+    }
+
+    /// Waits until the channel is closed or the receiver has been dropped.
+    ///
+    /// See [`poll_closed`](Self::poll_closed).
+    pub async fn closed(&self) {
+        poll_fn(|cx| self.poll_closed(cx)).await;
     }
 }
 
@@ -109,7 +139,7 @@ impl<T> Receiver<T> {
     /// This prevents any further messages from being sent on the channel
     /// while still enabling the receiver to drain messages that are buffered.
     pub fn close(&self) {
-        self.shared.get_mut().has_receiver = false;
+        self.shared.get_mut().close();
     }
 
     /// Returns whether this channel is closed.
@@ -117,16 +147,18 @@ impl<T> Receiver<T> {
         self.shared.strong_count() == 1 || !self.shared.get_ref().has_receiver
     }
 
-    /// Attempt to pull out the next value of this receiver, registering
-    /// the current task for wakeup if the value is not yet available,
-    /// and returning None if the stream is exhausted.
+    /// Waits for the next message.
+    ///
+    /// Returns `None` once the channel is closed or every sender has been
+    /// dropped, and every buffered message has been received.
     pub async fn recv(&self) -> Option<T> {
         poll_fn(|cx| self.poll_recv(cx)).await
     }
 
-    /// Attempt to pull out the next value of this receiver, registering
-    /// the current task for wakeup if the value is not yet available,
-    /// and returning None if the stream is exhausted.
+    /// Polls for the next message.
+    ///
+    /// Returns `Ready(None)` once the channel is closed or every sender has
+    /// been dropped, and every buffered message has been received.
     pub fn poll_recv(&self, cx: &mut Context<'_>) -> Poll<Option<T>> {
         let shared = self.shared.get_mut();
 
@@ -158,8 +190,10 @@ impl<T> Stream for Receiver<T> {
 }
 
 impl<T> FusedStream for Receiver<T> {
+    /// Returns `true` once the channel is closed and every buffered message
+    /// has been received.
     fn is_terminated(&self) -> bool {
-        self.is_closed()
+        self.is_closed() && self.shared.get_ref().buffer.is_empty()
     }
 }
 
@@ -168,8 +202,12 @@ impl<T> UnwindSafe for Receiver<T> {}
 impl<T> Drop for Receiver<T> {
     fn drop(&mut self) {
         let shared = self.shared.get_mut();
-        shared.buffer.clear();
         shared.has_receiver = false;
+        let buffer = std::mem::take(&mut shared.buffer);
+        shared.closed.wake();
+
+        // queued messages may send on this channel from their `Drop`
+        drop(buffer);
     }
 }
 
@@ -261,8 +299,12 @@ mod tests {
         assert!(rx.is_terminated());
 
         let (tx, rx) = channel::<()>();
+        assert_eq!(lazy(|cx| rx.poll_recv(cx)).await, Poll::Pending);
+        assert!(rx.shared.get_ref().blocked_recv.is_set());
         rx.close();
         assert!(tx.is_closed());
+        assert!(!rx.shared.get_ref().blocked_recv.is_set());
+        assert_eq!(lazy(|cx| rx.poll_recv(cx)).await, Poll::Ready(None));
 
         let (tx, rx) = channel::<()>();
         drop(tx);
@@ -271,5 +313,84 @@ mod tests {
         let _tx = rx.sender();
         assert!(!rx.is_closed());
         assert!(!rx.is_terminated());
+    }
+
+    #[ntex::test]
+    async fn test_poll_closed() {
+        let (tx, rx) = channel::<()>();
+        assert_eq!(lazy(|cx| tx.poll_closed(cx)).await, Poll::Pending);
+        assert!(tx.shared.get_ref().closed.is_set());
+        drop(rx);
+        assert!(!tx.shared.get_ref().closed.is_set());
+        assert_eq!(lazy(|cx| tx.poll_closed(cx)).await, Poll::Ready(()));
+        tx.closed().await;
+
+        let (tx, rx) = channel::<()>();
+        assert_eq!(lazy(|cx| tx.poll_closed(cx)).await, Poll::Pending);
+        rx.close();
+        assert!(!tx.shared.get_ref().closed.is_set());
+        tx.closed().await;
+
+        let (tx, _rx) = channel::<()>();
+        let tx2 = tx.clone();
+        assert_eq!(lazy(|cx| tx2.poll_closed(cx)).await, Poll::Pending);
+        tx.close();
+        assert!(!tx.shared.get_ref().closed.is_set());
+        tx2.closed().await;
+    }
+
+    #[test]
+    fn test_drop_receiver_reentrant_send() {
+        use std::rc::Rc;
+
+        struct Msg(Option<Sender<Msg>>, Rc<std::cell::Cell<usize>>);
+
+        impl Drop for Msg {
+            fn drop(&mut self) {
+                self.1.set(self.1.get() + 1);
+                if let Some(tx) = self.0.take() {
+                    assert!(tx.send(Msg(None, self.1.clone())).is_err());
+                }
+            }
+        }
+
+        let drops = Rc::new(std::cell::Cell::new(0));
+        let (tx, rx) = channel();
+        for _ in 0..4 {
+            tx.send(Msg(Some(tx.clone()), drops.clone())).unwrap();
+        }
+        drop(rx);
+        assert_eq!(drops.get(), 8);
+        assert!(tx.is_closed());
+    }
+
+    #[ntex::test]
+    async fn test_fused_drains_buffer() {
+        let (tx, mut rx) = channel();
+        tx.send(1).unwrap();
+        tx.send(2).unwrap();
+        drop(tx);
+
+        assert!(!rx.is_terminated());
+        assert_eq!(stream_recv(&mut rx).await, Some(1));
+        assert_eq!(stream_recv(&mut rx).await, Some(2));
+        assert!(rx.is_terminated());
+        assert_eq!(stream_recv(&mut rx).await, None);
+
+        let (tx, mut rx) = channel();
+        tx.send(1).unwrap();
+        rx.close();
+        assert!(!rx.is_terminated());
+        assert_eq!(stream_recv(&mut rx).await, Some(1));
+        assert!(rx.is_terminated());
+    }
+
+    #[ntex::test]
+    async fn test_mpsc_recv() {
+        let (tx, rx) = channel();
+        tx.send(1).unwrap();
+        assert_eq!(rx.recv().await, Some(1));
+        drop(tx);
+        assert_eq!(rx.recv().await, None);
     }
 }

@@ -1,31 +1,99 @@
-//! Utilities for encoding and decoding frames.
+//! Traits for encoding and decoding frames.
+//!
+//! A codec turns a byte stream into frames and back. [`Decoder`] splits
+//! incoming bytes into frames, [`Encoder`] serializes outgoing frames. The
+//! `ntex-io` crate drives them: `Io::recv()` and `IoRef::decode()` run the
+//! decoder on the read buffer, `Io::send()` and `IoRef::encode()` run the
+//! encoder on the write buffer, and the `ntex-dispatcher` crate uses both to
+//! connect a stream to a service.
+//!
+//! Both traits take `&self`, since a codec is shared between the reading and
+//! writing sides. A codec that keeps state between calls, such as a parser
+//! position or negotiated settings, has to use interior mutability, e.g.
+//! [`Cell`](std::cell::Cell) or [`RefCell`](std::cell::RefCell).
+//!
+//! # Example
+//!
+//! A codec for newline-terminated lines:
+//!
+//! ```
+//! use std::io;
+//!
+//! use ntex_bytes::{BytePages, Bytes, BytesMut};
+//! use ntex_codec::{Decoder, Encoder};
+//!
+//! struct LineCodec;
+//!
+//! impl Decoder for LineCodec {
+//!     type Item = Bytes;
+//!     type Error = io::Error;
+//!
+//!     fn decode(&self, src: &mut BytesMut) -> Result<Option<Bytes>, io::Error> {
+//!         match src.iter().position(|b| *b == b'\n') {
+//!             // consume the line and its terminator
+//!             Some(n) => Ok(Some(src.split_to(n + 1).slice(..n))),
+//!             // incomplete line, wait for more input
+//!             None => Ok(None),
+//!         }
+//!     }
+//!
+//!     fn decode_eof(&self, src: &mut BytesMut) -> Result<Option<Bytes>, io::Error> {
+//!         match self.decode(src)? {
+//!             Some(line) => Ok(Some(line)),
+//!             // the last line has no terminator
+//!             None if !src.is_empty() => Ok(Some(src.split_to(src.len()))),
+//!             None => Ok(None),
+//!         }
+//!     }
+//! }
+//!
+//! impl Encoder for LineCodec {
+//!     type Item = Bytes;
+//!     type Error = io::Error;
+//!
+//!     fn encode(&self, item: Bytes, dst: &mut BytePages) -> Result<(), io::Error> {
+//!         if item.contains(&b'\n') {
+//!             return Err(io::Error::new(io::ErrorKind::InvalidInput, "newline in line"));
+//!         }
+//!         dst.append(item);
+//!         dst.extend_from_slice(b"\n");
+//!         Ok(())
+//!     }
+//! }
+//!
+//! let mut src = BytesMut::from(&b"one\ntwo"[..]);
+//! assert_eq!(LineCodec.decode(&mut src).unwrap().unwrap(), "one");
+//! assert!(LineCodec.decode(&mut src).unwrap().is_none());
+//! assert_eq!(LineCodec.decode_eof(&mut src).unwrap().unwrap(), "two");
+//! assert!(LineCodec.decode_eof(&mut src).unwrap().is_none());
+//! ```
 
 use std::{fmt, io, rc::Rc};
 
 use ntex_bytes::{BytePages, Bytes, BytesMut};
 
-/// Trait of helper objects to write out messages as bytes.
+/// Serializes frames into bytes.
 pub trait Encoder {
-    /// The type of items consumed by the `Encoder`
+    /// The type of frames consumed by the encoder.
     type Item;
 
     /// The type of encoding errors.
     type Error: fmt::Debug;
 
-    #[deprecated(since = "1.2.0", note = "Implement .encodev() method.")]
-    /// Encodes a frame into the buffer provided.
-    fn encode(&self, _: Self::Item, _: &mut BytesMut) -> Result<(), Self::Error> {
-        panic!("Encoder::encodev() must be implemented")
-    }
-
-    /// Encodes a frame into the buffer provided.
-    fn encodev(&self, item: Self::Item, dst: &mut BytePages) -> Result<(), Self::Error> {
-        #[allow(deprecated)]
-        dst.with_bytes_mut(|buf| self.encode(item, buf))
-    }
+    /// Encodes a frame and appends it to `dst`.
+    ///
+    /// `dst` is the write buffer, a list of pages. [`BytePages::append`] adds
+    /// a `Bytes` value as a page of its own without copying it, while
+    /// [`BytePages::extend_from_slice`] and the [`BufMut`](ntex_bytes::BufMut)
+    /// methods copy into the pages.
+    ///
+    /// Output written to `dst` is not rolled back when this returns an
+    /// error, it is sent like any other output. Validate the frame before
+    /// writing it, so that an error does not leave a partial frame behind.
+    fn encode(&self, item: Self::Item, dst: &mut BytePages) -> Result<(), Self::Error>;
 }
 
-/// Decoding of frames via buffers.
+/// Splits a byte stream into frames.
 pub trait Decoder {
     /// The type of decoded frames.
     type Item: fmt::Debug;
@@ -37,8 +105,30 @@ pub trait Decoder {
     /// useful to report the failure as an `Item`.
     type Error: fmt::Debug;
 
-    /// Attempts to decode a frame from the provided buffer of bytes.
+    /// Attempts to decode a frame from the buffered input.
+    ///
+    /// Returns `Ok(Some(item))` after removing exactly one frame's bytes from
+    /// the front of `src`, and `Ok(None)` if `src` does not hold a complete
+    /// frame yet. On `None` the partial frame must stay in `src`, it is
+    /// passed in again together with the input that arrives next.
+    ///
+    /// This is called repeatedly while it returns frames, and may be called
+    /// with an empty buffer.
     fn decode(&self, src: &mut BytesMut) -> Result<Option<Self::Item>, Self::Error>;
+
+    /// Attempts to decode a frame once the transport reached a clean EOF.
+    ///
+    /// The peer closed its write half and no further input will arrive, so
+    /// this is the decoder's chance to produce a frame from whatever is left
+    /// in `src`, or to report a truncated one as an error. Once the transport
+    /// is at EOF it is used instead of [`decode`](Self::decode) for every
+    /// decode attempt, it may be called again after it returned `None`, and
+    /// with an empty buffer.
+    ///
+    /// The default implementation calls [`decode`](Self::decode).
+    fn decode_eof(&self, src: &mut BytesMut) -> Result<Option<Self::Item>, Self::Error> {
+        self.decode(src)
+    }
 }
 
 impl<T> Encoder for Rc<T>
@@ -48,13 +138,8 @@ where
     type Item = T::Item;
     type Error = T::Error;
 
-    #[allow(deprecated)]
-    fn encode(&self, item: Self::Item, dst: &mut BytesMut) -> Result<(), Self::Error> {
+    fn encode(&self, item: Self::Item, dst: &mut BytePages) -> Result<(), Self::Error> {
         (**self).encode(item, dst)
-    }
-
-    fn encodev(&self, item: Self::Item, dst: &mut BytePages) -> Result<(), Self::Error> {
-        (**self).encodev(item, dst)
     }
 }
 
@@ -68,11 +153,17 @@ where
     fn decode(&self, src: &mut BytesMut) -> Result<Option<Self::Item>, Self::Error> {
         (**self).decode(src)
     }
+
+    fn decode_eof(&self, src: &mut BytesMut) -> Result<Option<Self::Item>, Self::Error> {
+        (**self).decode_eof(src)
+    }
 }
 
-/// Bytes codec.
+/// Passes bytes through unchanged.
 ///
-/// Reads/Writes chunks of bytes from a stream.
+/// Decoding returns everything buffered as one frame, and returns `None` only
+/// when the buffer is empty. Encoding appends the `Bytes` value to the write
+/// buffer as is, without copying it.
 #[derive(Debug, Copy, Clone)]
 pub struct BytesCodec;
 
@@ -81,7 +172,7 @@ impl Encoder for BytesCodec {
     type Error = io::Error;
 
     #[inline]
-    fn encodev(&self, item: Bytes, dst: &mut BytePages) -> Result<(), Self::Error> {
+    fn encode(&self, item: Bytes, dst: &mut BytePages) -> Result<(), Self::Error> {
         dst.append(item);
         Ok(())
     }
@@ -97,5 +188,103 @@ impl Decoder for BytesCodec {
         } else {
             Ok(Some(src.split_to(src.len())))
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::cell::Cell;
+
+    use super::*;
+
+    /// Decodes one-byte frames and counts `decode_eof` calls.
+    #[derive(Default)]
+    struct ByteCodec {
+        eof: Cell<usize>,
+    }
+
+    impl Decoder for ByteCodec {
+        type Item = u8;
+        type Error = io::Error;
+
+        fn decode(&self, src: &mut BytesMut) -> Result<Option<u8>, io::Error> {
+            if src.is_empty() {
+                Ok(None)
+            } else {
+                Ok(Some(src.split_to(1)[0]))
+            }
+        }
+
+        fn decode_eof(&self, src: &mut BytesMut) -> Result<Option<u8>, io::Error> {
+            self.eof.set(self.eof.get() + 1);
+            self.decode(src)
+        }
+    }
+
+    /// Uses the default `decode_eof`.
+    struct DefaultEof;
+
+    impl Decoder for DefaultEof {
+        type Item = usize;
+        type Error = io::Error;
+
+        fn decode(&self, src: &mut BytesMut) -> Result<Option<usize>, io::Error> {
+            let len = src.len();
+            src.clear();
+            Ok(Some(len))
+        }
+    }
+
+    #[test]
+    fn bytes_codec() {
+        let codec = BytesCodec;
+        let codec2 = codec;
+        assert_eq!(format!("{:?}", codec2.clone()), "BytesCodec");
+
+        let mut src = BytesMut::new();
+        assert!(codec.decode(&mut src).unwrap().is_none());
+        assert!(codec.decode_eof(&mut src).unwrap().is_none());
+
+        src.extend_from_slice(b"hello");
+        assert_eq!(codec.decode(&mut src).unwrap().unwrap(), "hello");
+        assert!(src.is_empty());
+        src.extend_from_slice(b"eof");
+        assert_eq!(codec.decode_eof(&mut src).unwrap().unwrap(), "eof");
+        assert!(src.is_empty());
+
+        let mut dst = BytePages::default();
+        codec
+            .encode(Bytes::from_static(b"hello "), &mut dst)
+            .unwrap();
+        codec
+            .encode(Bytes::from_static(b"world"), &mut dst)
+            .unwrap();
+        codec.encode(Bytes::new(), &mut dst).unwrap();
+        assert_eq!(dst.len(), 11);
+        assert_eq!(dst.freeze(), "hello world");
+    }
+
+    #[test]
+    fn default_decode_eof() {
+        let mut src = BytesMut::from(&b"abc"[..]);
+        assert_eq!(DefaultEof.decode_eof(&mut src).unwrap(), Some(3));
+        assert_eq!(DefaultEof.decode_eof(&mut src).unwrap(), Some(0));
+    }
+
+    #[test]
+    fn rc_codec() {
+        let codec = Rc::new(ByteCodec::default());
+        let mut src = BytesMut::from(&b"ab"[..]);
+        assert_eq!(codec.decode(&mut src).unwrap(), Some(b'a'));
+        assert_eq!(codec.eof.get(), 0);
+        // forwards to the inner `decode_eof`, not the default one
+        assert_eq!(codec.decode_eof(&mut src).unwrap(), Some(b'b'));
+        assert_eq!(codec.decode_eof(&mut src).unwrap(), None);
+        assert_eq!(codec.eof.get(), 2);
+
+        let codec = Rc::new(BytesCodec);
+        let mut dst = BytePages::default();
+        codec.encode(Bytes::from_static(b"rc"), &mut dst).unwrap();
+        assert_eq!(dst.freeze(), "rc");
     }
 }

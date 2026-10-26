@@ -1,11 +1,11 @@
 use std::{borrow::ToOwned, cell::Ref};
 
 use super::config::WebAppConfig;
-use crate::http::{RequestHead, header, header::HeaderName, uri};
+use crate::http::{RequestHead, header, header::HeaderName};
 
-const X_FORWARDED_FOR: &[u8] = b"x-forwarded-for";
-const X_FORWARDED_HOST: &[u8] = b"x-forwarded-host";
-const X_FORWARDED_PROTO: &[u8] = b"x-forwarded-proto";
+const X_FORWARDED_FOR: HeaderName = HeaderName::from_static("x-forwarded-for");
+const X_FORWARDED_HOST: HeaderName = HeaderName::from_static("x-forwarded-host");
+const X_FORWARDED_PROTO: HeaderName = HeaderName::from_static("x-forwarded-proto");
 
 /// `HttpRequest` connection information
 #[derive(Debug, Clone, Default)]
@@ -14,6 +14,13 @@ pub struct ConnectionInfo {
     host: String,
     remote: Option<String>,
     peer: Option<String>,
+}
+
+/// Returns `host` if it is a valid `host[:port]`.
+fn valid_host(host: &str) -> Option<&str> {
+    urly::Authority::new(host)
+        .is_ok_and(|a| a.userinfo().is_none() && !a.host().is_empty())
+        .then_some(host)
 }
 
 impl ConnectionInfo {
@@ -60,48 +67,35 @@ impl ConnectionInfo {
 
         // scheme
         if scheme.is_none() {
-            if let Some(h) = req
-                .headers
-                .get(HeaderName::from_lowercase(X_FORWARDED_PROTO).unwrap())
+            if let Some(h) = req.headers.get(&X_FORWARDED_PROTO)
                 && let Ok(h) = h.to_str()
             {
                 scheme = h.split(',').next().map(str::trim);
             }
             if scheme.is_none() {
-                scheme = req.uri.scheme().map(uri::Scheme::as_str);
+                scheme = req.uri.scheme_str();
                 if scheme.is_none() && cfg.secure() {
                     scheme = Some("https");
                 }
             }
         }
 
-        // host
-        if host.is_none() {
-            if let Some(h) = req
-                .headers
-                .get(HeaderName::from_lowercase(X_FORWARDED_HOST).unwrap())
-                && let Ok(h) = h.to_str()
-            {
-                host = h.split(',').next().map(str::trim);
-            }
-            if host.is_none() {
-                if let Some(h) = req.headers.get(&header::HOST) {
-                    host = h.to_str().ok();
-                }
-                if host.is_none() {
-                    host = req.uri.authority().map(uri::Authority::as_str);
-                    if host.is_none() {
-                        host = Some(cfg.host());
-                    }
-                }
-            }
-        }
+        // host, invalid values are skipped
+        host = host
+            .and_then(valid_host)
+            .or_else(|| {
+                let h = req.headers.get(&X_FORWARDED_HOST)?.to_str().ok()?;
+                valid_host(h.split(',').next()?.trim())
+            })
+            // the authority of an absolute-form target takes precedence over
+            // `Host`, see RFC 9112 section 3.2.2
+            .or_else(|| Some(req.uri.authority()?.host_port()).filter(|h| !h.is_empty()))
+            .or_else(|| valid_host(req.headers.get(&header::HOST)?.to_str().ok()?))
+            .or_else(|| Some(cfg.host()));
 
         // remote addr
         if remote.is_none() {
-            if let Some(h) = req
-                .headers
-                .get(HeaderName::from_lowercase(X_FORWARDED_FOR).unwrap())
+            if let Some(h) = req.headers.get(&X_FORWARDED_FOR)
                 && let Ok(h) = h.to_str()
             {
                 remote = h.split(',').next().map(str::trim);
@@ -138,9 +132,11 @@ impl ConnectionInfo {
     ///
     /// - Forwarded
     /// - X-Forwarded-Host
-    /// - Host
     /// - Uri
+    /// - Host
     /// - Server hostname
+    ///
+    /// Header values that are not a valid `host[:port]` are skipped.
     pub fn host(&self) -> &str {
         &self.host
     }
@@ -157,7 +153,7 @@ impl ConnectionInfo {
     /// Do not use this function for security purposes, unless you can ensure the Forwarded and
     /// X-Forwarded-For headers cannot be spoofed by the client. If you want the client's socket
     /// address explicitly, use
-    /// [`HttpRequest::peer_addr()`](../web/struct.HttpRequest.html#method.peer_addr) instead.
+    /// [`HttpRequest::peer_addr()`](crate::web::HttpRequest::peer_addr) instead.
     #[inline]
     pub fn remote(&self) -> Option<&str> {
         if let Some(ref r) = self.remote {
@@ -221,5 +217,68 @@ mod tests {
             .to_http_request();
         let info = req.connection_info();
         assert_eq!(info.scheme(), "https");
+    }
+
+    #[test]
+    fn test_forwarded_ignored_items() {
+        let req = TestRequest::default()
+            .header(
+                header::FORWARDED,
+                "for=192.0.2.60, for=192.0.2.61; by=203.0.113.43; host=a.org; host=b.org; proto=https; proto=http; unknown",
+            )
+            .to_http_request();
+        let info = req.connection_info();
+        assert_eq!(info.remote(), Some("192.0.2.60"));
+        assert_eq!(info.host(), "a.org");
+        assert_eq!(info.scheme(), "https");
+    }
+
+    #[test]
+    fn test_host_sources() {
+        // absolute-form target takes precedence over `Host`, userinfo is dropped
+        let req = TestRequest::with_uri("http://u:p@a.org:8080/p")
+            .header(header::HOST, "b.org")
+            .to_http_request();
+        assert_eq!(req.connection_info().host(), "a.org:8080");
+
+        // invalid values are skipped
+        let req = TestRequest::default()
+            .header(header::FORWARDED, "host=a/b")
+            .header(X_FORWARDED_HOST, "evil/x#, c.org")
+            .header(header::HOST, "b.org:81")
+            .to_http_request();
+        assert_eq!(req.connection_info().host(), "b.org:81");
+
+        let req = TestRequest::default()
+            .header(X_FORWARDED_HOST, "u@c.org")
+            .header(header::HOST, "")
+            .to_http_request();
+        assert_eq!(req.connection_info().host(), "localhost:8080");
+    }
+
+    #[test]
+    fn test_secure_config() {
+        let req = TestRequest::default().to_http_request();
+        let info = ConnectionInfo::new(req.head(), &WebAppConfig::new().set_secure());
+        assert_eq!(info.scheme(), "https");
+
+        let info = ConnectionInfo::new(req.head(), &WebAppConfig::new());
+        assert_eq!(info.scheme(), "http");
+    }
+
+    #[crate::rt_test]
+    async fn test_peer_addr() {
+        let req = TestRequest::default()
+            .peer_addr("192.0.2.1:8080".parse().unwrap())
+            .to_http_request();
+        let info = req.connection_info();
+        assert_eq!(info.remote(), Some("192.0.2.1:8080"));
+
+        let req = TestRequest::default()
+            .peer_addr("192.0.2.1:8080".parse().unwrap())
+            .header(X_FORWARDED_FOR, "192.0.2.60")
+            .to_http_request();
+        let info = req.connection_info();
+        assert_eq!(info.remote(), Some("192.0.2.60"));
     }
 }

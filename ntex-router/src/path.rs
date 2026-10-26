@@ -9,16 +9,17 @@ use crate::{Resource, ResourcePath};
 pub(super) enum PathItem {
     Static(&'static str),
     Segment(String),
-    IdxSegment(u16, u16),
+    IdxSegment(u32, u32),
 }
 
 /// Resource path match information
 ///
-/// If resource path contains variable patterns, `Path` stores them.
+/// Wraps a path source and stores the values of dynamic segments matched by
+/// a [`Router`](crate::Router).
 #[derive(Debug)]
 pub struct Path<T> {
     resource: T,
-    pub(super) skip: u16,
+    pub(super) skip: u32,
     pub(super) segments: Vec<(&'static str, PathItem)>,
 }
 
@@ -43,6 +44,7 @@ impl<T: Clone> Clone for Path<T> {
 }
 
 impl<T: ResourcePath> Path<T> {
+    /// Creates a new path state for the path source.
     pub fn new(resource: T) -> Path<T> {
         Path {
             resource,
@@ -64,7 +66,17 @@ impl<T: ResourcePath> Path<T> {
     }
 
     #[inline]
-    /// Path
+    /// Consume the path state and return the inner path instance
+    pub fn into_inner(self) -> T {
+        self.resource
+    }
+
+    #[inline]
+    /// Path that is not matched yet, e.g. the rest of the path after a prefix
+    /// resource matched.
+    ///
+    /// Unlike [`get_ref().path()`](ResourcePath::path), which is the full path,
+    /// it excludes the skipped part of the path.
     pub fn path(&self) -> &str {
         let skip = self.skip as usize;
         let path = self.resource.path();
@@ -72,7 +84,7 @@ impl<T: ResourcePath> Path<T> {
     }
 
     #[inline]
-    /// Set new path
+    /// Set new path source and reset state
     pub fn set(&mut self, resource: T) {
         self.skip = 0;
         self.resource = resource;
@@ -80,16 +92,19 @@ impl<T: ResourcePath> Path<T> {
     }
 
     #[inline]
-    /// Reset state
+    /// Reset skipped length and matched segments
     pub fn reset(&mut self) {
         self.skip = 0;
         self.segments.clear();
     }
 
     #[inline]
-    /// Skip first `n` chars in path
-    pub fn skip(&mut self, n: u16) {
-        self.skip += n;
+    /// Skip first `n` bytes in path, matching starts after them
+    ///
+    /// The skipped length is limited to the path length.
+    pub fn skip(&mut self, n: u32) {
+        let len = u32::try_from(self.resource.path().len()).unwrap_or(u32::MAX);
+        self.skip = self.skip.saturating_add(n).min(len);
     }
 
     // pub(crate) fn add(&mut self, name: &'static str, value: String) {
@@ -102,18 +117,21 @@ impl<T: ResourcePath> Path<T> {
     }
 
     #[inline]
-    /// Check if there are any matched patterns
+    /// Check if there are any matched segments
     pub fn is_empty(&self) -> bool {
         self.segments.is_empty()
     }
 
     #[inline]
-    /// Check number of extracted parameters
+    /// Number of matched segments
     pub fn len(&self) -> usize {
         self.segments.len()
     }
 
-    /// Get matched parameter by name without type conversion
+    /// Get matched segment by name without type conversion
+    ///
+    /// If no segment is named `tail`, the `tail` key returns the unprocessed
+    /// part of the path, see [`path()`](Self::path).
     pub fn get(&self, key: &str) -> Option<&str> {
         for item in &self.segments {
             if key == item.0 {
@@ -126,27 +144,11 @@ impl<T: ResourcePath> Path<T> {
                 };
             }
         }
-        if key == "tail" {
-            Some(&self.resource.path()[(self.skip as usize)..])
-        } else {
-            None
-        }
+        if key == "tail" { Some(self.path()) } else { None }
     }
 
-    /// Get unprocessed part of the path
-    pub fn unprocessed(&self) -> &str {
-        &self.resource.path()[(self.skip as usize)..]
-    }
-
-    /// Get matched parameter by name.
-    ///
-    /// If keyed parameter is not available empty string is used as default
-    /// value.
-    pub fn query(&self, key: &str) -> &str {
-        self.get(key).unwrap_or_default()
-    }
-
-    /// Return iterator to items in parameter container
+    /// Iterator over matched segments as `(name, value)` pairs, in pattern
+    /// order
     pub fn iter(&self) -> PathIter<'_, T> {
         PathIter {
             idx: 0,
@@ -154,13 +156,15 @@ impl<T: ResourcePath> Path<T> {
         }
     }
 
-    /// Try to deserialize matching parameters to a specified type `U`
+    /// Try to deserialize matched segments to a specified type `U`
+    ///
+    /// See [`PathDeserializer`].
     pub fn load<'de, U: serde::Deserialize<'de>>(&'de self) -> Result<U, de::value::Error> {
         de::Deserialize::deserialize(PathDeserializer::new(self))
     }
 }
 
-/// Iterator to items in parameter container
+/// Iterator over matched segments, see [`Path::iter()`]
 #[derive(Debug)]
 pub struct PathIter<'a, T> {
     idx: usize,
@@ -188,6 +192,15 @@ impl<'a, T: ResourcePath> Iterator for PathIter<'a, T> {
     }
 }
 
+impl<'a, T: ResourcePath> IntoIterator for &'a Path<T> {
+    type Item = (&'a str, &'a str);
+    type IntoIter = PathIter<'a, T>;
+
+    fn into_iter(self) -> PathIter<'a, T> {
+        self.iter()
+    }
+}
+
 impl<'a, T: ResourcePath> Index<&'a str> for Path<T> {
     type Output = str;
 
@@ -201,7 +214,13 @@ impl<T: ResourcePath> Index<usize> for Path<T> {
     type Output = str;
 
     fn index(&self, idx: usize) -> &str {
-        match self.segments[idx].1 {
+        let Some((_, item)) = self.segments.get(idx) else {
+            panic!(
+                "Segment index {idx} is out of range, path has {} segments",
+                self.segments.len()
+            )
+        };
+        match *item {
             PathItem::Static(s) => s,
             PathItem::Segment(ref s) => s,
             PathItem::IdxSegment(s, e) => &self.resource.path()[(s as usize)..(e as usize)],
@@ -235,14 +254,57 @@ mod tests {
         p.skip(2);
         assert_eq!(p.get("tail").unwrap(), "st");
         assert_eq!(p.get("unknown"), None);
-        assert_eq!(p.query("tail"), "st");
-        assert_eq!(p.query("unknown"), "");
-        assert_eq!(p.unprocessed(), "st");
+        assert_eq!(p.path(), "st");
+        assert_eq!(p.get_ref().path(), "test");
 
         p.reset();
-        assert_eq!(p.unprocessed(), "test");
+        assert_eq!(p.path(), "test");
 
         p.segments.push(("k1", PathItem::IdxSegment(0, 2)));
         assert_eq!(p.get("k1").unwrap(), "te");
+    }
+
+    #[test]
+    fn test_path_set_and_items() {
+        let mut p = Path::new("/first/path");
+        p.skip(7);
+        p.add_static("st", "static");
+        p.segments
+            .push(("seg", PathItem::Segment("owned".to_string())));
+        assert_eq!(p.path(), "path");
+        assert_eq!(p.len(), 2);
+        assert_eq!(p.get("st"), Some("static"));
+        assert_eq!(p.get("seg"), Some("owned"));
+        assert_eq!(&p[0], "static");
+        assert_eq!(&p[1], "owned");
+        assert_eq!(
+            p.iter().collect::<Vec<_>>(),
+            vec![("st", "static"), ("seg", "owned")]
+        );
+
+        // skip is limited to the path length
+        p.skip(100);
+        assert_eq!(p.path(), "");
+
+        p.set("/second");
+        assert!(p.is_empty());
+        assert_eq!(p.path(), "/second");
+        assert_eq!(*p.get_ref(), "/second");
+    }
+
+    #[test]
+    #[should_panic(expected = "Value for parameter is not available")]
+    fn test_path_index_missing() {
+        let p = Path::new("/");
+        let _ = &p["missing"];
+    }
+
+    #[test]
+    #[should_panic(expected = "Segment index 1 is out of range, path has 1 segments")]
+    fn index_out_of_range() {
+        let mut p = Path::new("/test");
+        p.add_static("st", "static");
+        assert_eq!(&p[0], "static");
+        let _ = &p[1];
     }
 }

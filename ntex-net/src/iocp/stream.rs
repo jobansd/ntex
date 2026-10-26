@@ -1,0 +1,1875 @@
+use std::os::windows::io::{AsRawSocket, BorrowedSocket};
+use std::{cell::Cell, io, mem, net, pin::pin, rc::Rc};
+
+use ntex_io::IoContext;
+use ntex_rt::{Arbiter, syscall};
+use ntex_util::future::{Either, select};
+use ntex_util::{channel::pool, time::sleep};
+use slab::Slab;
+use socket2::Socket;
+use windows_sys::Win32::Networking::WinSock;
+
+use super::{Handler, OpPairBox, Overlapped, Reactor, ReactorApi, ops};
+use crate::helpers::Queue;
+
+/// Releases a socket, gracefully unless the connection was force-closed.
+///
+/// A graceful close drains the receive queue so that a pending `RST` cannot
+/// destroy output that has not reached the peer yet, and shuts both directions
+/// down before closing. A force close skips both and resets the connection
+/// instead, so that the peer cannot mistake a truncated stream for a complete
+/// one.
+///
+/// The socket is closed even if the graceful shutdown fails. The
+/// shutdown error, if any, is reported in preference to a close error.
+///
+/// This runs on the reactor thread and does not block it: the drain and the
+/// shutdown never wait, and neither does `closesocket` on a non-blocking
+/// socket. The drain is safe here too, callers only get here once neither the
+/// recv nor the send is in flight, or after the socket is reset anyway.
+///
+/// `nonblocking` tells whether the socket is in non-blocking mode. A blocking
+/// socket can wait in `closesocket` for the linger timeout set by the
+/// application, so it is closed on the blocking pool instead, see
+/// [`Close::Blocking`].
+fn close_socket(io: WinSock::SOCKET, terminate: bool, nonblocking: bool) -> Close {
+    let shutdown = if terminate {
+        crate::helpers::abort_raw_socket(io as _);
+        Ok(())
+    } else {
+        crate::helpers::drain_raw_socket(io as _);
+        syscall!(SOCKET, WinSock::shutdown(io, 2)).map(|_| ())
+    };
+    if nonblocking {
+        match syscall!(SOCKET, WinSock::closesocket(io)) {
+            Ok(_) => return Close::Done(shutdown),
+            // A linger timeout set by the application cannot be waited for
+            // on a non-blocking socket; the socket stays open and the close
+            // has to be repeated in blocking mode.
+            Err(err) if err.raw_os_error() == Some(WinSock::WSAEWOULDBLOCK) => (),
+            Err(err) => return Close::Done(shutdown.and(Err(err))),
+        }
+    }
+    Close::Blocking(BlockingClose { io, shutdown })
+}
+
+/// Outcome of [`close_socket()`].
+enum Close {
+    /// The socket is closed.
+    Done(io::Result<()>),
+    /// The socket is still open, closing it may block until the linger timeout
+    /// expires, so it has to be finished on the blocking pool.
+    Blocking(BlockingClose),
+}
+
+/// A close that has to wait for the linger timeout of the socket.
+struct BlockingClose {
+    io: WinSock::SOCKET,
+    shutdown: io::Result<()>,
+}
+
+impl Close {
+    /// Waits until the socket is closed.
+    async fn wait(self) -> io::Result<()> {
+        match self {
+            Close::Done(res) => res,
+            Close::Blocking(close) => close.spawn().await,
+        }
+    }
+
+    /// Closes the socket on the current thread, waiting for the linger
+    /// timeout if needed.
+    fn finish(self) -> io::Result<()> {
+        match self {
+            Close::Done(res) => res,
+            Close::Blocking(close) => close.run(),
+        }
+    }
+
+    /// Lets the close finish on its own, logging failures.
+    ///
+    /// Used where there is nobody left to report the outcome to.
+    fn detach(self, io: WinSock::SOCKET, tag: &'static str) {
+        match self {
+            Close::Done(Ok(())) => (),
+            Close::Done(Err(err)) => {
+                log::error!("{tag}: Cannot close socket ({io:?}), {err:?}");
+            }
+            Close::Blocking(close) => ntex_rt::spawn_blocking(move || {
+                if let Err(err) = close.run() {
+                    log::error!("{tag}: Cannot close socket ({io:?}), {err:?}");
+                }
+            })
+            .detach(),
+        }
+    }
+}
+
+impl BlockingClose {
+    /// Starts the close independently of the future awaiting its result.
+    fn spawn(self) -> impl Future<Output = io::Result<()>> {
+        let (tx, rx) = oneshot::async_channel();
+        // Dropping a BlockingResult cancels queued work. Detach the job itself,
+        // and use a separate channel so cancellation cannot discard the socket.
+        ntex_rt::spawn_blocking(move || {
+            let _ = tx.send(self.run());
+        })
+        .detach();
+        async move {
+            rx.await
+                .map_err(|_| io::Error::other(ntex_rt::BlockingError))
+                .and_then(|res| res)
+        }
+    }
+
+    /// Closes the socket in blocking mode, waiting for the linger timeout.
+    fn run(self) -> io::Result<()> {
+        // a non-blocking socket would fail the close with `WSAEWOULDBLOCK` again
+        let sock = unsafe { BorrowedSocket::borrow_raw(self.io as _) };
+        let _ = socket2::SockRef::from(&sock).set_nonblocking(false);
+        let close = syscall!(SOCKET, WinSock::closesocket(self.io)).map(|_| ());
+        self.shutdown.and(close)
+    }
+}
+
+#[derive(Clone)]
+pub(crate) struct StreamOps(Rc<StreamOpsInner>);
+
+pub(crate) struct StreamCtl {
+    id: usize,
+    inner: Rc<StreamOpsInner>,
+}
+
+pub(crate) struct WeakStreamCtl {
+    id: usize,
+    inner: Rc<StreamOpsInner>,
+}
+
+bitflags::bitflags! {
+    #[derive(Copy, Clone, Debug, Eq, PartialEq, Ord, PartialOrd, Hash)]
+    struct Flags: u8 {
+        /// the connection was force-closed, release it without a graceful close
+        const TERMINATE    = 0b0001_0000;
+        const CLOSED       = 0b0010_0000;
+        const DROPPED_PRI  = 0b0100_0000;
+        const DROPPED_SEC  = 0b1000_0000;
+    }
+}
+
+#[derive(Debug)]
+struct StreamItem {
+    io: Socket,
+    flags: Flags,
+    // Peer address, `None` for unix sockets
+    addr: Option<net::SocketAddr>,
+    // Boxed so that a reference to the item does not cover them: a recv that
+    // completes immediately runs the read filters inside `ReadOperation::read()`,
+    // and a write they issue borrows the item while that `&mut` is live. This
+    // also keeps their addresses stable while the slab grows and moves items.
+    ops: OpPairBox<ops::ReadOperation, ops::WriteOperation>,
+    close: Option<pool::Sender<io::Result<()>>>,
+}
+
+struct StreamOpsHandler {
+    inner: Rc<StreamOpsInner>,
+}
+
+enum IdType {
+    Stream(u32),
+    Weak(u32),
+}
+
+#[allow(clippy::box_collection)]
+struct StreamOpsInner {
+    api: ReactorApi,
+    storage: Cell<Option<Box<StreamOpsStorage>>>,
+    delayed_feed: Queue<IdType>,
+    pool: pool::Pool<io::Result<()>>,
+}
+
+struct StreamOpsStorage {
+    streams: Slab<StreamItem>,
+}
+
+impl StreamOps {
+    /// Get `StreamOps` instance from the current runtime, or create new one
+    pub(crate) fn get(reactor: &Reactor) -> Self {
+        Arbiter::get_value(|| {
+            let mut inner = None;
+            reactor.register(|api| {
+                let ops = Rc::new(StreamOpsInner {
+                    api,
+                    pool: pool::new(),
+                    storage: Cell::new(Some(Box::new(StreamOpsStorage {
+                        streams: Slab::new(),
+                    }))),
+                    delayed_feed: Queue::new(),
+                });
+                inner = Some(ops.clone());
+                Box::new(StreamOpsHandler { inner: ops })
+            });
+
+            StreamOps(inner.unwrap())
+        })
+    }
+
+    pub(crate) fn register(
+        self,
+        io: Socket,
+        addr: Option<net::SocketAddr>,
+        ctx: IoContext,
+    ) -> (StreamCtl, WeakStreamCtl) {
+        self.register_with(io, addr, ctx, true)
+    }
+
+    /// Registers a stream, `notify` allows waiting for input with socket state
+    /// notifications instead of zero-byte recvs.
+    fn register_with(
+        self,
+        io: Socket,
+        addr: Option<net::SocketAddr>,
+        ctx: IoContext,
+        notify: bool,
+    ) -> (StreamCtl, WeakStreamCtl) {
+        let sock = io.as_raw_socket();
+        #[cfg(feature = "trace")]
+        log::trace!("{}: Registered({:?}) {:?}", ctx.tag(), sock, addr);
+
+        let mut storage = self.0.storage.take().unwrap();
+        let entry = storage.streams.vacant_entry();
+        let id = entry.key();
+
+        // read op
+        //
+        // A non-blocking socket is read in place without waiting for the kernel
+        // to report it readable first; overlapped operations are not affected
+        let nonblocking = match io.set_nonblocking(true) {
+            Ok(()) => true,
+            Err(err) => {
+                log::error!(
+                    "{}: Cannot switch socket({sock:?}) to non-blocking mode, {err:?}",
+                    ctx.tag()
+                );
+                false
+            }
+        };
+        let mut rd_op = ops::ReadOperation::new(id, sock, ctx.clone(), nonblocking);
+        // edge-triggered notifications need a non-blocking socket, it is
+        // read until drained. Such a read never waits with an overlapped
+        // recv, so it needs no kernel header.
+        let rd_overlapped = if notify && nonblocking && self.0.api.register_notify(sock as _, id) {
+            rd_op.use_notifications();
+            None
+        } else {
+            Some(self.0.api.overlapped(ops::RD_OP))
+        };
+
+        let ops = OpPairBox::new(
+            rd_overlapped,
+            rd_op,
+            self.0.api.overlapped(ops::WR_OP),
+            ops::WriteOperation::new(id, sock, ctx),
+        );
+
+        entry.insert(StreamItem {
+            io,
+            ops,
+            addr,
+            close: None,
+            flags: Flags::empty(),
+        });
+        self.0.storage.set(Some(storage));
+
+        (
+            StreamCtl {
+                id,
+                inner: self.0.clone(),
+            },
+            WeakStreamCtl {
+                id,
+                inner: self.0.clone(),
+            },
+        )
+    }
+}
+
+impl Handler for StreamOpsHandler {
+    fn completed(&mut self, udata: u32, res: io::Result<usize>, optr: *mut Overlapped) {
+        if let Some(id) = match udata {
+            ops::RD_OP => ops::ReadOperation::completed(res, optr),
+            ops::WR_OP => ops::WriteOperation::completed(res, optr),
+            _ => {
+                log::warn!("Unknown operation: {udata}");
+                None
+            }
+        } {
+            self.inner.with(|st| {
+                if let Some(item) = st.streams.get_mut(id)
+                    && !item.flags.contains(Flags::CLOSED)
+                    && item.pause_ops()
+                    && let Some(tx) = item.close.take()
+                {
+                    item.flags.insert(Flags::CLOSED);
+                    let _tag = item.ops.read().tag();
+                    let io = item.io.as_raw_socket() as _;
+                    #[cfg(feature = "trace")]
+                    log::trace!("{_tag}: CloseWait({:?})", io);
+                    let terminate = item.flags.contains(Flags::TERMINATE);
+                    // `shutdown()` is waiting on `tx`, and reports the result
+                    // through `IoContext::stopped`, so it must not resolve
+                    // before the socket is actually closed
+                    match close_socket(io, terminate, !item.ops.read().is_blocking()) {
+                        Close::Done(res) => {
+                            let _ = tx.send(res);
+                        }
+                        Close::Blocking(close) => {
+                            // Started right away rather than inside the task
+                            // below: if the runtime stops before that task
+                            // runs, the socket must still be closed, and
+                            // `cleanup()` skips `CLOSED` items.
+                            let close = close.spawn();
+                            ntex_rt::spawn(async move {
+                                let res = close.await;
+                                #[cfg(feature = "trace")]
+                                log::trace!("{_tag}: WaitClosed({:?})", io);
+                                let _ = tx.send(res);
+                            })
+                            .detach();
+                        }
+                    }
+                } else {
+                    // a forced close does not wait for the completions, the
+                    // item is freed once the last one arrives
+                    st.release_if_done(id);
+                }
+            });
+        }
+    }
+
+    fn notified(&mut self, id: usize, _events: u32) {
+        // A notification queued before the socket was closed can arrive after
+        // the slot is reused. It then acts as a spurious `read()`, which is
+        // harmless: a non-blocking socket is found drained, a blocking one is
+        // not read before the kernel reports input, and a paused stream is
+        // not read at all.
+        let op = self.inner.with(|st| {
+            st.streams
+                .get_mut(id)
+                .filter(|item| !item.is_closing())
+                .map(|item| (item.ops.read_ptr(), item.ops.read_overlapped()))
+        });
+        if let Some((op, overlapped)) = op {
+            // SAFETY: see `StreamCtl::read()`
+            unsafe { (*op).notified(overlapped) };
+        }
+    }
+
+    fn tick(&mut self) {
+        self.inner.check_delayed_feed();
+    }
+
+    fn cleanup(&mut self) {
+        // The reactor has stopped, so nothing will close the sockets that are
+        // still registered: stored `IoContext`s keep `StreamOpsInner` alive
+        // through the io handle, and the drop paths never run for them.
+        if let Some(mut storage) = self.inner.storage.take() {
+            for item in storage.streams.drain() {
+                if item.flags.contains(Flags::CLOSED) {
+                    // a close job owns the socket, a forced close may have left
+                    // operations in flight, see below
+                    if item.ops.read().is_pending() || item.ops.write().is_pending() {
+                        mem::forget(item);
+                    } else {
+                        mem::forget(item.io);
+                    }
+                    continue;
+                }
+                let io = item.io.as_raw_socket() as _;
+                let tag = item.ops.read().tag();
+                log::trace!("{tag}: Unclosed socket ({io:?}) {:?}", item.addr);
+                // the reactor has stopped, waiting here blocks nothing, while
+                // the blocking pool may never run a close handed to it
+                let res = close_socket(
+                    io,
+                    item.flags.contains(Flags::TERMINATE),
+                    !item.ops.read().is_blocking(),
+                )
+                .finish();
+                if let Err(err) = res {
+                    log::error!("{tag}: Cannot close socket ({io:?}), {err:?}");
+                }
+                if item.ops.read().is_pending() || item.ops.write().is_pending() {
+                    // Closing the socket cancels the pending operations, but
+                    // the kernel still writes their completion into the
+                    // `OVERLAPPED` and buffers inside the item, and nothing
+                    // dequeues it anymore. Leak the item so that memory stays
+                    // valid.
+                    mem::forget(item);
+                } else {
+                    mem::forget(item.io);
+                }
+            }
+            self.inner.storage.set(Some(storage));
+        }
+        self.inner.delayed_feed.clear();
+    }
+}
+
+impl StreamOpsInner {
+    fn with<F, R>(&self, f: F) -> R
+    where
+        F: FnOnce(&mut StreamOpsStorage) -> R,
+    {
+        let mut storage = self.storage.take().unwrap();
+        let result = f(&mut storage);
+        self.storage.set(Some(storage));
+        result
+    }
+
+    fn check_delayed_feed(&self) {
+        if !self.delayed_feed.is_empty()
+            && let Some(mut storage) = self.storage.take()
+        {
+            while let Some(id) = self.delayed_feed.pop() {
+                match id {
+                    IdType::Stream(id) => storage.drop_stream(id as usize),
+                    IdType::Weak(id) => storage.drop_weak_stream(id as usize),
+                }
+            }
+            self.storage.set(Some(storage));
+        }
+    }
+}
+
+impl StreamCtl {
+    pub(crate) async fn shutdown(&self, terminate: bool) -> io::Result<()> {
+        let result = self.inner.with(|st| {
+            if let Some(item) = st.streams.get_mut(self.id) {
+                if terminate {
+                    // the connection was force-closed, so the deferred close
+                    // below and the drop paths must skip the graceful close too
+                    item.flags.insert(Flags::TERMINATE);
+                }
+                if item.flags.contains(Flags::CLOSED) {
+                    None
+                } else if item.pause_ops() {
+                    // no outstanding ops
+                    item.flags.insert(Flags::CLOSED);
+                    Some(Either::Left((
+                        item.ops.read().tag(),
+                        item.io.as_raw_socket() as _,
+                        !item.ops.read().is_blocking(),
+                    )))
+                } else {
+                    let (tx, rx) = self.inner.pool.channel();
+                    item.close = Some(tx);
+                    Some(Either::Right((rx, item.ops.read().shutdown_timeout())))
+                }
+            } else {
+                None
+            }
+        });
+
+        match result {
+            Some(Either::Left((_tag, io, nonblocking))) => {
+                #[cfg(feature = "trace")]
+                log::trace!("{_tag}: Close({io:?})");
+                close_socket(io, terminate, nonblocking).wait().await
+            }
+            Some(Either::Right((rx, timeout))) => {
+                let mut rx = pin!(rx);
+                if let Either::Left(res) = select(rx.as_mut(), sleep(timeout)).await {
+                    return res
+                        .map_err(|_| io::Error::other("Unexpected"))
+                        .and_then(|res| res);
+                }
+                // A cancelled operation has not completed in time, it may never
+                // do. Closing the socket completes it, unless the close has
+                // started meanwhile.
+                let Some((tag, io, nonblocking)) = self.inner.with(|st| st.force_close(self.id))
+                else {
+                    return rx
+                        .await
+                        .map_err(|_| io::Error::other("Unexpected"))
+                        .and_then(|res| res);
+                };
+                log::warn!(
+                    "{tag}: Cancelled operations did not complete in {timeout:?}, closing socket ({io:?})"
+                );
+                if let Err(err) = close_socket(io, true, nonblocking).wait().await {
+                    log::error!("{tag}: Cannot close socket ({io:?}), {err:?}");
+                }
+                Err(io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    "cancelled operations did not complete",
+                ))
+            }
+            None => Ok(()),
+        }
+    }
+
+    pub(crate) fn read(&self) {
+        let op = self.inner.with(|st| {
+            st.streams
+                .get_mut(self.id)
+                .filter(|item| !item.is_closing())
+                .map(|item| (item.ops.read_ptr(), item.ops.read_overlapped()))
+        });
+        if let Some((op, overlapped)) = op {
+            // Issued outside `with()`: a recv that completes immediately runs
+            // the read filters, and output they produce may be written right
+            // away through `WeakStreamCtl::write`, which needs the storage.
+            //
+            // SAFETY: the operation is owned by an `OpPairBox`, so its address is
+            // stable. It is only freed once this handle is dropped or the
+            // reactor stops. A close only starts from `shutdown()`, never from
+            // within the read.
+            // A write issued from within the read borrows the item, which does
+            // not overlap the boxed payload. Neither borrow covers the header.
+            unsafe { (*op).read(overlapped) };
+        }
+    }
+
+    pub(crate) fn write(&self) {
+        self.inner.with(|st| {
+            if let Some(item) = st.streams.get_mut(self.id)
+                && !item.is_closing()
+            {
+                let overlapped = item.ops.write_overlapped();
+                item.ops.write_mut().write(overlapped);
+            }
+        });
+    }
+
+    pub(crate) fn pause(&self) {
+        self.inner.with(|st| {
+            if let Some(item) = st.streams.get_mut(self.id)
+                && !item.is_closing()
+            {
+                item.ops.read_mut().pause();
+            }
+        });
+    }
+}
+
+impl StreamItem {
+    /// Cancels the operations in flight, and marks them as closing so their
+    /// completions start the close. Returns `true` if none is in flight.
+    ///
+    /// Both are always paused: a send left running would issue the next one
+    /// once it completes.
+    fn pause_ops(&mut self) -> bool {
+        let overlapped = self.ops.read_overlapped();
+        let rd = self.ops.read_mut().cancel(overlapped);
+        let overlapped = self.ops.write_overlapped();
+        let wr = self.ops.write_mut().pause(overlapped);
+        rd && wr
+    }
+
+    /// Whether the close has started. No operation may be started then, and
+    /// once the socket is closed its handle value may belong to another one.
+    fn is_closing(&self) -> bool {
+        self.close.is_some() || self.flags.contains(Flags::CLOSED)
+    }
+}
+
+impl StreamOpsStorage {
+    fn drop_stream(&mut self, id: usize) {
+        // Dropping while `StreamOps` handling event. The item is gone if
+        // `cleanup()` already released it.
+        let Some(item) = self.streams.get_mut(id) else {
+            return;
+        };
+        #[cfg(feature = "trace")]
+        log::trace!(
+            "{}: DropStream ({:?}) f:{:?}",
+            item.ops.read().tag(),
+            item.io.as_raw_socket(),
+            item.flags,
+        );
+
+        item.flags.insert(Flags::DROPPED_PRI);
+        self.release_if_done(id);
+    }
+
+    fn drop_weak_stream(&mut self, id: usize) {
+        // see `drop_stream`
+        let Some(item) = self.streams.get_mut(id) else {
+            return;
+        };
+        #[cfg(feature = "trace")]
+        log::trace!(
+            "{}: DropStreamSec ({:?}) f:{:?}",
+            item.ops.read().tag(),
+            item.io.as_raw_socket(),
+            item.flags,
+        );
+
+        item.flags.insert(Flags::DROPPED_SEC);
+        self.release_if_done(id);
+    }
+
+    /// Frees an item once both handles are gone and no operation is in flight.
+    ///
+    /// Operations can still be in flight after a forced close, the completion
+    /// of the last one calls this again.
+    fn release_if_done(&mut self, id: usize) {
+        let Some(item) = self.streams.get_mut(id) else {
+            return;
+        };
+        if !item.flags.contains(Flags::DROPPED_PRI | Flags::DROPPED_SEC) {
+            return;
+        }
+        if item.ops.read().is_pending() || item.ops.write().is_pending() {
+            if !item.flags.contains(Flags::CLOSED) {
+                // dropped without a shutdown, cancel so that the completions
+                // arrive; once closed, the handle value may be reused
+                item.pause_ops();
+            }
+            return;
+        }
+        Self::release(self.streams.remove(id));
+    }
+
+    /// Stops waiting for cancelled operations and takes over the close.
+    ///
+    /// Returns the socket to close, or `None` if the close has already started
+    /// because the operations completed meanwhile.
+    fn force_close(&mut self, id: usize) -> Option<(&'static str, WinSock::SOCKET, bool)> {
+        let item = self.streams.get_mut(id)?;
+        item.close.take()?;
+        item.flags.insert(Flags::CLOSED | Flags::TERMINATE);
+        Some((
+            item.ops.read().tag(),
+            item.io.as_raw_socket() as _,
+            !item.ops.read().is_blocking(),
+        ))
+    }
+
+    /// Frees an item once both handles are gone, closing its socket unless a
+    /// close job already owns it.
+    fn release(item: StreamItem) {
+        // The item holds the `OVERLAPPED` and buffers of its operations, so
+        // freeing it while one is in flight lets the kernel complete into freed
+        // memory. `release_if_done()` waits for both operations, and
+        // `cleanup()` takes the items that are still registered at shutdown.
+        debug_assert!(
+            !item.ops.read().is_pending() && !item.ops.write().is_pending(),
+            "{}: stream released with an operation in flight",
+            item.ops.read().tag()
+        );
+        if !item.flags.contains(Flags::CLOSED) {
+            let io = item.io.as_raw_socket() as _;
+            let terminate = item.flags.contains(Flags::TERMINATE);
+            close_socket(io, terminate, !item.ops.read().is_blocking())
+                .detach(io, item.ops.read().tag());
+        }
+        mem::forget(item.io);
+    }
+}
+
+impl Drop for StreamCtl {
+    fn drop(&mut self) {
+        if let Some(mut storage) = self.inner.storage.take() {
+            storage.drop_stream(self.id);
+            self.inner.storage.set(Some(storage));
+        } else {
+            self.inner.delayed_feed.push(IdType::Stream(self.id as u32));
+        }
+    }
+}
+
+impl WeakStreamCtl {
+    /// Returns the peer address, or `None` once `cleanup()` released the stream.
+    pub(crate) fn peer_addr(&self) -> Option<net::SocketAddr> {
+        self.inner
+            .with(|st| st.streams.get(self.id).and_then(|item| item.addr))
+    }
+
+    pub(crate) fn write(&self) {
+        self.inner.with(|st| {
+            if let Some(item) = st.streams.get_mut(self.id)
+                && !item.is_closing()
+            {
+                let overlapped = item.ops.write_overlapped();
+                item.ops.write_mut().write(overlapped);
+            }
+        });
+    }
+}
+
+impl Drop for WeakStreamCtl {
+    fn drop(&mut self) {
+        if let Some(mut storage) = self.inner.storage.take() {
+            storage.drop_weak_stream(self.id);
+            self.inner.storage.set(Some(storage));
+        } else {
+            self.inner.delayed_feed.push(IdType::Weak(self.id as u32));
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::os::windows::io::{AsRawHandle, FromRawSocket, IntoRawSocket};
+
+    use ntex_bytes::BytesMut;
+    use socket2::{Domain, Protocol, Type};
+    use windows_sys::Win32::System::IO::{GetQueuedCompletionStatusEx, OVERLAPPED_ENTRY};
+
+    use super::*;
+
+    fn is_open(io: WinSock::SOCKET) -> bool {
+        let mut val = 0i32;
+        let mut len = i32::try_from(mem::size_of::<i32>()).unwrap();
+        let res = unsafe {
+            WinSock::getsockopt(
+                io,
+                WinSock::SOL_SOCKET,
+                WinSock::SO_TYPE,
+                (&raw mut val).cast(),
+                &raw mut len,
+            )
+        };
+        res == 0
+    }
+
+    /// Whether `io` is still the socket bound to `addr`. Tests run in
+    /// parallel, a closed handle value may already belong to another test.
+    fn is_ours(io: WinSock::SOCKET, addr: &socket2::SockAddr) -> bool {
+        is_open(io) && {
+            let s = mem::ManuallyDrop::new(unsafe { Socket::from_raw_socket(io as _) });
+            s.local_addr().is_ok_and(|a| a == *addr)
+        }
+    }
+
+    /// Items are stored inline in the slab, so their size is paid for every
+    /// slot, vacant ones included.
+    #[test]
+    fn stream_item_is_compact() {
+        assert!(
+            mem::size_of::<StreamItem>() <= 72,
+            "StreamItem is {} bytes",
+            mem::size_of::<StreamItem>()
+        );
+    }
+
+    /// A failed graceful shutdown must not leave the socket open: the caller
+    /// has already given up ownership of it, so nothing else would close it.
+    #[test]
+    fn close_socket_closes_when_shutdown_fails() {
+        // `shutdown` fails with `WSAENOTCONN` on a socket that never connected
+        let sock = Socket::new(Domain::IPV4, Type::STREAM, Some(Protocol::TCP)).unwrap();
+        sock.bind(
+            &"127.0.0.1:0"
+                .parse::<std::net::SocketAddr>()
+                .unwrap()
+                .into(),
+        )
+        .unwrap();
+        sock.set_nonblocking(true).unwrap();
+        let addr = sock.local_addr().unwrap();
+        let io = sock.into_raw_socket() as WinSock::SOCKET;
+
+        let Close::Done(res) = close_socket(io, false, true) else {
+            panic!("close of a non-blocking socket did not complete in place");
+        };
+        let open = is_ours(io, &addr);
+        if open {
+            unsafe { WinSock::closesocket(io) };
+        }
+
+        assert_eq!(
+            res.unwrap_err().raw_os_error(),
+            Some(WinSock::WSAENOTCONN),
+            "the shutdown error must still be reported"
+        );
+        assert!(!open, "socket leaked after a failed shutdown");
+    }
+
+    /// A linger timeout set by the application must not make the close wait
+    /// on the reactor thread, and must not lose the unsent output.
+    ///
+    /// Winsock documents that `closesocket` of a non-blocking socket with a
+    /// linger timeout fails with `WSAEWOULDBLOCK` and leaves the socket open,
+    /// such a close is finished in blocking mode. Current Windows versions
+    /// can close it right away instead, both outcomes are accepted.
+    #[test]
+    fn lingering_close_does_not_wait() {
+        use std::time::{Duration, Instant};
+
+        let lst = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let client = Socket::from(std::net::TcpStream::connect(lst.local_addr().unwrap()).unwrap());
+        let (mut peer, _) = lst.accept().unwrap();
+        peer.set_read_timeout(Some(Duration::from_secs(10)))
+            .unwrap();
+        client.set_linger(Some(Duration::from_secs(5))).unwrap();
+        client.set_nonblocking(true).unwrap();
+
+        // fill the send buffer, the peer does not read yet
+        let data = vec![1u8; 64 * 1024];
+        let mut sent = 0;
+        loop {
+            match std::io::Write::write(&mut &client, &data) {
+                Ok(n) => sent += n,
+                Err(err) if err.kind() == io::ErrorKind::WouldBlock => break,
+                Err(err) => panic!("{err:?}"),
+            }
+        }
+        let addr = client.local_addr().unwrap();
+        let io = client.into_raw_socket() as WinSock::SOCKET;
+
+        let start = Instant::now();
+        let close = close_socket(io, false, true);
+        assert!(start.elapsed() < Duration::from_secs(1), "close waited");
+        let job = match close {
+            Close::Done(res) => {
+                eprintln!("lingering close: done inline, {res:?}");
+                res.unwrap();
+                None
+            }
+            Close::Blocking(close) => {
+                eprintln!("lingering close: finished in blocking mode");
+                assert!(is_ours(io, &addr), "lingering close released the socket");
+                Some(std::thread::spawn(move || close.run()))
+            }
+        };
+
+        let mut buf = vec![0u8; 64 * 1024];
+        let mut received = 0;
+        loop {
+            match std::io::Read::read(&mut peer, &mut buf).unwrap() {
+                0 => break,
+                n => received += n,
+            }
+        }
+        if let Some(job) = job {
+            job.join().unwrap().unwrap();
+        }
+        assert_eq!(received, sent, "unsent output lost");
+        assert!(!is_ours(io, &addr), "socket not closed");
+    }
+
+    struct TestStream {
+        socket: Socket,
+        ops: StreamOps,
+        ctl: Rc<Cell<Option<StreamCtl>>>,
+        notify: bool,
+    }
+
+    struct TestHandle {
+        ctl: WeakStreamCtl,
+    }
+
+    impl ntex_io::Handle for TestHandle {
+        fn query(&self, id: std::any::TypeId) -> Option<Box<dyn std::any::Any>> {
+            super::super::io::query(&self.ctl, id)
+        }
+    }
+
+    impl ntex_io::IoStream for TestStream {
+        fn start(self, ctx: IoContext) -> Box<dyn ntex_io::Handle> {
+            let addr = self.socket.peer_addr().unwrap().as_socket();
+            let (ctl, weak) = self.ops.register_with(self.socket, addr, ctx, self.notify);
+            self.ctl.set(Some(ctl));
+            Box::new(TestHandle { ctl: weak })
+        }
+    }
+
+    /// Registers the client end of a loopback connection with a private
+    /// reactor, and returns it along with the peer end. The stream waits for
+    /// input with zero-byte recvs.
+    fn registered(
+        reactor: &Reactor,
+    ) -> (
+        ntex_io::Io,
+        StreamCtl,
+        StreamOps,
+        WinSock::SOCKET,
+        std::net::TcpStream,
+    ) {
+        registered_with(reactor, false)
+    }
+
+    /// Like `registered()`, but the stream waits for input with socket state
+    /// notifications. Returns `None` if they are not available.
+    fn registered_notify(
+        reactor: &Reactor,
+    ) -> Option<(
+        ntex_io::Io,
+        StreamCtl,
+        StreamOps,
+        WinSock::SOCKET,
+        std::net::TcpStream,
+    )> {
+        let res = registered_with(reactor, true);
+        if res
+            .2
+            .0
+            .with(|st| st.streams[res.1.id].ops.read().is_notified())
+        {
+            Some(res)
+        } else {
+            eprintln!("socket state notifications are not available, skipped");
+            cleanup(&res.2);
+            None
+        }
+    }
+
+    fn registered_with(
+        reactor: &Reactor,
+        notify: bool,
+    ) -> (
+        ntex_io::Io,
+        StreamCtl,
+        StreamOps,
+        WinSock::SOCKET,
+        std::net::TcpStream,
+    ) {
+        let lst = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let client = std::net::TcpStream::connect(lst.local_addr().unwrap()).unwrap();
+        let (peer, _) = lst.accept().unwrap();
+        peer.set_read_timeout(Some(std::time::Duration::from_secs(5)))
+            .unwrap();
+
+        let ops = StreamOps::get(reactor);
+        let raw = client.as_raw_socket() as WinSock::SOCKET;
+        ops.0.api.attach(raw as _, true).unwrap();
+        let ctl = Rc::new(Cell::new(None));
+        let io = ntex_io::Io::new(
+            TestStream {
+                socket: Socket::from(client),
+                ops: ops.clone(),
+                ctl: ctl.clone(),
+                notify,
+            },
+            ntex_service::cfg::SharedCfg::default(),
+        );
+        (io, ctl.take().unwrap(), ops, raw, peer)
+    }
+
+    fn cleanup(ops: &StreamOps) {
+        StreamOpsHandler {
+            inner: ops.0.clone(),
+        }
+        .cleanup();
+    }
+
+    /// Asserts the socket is closed, and releases it if it is not.
+    fn assert_closed(io: WinSock::SOCKET, peer: &mut std::net::TcpStream) {
+        let open = is_ours(io, &peer.peer_addr().unwrap().into());
+        if open {
+            unsafe { WinSock::closesocket(io) };
+        }
+        assert!(!open, "cleanup leaked the socket");
+        let mut buf = [0u8; 16];
+        assert_eq!(std::io::Read::read(peer, &mut buf).unwrap(), 0);
+    }
+
+    /// Occupies the sole worker until the sender is used or dropped.
+    fn block_worker() -> std::sync::mpsc::Sender<()> {
+        let (started_tx, started_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        ntex_rt::spawn_blocking(move || {
+            started_tx.send(()).unwrap();
+            let _ = release_rx.recv();
+        })
+        .detach();
+        started_rx
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .unwrap();
+        release_tx
+    }
+
+    #[test]
+    fn blocking_close_survives_cancelled_shutdown() {
+        ntex_rt::System::build()
+            .thread_pool_limit(1)
+            .testing()
+            .build(crate::DefaultRuntime)
+            .block_on(async {
+                let release = block_worker();
+                let reactor = Reactor::new().unwrap();
+                let (io, ctl, ops, raw, mut peer) = registered(&reactor);
+                ops.0
+                    .with(|st| st.streams[ctl.id].ops.read_mut().fake_blocking());
+
+                {
+                    let mut shutdown = pin!(ctl.shutdown(false));
+                    std::future::poll_fn(|cx| {
+                        assert!(shutdown.as_mut().poll(cx).is_pending());
+                        std::task::Poll::Ready(())
+                    })
+                    .await;
+                }
+
+                // Cleanup must leave the socket to the queued close job.
+                cleanup(&ops);
+                assert!(is_ours(raw, &peer.peer_addr().unwrap().into()));
+                release.send(()).unwrap();
+                ntex_rt::spawn_blocking(|| ()).await.unwrap();
+                assert_closed(raw, &mut peer);
+                drop((ctl, io));
+            });
+    }
+
+    #[test]
+    fn blocking_close_survives_runtime_shutdown() {
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        let (release, raw, mut peer) = ntex_rt::System::build()
+            .thread_pool_limit(1)
+            .testing()
+            .build(crate::DefaultRuntime)
+            .block_on(async {
+                let release = block_worker();
+                let reactor = Reactor::new().unwrap();
+                let (io, ctl, ops, raw, peer) = registered(&reactor);
+                ops.0.with(|st| {
+                    st.streams[ctl.id].ops.read_mut().fake_blocking();
+                    st.streams[ctl.id].ops.read_mut().fake_pending();
+                });
+
+                {
+                    let mut shutdown = pin!(ctl.shutdown(false));
+                    std::future::poll_fn(|cx| {
+                        assert!(shutdown.as_mut().poll(cx).is_pending());
+                        std::task::Poll::Ready(())
+                    })
+                    .await;
+                    complete_aborted_recv(&ops, ctl.id);
+                }
+
+                cleanup(&ops);
+                drop((ctl, io));
+                // A fence behind the close lets us observe the drained queue
+                // after runtime teardown has dropped its async result relay.
+                ntex_rt::spawn_blocking(move || done_tx.send(()).unwrap()).detach();
+                (release, raw, peer)
+            });
+
+        assert!(is_ours(raw, &peer.peer_addr().unwrap().into()));
+        release.send(()).unwrap();
+        done_rx
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .unwrap();
+        assert_closed(raw, &mut peer);
+    }
+
+    #[ntex::test]
+    async fn blocking_close_reports_shutdown_error() {
+        let sock = Socket::new(Domain::IPV4, Type::STREAM, Some(Protocol::TCP)).unwrap();
+        sock.bind(
+            &"127.0.0.1:0"
+                .parse::<std::net::SocketAddr>()
+                .unwrap()
+                .into(),
+        )
+        .unwrap();
+        let addr = sock.local_addr().unwrap();
+        let raw = sock.into_raw_socket() as WinSock::SOCKET;
+
+        let result = close_socket(raw, false, false).wait().await;
+        let open = is_ours(raw, &addr);
+        if open {
+            unsafe { WinSock::closesocket(raw) };
+        }
+        assert!(!open, "blocking close leaked the socket");
+        assert_eq!(
+            result.unwrap_err().raw_os_error(),
+            Some(WinSock::WSAENOTCONN)
+        );
+    }
+
+    /// A socket that is still open when the runtime stops must be closed by
+    /// `cleanup()`, and handles dropped afterwards must not touch it again.
+    #[ntex::test]
+    async fn cleanup_closes_idle_socket() {
+        let reactor = Reactor::new().unwrap();
+        let (io, ctl, ops, raw, mut peer) = registered(&reactor);
+
+        let addr = peer.local_addr().unwrap();
+        assert_eq!(
+            io.query::<ntex_io::types::PeerAddr>().get().unwrap().0,
+            addr
+        );
+
+        cleanup(&ops);
+        assert_closed(raw, &mut peer);
+        assert!(io.query::<ntex_io::types::PeerAddr>().get().is_none());
+
+        drop(ctl);
+        drop(io);
+        cleanup(&ops);
+    }
+
+    /// A socket with a recv in flight must be closed too. The item stays
+    /// allocated, since the kernel still completes the recv into it.
+    #[ntex::test]
+    async fn cleanup_closes_socket_with_pending_recv() {
+        let reactor = Reactor::new().unwrap();
+        let (io, ctl, ops, raw, mut peer) = registered(&reactor);
+        ctl.read();
+        assert!(
+            ops.0.with(|st| st.streams[ctl.id].ops.read().is_pending()),
+            "recv completed without data"
+        );
+
+        cleanup(&ops);
+        assert_closed(raw, &mut peer);
+
+        drop(ctl);
+        drop(io);
+    }
+
+    /// A recv waiting for input on an idle connection must not hold a read
+    /// buffer, the kernel is only asked to report that input is available.
+    #[ntex::test]
+    async fn idle_recv_holds_no_read_buffer() {
+        let reactor = Reactor::new().unwrap();
+        let (io, ctl, ops, raw, mut peer) = registered(&reactor);
+        let page = io.cfg().read_size_min();
+        let buf = BytesMut::with_page_size(page);
+        let ptr = buf.as_ptr();
+        drop(buf);
+
+        ctl.read();
+        assert!(
+            ops.0.with(|st| st.streams[ctl.id].ops.read().is_pending()),
+            "recv completed without data"
+        );
+        let buf = BytesMut::with_page_size(page);
+        assert_eq!(buf.as_ptr(), ptr, "idle recv took a read buffer");
+        drop(buf);
+
+        cleanup(&ops);
+        assert_closed(raw, &mut peer);
+
+        drop(ctl);
+        drop(io);
+    }
+
+    /// Available input is read in place, then a recv waits for more.
+    #[ntex::test]
+    async fn available_input_is_read_in_place() {
+        let reactor = Reactor::new().unwrap();
+        let (io, ctl, ops, raw, mut peer) = registered(&reactor);
+        std::io::Write::write_all(&mut peer, b"hello").unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(100));
+
+        ctl.read();
+        assert!(
+            ops.0.with(|st| st.streams[ctl.id].ops.read().is_pending()),
+            "no recv waits for more input"
+        );
+        assert_eq!(
+            io.with_read_dst(|buf| buf.split_to(buf.len())),
+            b"hello".as_ref()
+        );
+
+        cleanup(&ops);
+        assert_closed(raw, &mut peer);
+
+        drop(ctl);
+        drop(io);
+    }
+
+    /// Delivers an aborted completion for a recv marked by `fake_pending()`.
+    fn complete_aborted_recv(ops: &StreamOps, id: usize) {
+        let optr = ops
+            .0
+            .with(|st| st.streams[id].ops.read_overlapped().cast::<Overlapped>());
+        complete_aborted(ops, ops::RD_OP, optr);
+    }
+
+    /// Delivers an aborted completion for a send marked by `fake_pending()`.
+    fn complete_aborted_send(ops: &StreamOps, id: usize) {
+        let optr = ops
+            .0
+            .with(|st| st.streams[id].ops.write_overlapped().cast::<Overlapped>());
+        complete_aborted(ops, ops::WR_OP, optr);
+    }
+
+    fn complete_aborted(ops: &StreamOps, udata: u32, optr: *mut Overlapped) {
+        let err = io::Error::from_raw_os_error(
+            i32::try_from(windows_sys::Win32::Foundation::ERROR_OPERATION_ABORTED).unwrap(),
+        );
+        StreamOpsHandler {
+            inner: ops.0.clone(),
+        }
+        .completed(udata, Err(err), optr);
+    }
+
+    /// A shutdown with both a recv and a send in flight must cancel both. A
+    /// send left running would start the next one once it completes, and a
+    /// stalled one would hold up the close until the shutdown timeout.
+    #[ntex::test]
+    async fn shutdown_cancels_pending_recv_and_send() {
+        let reactor = Reactor::new().unwrap();
+        let (io, ctl, ops, raw, mut peer) = registered(&reactor);
+        let id = ctl.id;
+        ops.0.with(|st| {
+            st.streams[id].ops.read_mut().fake_blocking();
+            st.streams[id].ops.read_mut().fake_pending();
+            st.streams[id].ops.write_mut().fake_pending_with(&[b"data"]);
+        });
+
+        {
+            let mut fut = pin!(ntex::time::timeout(
+                ntex::time::Seconds(5),
+                ctl.shutdown(false)
+            ));
+            std::future::poll_fn(|cx| {
+                assert!(fut.as_mut().poll(cx).is_pending());
+                std::task::Poll::Ready(())
+            })
+            .await;
+            assert!(
+                ops.0.with(|st| st.streams[id].ops.write().is_closing()),
+                "send in flight not cancelled"
+            );
+
+            complete_aborted_send(&ops, id);
+            assert_eq!(
+                ops.0.with(|st| st.streams[id].ops.write().unsent()),
+                0,
+                "cancelled send kept its pages"
+            );
+            complete_aborted_recv(&ops, id);
+            fut.await
+                .expect("close did not start after both completions")
+                .unwrap();
+        }
+        assert_closed(raw, &mut peer);
+
+        drop(ctl);
+        drop(io);
+    }
+
+    /// A close waiting for a cancelled recv that never completes must give up
+    /// after the shutdown timeout and close the socket, resetting the
+    /// connection. The item stays allocated until the recv does complete.
+    #[ntex::test]
+    async fn shutdown_closes_socket_when_cancel_does_not_complete() {
+        let reactor = Reactor::new().unwrap();
+        let (io, ctl, ops, raw, mut peer) = registered(&reactor);
+        let id = ctl.id;
+        ops.0
+            .with(|st| st.streams[id].ops.read_mut().fake_pending());
+
+        let err = ntex::time::timeout(ntex::time::Seconds(5), ctl.shutdown(false))
+            .await
+            .expect("close waited for the recv past the shutdown timeout")
+            .unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::TimedOut);
+
+        let open = is_ours(raw, &peer.peer_addr().unwrap().into());
+        if open {
+            unsafe { WinSock::closesocket(raw) };
+        }
+        assert!(!open, "socket not closed");
+        let mut buf = [0u8; 16];
+        let err = std::io::Read::read(&mut peer, &mut buf).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::ConnectionReset);
+
+        drop(ctl);
+        drop(io);
+        assert!(
+            ops.0.with(|st| st.streams.contains(id)),
+            "item freed with a recv in flight"
+        );
+        complete_aborted_recv(&ops, id);
+        assert!(
+            !ops.0.with(|st| st.streams.contains(id)),
+            "item not freed after the completion"
+        );
+    }
+
+    /// Handles dropped without a shutdown while a recv is in flight must
+    /// cancel it and keep the item, the kernel still completes into it. The
+    /// completion frees the item and closes the socket.
+    #[ntex::test]
+    async fn drop_without_shutdown_waits_for_pending_recv() {
+        let reactor = Reactor::new().unwrap();
+        let (io, ctl, ops, raw, peer) = registered(&reactor);
+        let id = ctl.id;
+        ops.0
+            .with(|st| st.streams[id].ops.read_mut().fake_pending());
+
+        drop(ctl);
+        drop(io);
+        assert!(
+            ops.0.with(|st| st.streams.contains(id)),
+            "item freed with a recv in flight"
+        );
+
+        complete_aborted_recv(&ops, id);
+        assert!(
+            !ops.0.with(|st| st.streams.contains(id)),
+            "item not freed after the completion"
+        );
+        let addr = peer.peer_addr().unwrap().into();
+        assert!(!is_ours(raw, &addr), "socket not closed");
+    }
+
+    /// A handle dropped while the storage is in use, e.g. from within a
+    /// completion, is released on the next reactor tick.
+    #[ntex::test]
+    async fn drop_during_completion_is_deferred_to_tick() {
+        let reactor = Reactor::new().unwrap();
+        let (io, ctl, ops, raw, peer) = registered(&reactor);
+        let id = ctl.id;
+
+        let storage = ops.0.storage.take().unwrap();
+        drop(ctl);
+        ops.0.storage.set(Some(storage));
+        assert!(!ops.0.delayed_feed.is_empty());
+        assert!(
+            !ops.0
+                .with(|st| st.streams[id].flags.contains(Flags::DROPPED_PRI))
+        );
+
+        StreamOpsHandler {
+            inner: ops.0.clone(),
+        }
+        .tick();
+        assert!(ops.0.delayed_feed.is_empty());
+        assert!(
+            ops.0
+                .with(|st| st.streams[id].flags.contains(Flags::DROPPED_PRI))
+        );
+
+        // the weak handle goes with the io, then the item is freed
+        drop(io);
+        assert!(!ops.0.with(|st| st.streams.contains(id)));
+        let addr = peer.peer_addr().unwrap().into();
+        assert!(!is_ours(raw, &addr), "socket not closed");
+    }
+
+    /// A second shutdown finds the close already done and succeeds, and no
+    /// operation is started on a closed stream.
+    #[ntex::test]
+    async fn repeated_shutdown_succeeds() {
+        let reactor = Reactor::new().unwrap();
+        let (io, ctl, ops, raw, mut peer) = registered(&reactor);
+        let id = ctl.id;
+
+        // nothing is in flight, the socket is closed without suspending
+        std::future::poll_fn(|cx| {
+            let mut fut = pin!(ctl.shutdown(false));
+            assert!(matches!(
+                fut.as_mut().poll(cx),
+                std::task::Poll::Ready(Ok(()))
+            ));
+            std::task::Poll::Ready(())
+        })
+        .await;
+        ctl.shutdown(false).await.unwrap();
+
+        ctl.read();
+        ctl.write();
+        assert!(!ops.0.with(|st| st.streams[id].ops.read().is_pending()));
+        assert_closed(raw, &mut peer);
+
+        drop(ctl);
+        drop(io);
+    }
+
+    /// A send that fails right away drops its pages and reports the error.
+    #[ntex::test]
+    async fn send_to_reset_peer_reports_error() {
+        let reactor = Reactor::new().unwrap();
+        let (io, ctl, ops, raw, peer) = registered(&reactor);
+        let addr = peer.peer_addr().unwrap().into();
+        Socket::from(peer)
+            .set_linger(Some(std::time::Duration::ZERO))
+            .unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(100));
+
+        io.encode(
+            ntex::util::Bytes::from_static(b"data"),
+            &ntex::codec::BytesCodec,
+        )
+        .unwrap();
+        ctl.write();
+
+        let err = ntex::time::timeout(ntex::time::Seconds(5), io.flush(true))
+            .await
+            .expect("send error not reported")
+            .unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::ConnectionReset);
+        assert!(!ops.0.with(|st| st.streams[ctl.id].ops.write().is_pending()));
+        assert_eq!(ops.0.with(|st| st.streams[ctl.id].ops.write().unsent()), 0);
+
+        cleanup(&ops);
+        assert!(!is_ours(raw, &addr));
+        drop(ctl);
+        drop(io);
+    }
+
+    /// Dequeues a completion from the reactor's port, waiting up to `timeout`
+    /// milliseconds. The kernel writes the result into the `OVERLAPPED` only
+    /// once its completion is dequeued, so its status cannot be polled.
+    fn dequeue(reactor: &Reactor, timeout: u32) -> Option<*mut Overlapped> {
+        let mut entry = OVERLAPPED_ENTRY::default();
+        let mut count = 0;
+        let res = unsafe {
+            GetQueuedCompletionStatusEx(
+                reactor.as_raw_handle().cast(),
+                &raw mut entry,
+                1,
+                &raw mut count,
+                timeout,
+                0,
+            )
+        };
+        (res != 0 && count == 1).then_some(entry.lpOverlapped.cast())
+    }
+
+    fn rd_optr(ops: &StreamOps, id: usize) -> *mut Overlapped {
+        ops.0
+            .with(|st| st.streams[id].ops.read_overlapped().cast::<Overlapped>())
+    }
+
+    /// A pause leaves the zero-byte recv in flight, cancelling it would cost a
+    /// syscall and a completion on every pause.
+    #[ntex::test]
+    async fn pause_keeps_recv_in_flight() {
+        let reactor = Reactor::new().unwrap();
+        let (io, ctl, ops, raw, mut peer) = registered(&reactor);
+        let id = ctl.id;
+        ctl.read();
+        assert!(ops.0.with(|st| st.streams[id].ops.read().is_pending()));
+
+        ctl.pause();
+        assert!(ops.0.with(|st| st.streams[id].ops.read().is_pending()));
+        assert_eq!(dequeue(&reactor, 50), None, "pause cancelled recv");
+
+        // resuming finds the recv still in flight and issues no other
+        ctl.read();
+        assert!(ops.0.with(|st| st.streams[id].ops.read().is_pending()));
+        assert_eq!(dequeue(&reactor, 50), None, "resume completed recv");
+
+        cleanup(&ops);
+        assert_closed(raw, &mut peer);
+        drop(ctl);
+        drop(io);
+    }
+
+    /// A recv that completes during a pause does not read, the input stays in
+    /// the socket until reading resumes.
+    #[ntex::test]
+    async fn recv_completed_while_paused_reads_on_resume() {
+        let reactor = Reactor::new().unwrap();
+        let (io, ctl, ops, raw, mut peer) = registered(&reactor);
+        let id = ctl.id;
+        ctl.read();
+        ctl.pause();
+
+        std::io::Write::write_all(&mut peer, b"hello").unwrap();
+        let optr = rd_optr(&ops, id);
+        assert_eq!(dequeue(&reactor, 5000), Some(optr), "recv not completed");
+        StreamOpsHandler {
+            inner: ops.0.clone(),
+        }
+        .completed(ops::RD_OP, Ok(0), optr);
+        assert!(
+            !ops.0.with(|st| st.streams[id].ops.read().is_pending()),
+            "recv re-armed while paused"
+        );
+        assert!(io.with_read_dst(|buf| buf.is_empty()), "read while paused");
+
+        ctl.read();
+        assert_eq!(
+            io.with_read_dst(|buf| buf.split_to(buf.len())),
+            b"hello".as_ref()
+        );
+        assert!(
+            ops.0.with(|st| st.streams[id].ops.read().is_pending()),
+            "no recv waits for more input"
+        );
+
+        cleanup(&ops);
+        assert_closed(raw, &mut peer);
+        drop(ctl);
+        drop(io);
+    }
+
+    /// A cancelled recv of a stream that is not paused resumes reading, so
+    /// input that arrived meanwhile is not left unread.
+    #[ntex::test]
+    async fn cancelled_recv_resumes_reading() {
+        let reactor = Reactor::new().unwrap();
+        let (io, ctl, ops, raw, mut peer) = registered(&reactor);
+        let id = ctl.id;
+        ops.0
+            .with(|st| st.streams[id].ops.read_mut().fake_pending());
+        std::io::Write::write_all(&mut peer, b"hello").unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(100));
+
+        complete_aborted_recv(&ops, id);
+        assert_eq!(
+            io.with_read_dst(|buf| buf.split_to(buf.len())),
+            b"hello".as_ref()
+        );
+        assert!(
+            ops.0.with(|st| st.streams[id].ops.read().is_pending()),
+            "no recv waits for more input"
+        );
+
+        cleanup(&ops);
+        assert_closed(raw, &mut peer);
+        drop(ctl);
+        drop(io);
+    }
+
+    /// A socket left in blocking mode is only read once the kernel reported
+    /// input, so a read never blocks the reactor.
+    #[ntex::test]
+    async fn blocking_socket_is_read_after_readiness() {
+        let reactor = Reactor::new().unwrap();
+        let (io, ctl, ops, raw, mut peer) = registered(&reactor);
+        let id = ctl.id;
+        ops.0
+            .with(|st| st.streams[id].ops.read_mut().fake_blocking());
+        {
+            let s = mem::ManuallyDrop::new(unsafe { Socket::from_raw_socket(raw as _) });
+            s.set_nonblocking(false).unwrap();
+            // a recv issued without input fails after this instead of hanging
+            s.set_read_timeout(Some(std::time::Duration::from_secs(2)))
+                .unwrap();
+        }
+
+        let start = std::time::Instant::now();
+        ctl.read();
+        assert!(
+            start.elapsed() < std::time::Duration::from_secs(1),
+            "read blocked without input"
+        );
+        assert!(
+            ops.0.with(|st| st.streams[id].ops.read().is_pending()),
+            "no recv waits for input"
+        );
+
+        // the recv reports the input, the kernel is done with the operation
+        // once the input has arrived
+        std::io::Write::write_all(&mut peer, b"hello").unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(100));
+        StreamOpsHandler {
+            inner: ops.0.clone(),
+        }
+        .completed(
+            ops::RD_OP,
+            Ok(0),
+            ops.0
+                .with(|st| st.streams[id].ops.read_overlapped().cast::<Overlapped>()),
+        );
+        assert_eq!(
+            io.with_read_dst(|buf| buf.split_to(buf.len())),
+            b"hello".as_ref()
+        );
+        assert!(
+            ops.0.with(|st| st.streams[id].ops.read().is_pending()),
+            "no recv waits for more input"
+        );
+
+        cleanup(&ops);
+        assert_closed(raw, &mut peer);
+        drop(ctl);
+        drop(io);
+    }
+
+    /// Dequeues the next socket state notification from the reactor's port,
+    /// waiting up to `timeout` milliseconds, and delivers it like the reactor
+    /// does. Returns `false` if none arrived.
+    fn deliver_notification(reactor: &Reactor, ops: &StreamOps, timeout: u32) -> bool {
+        let mut entry = OVERLAPPED_ENTRY::default();
+        let mut count = 0;
+        let res = unsafe {
+            GetQueuedCompletionStatusEx(
+                reactor.as_raw_handle().cast(),
+                &raw mut entry,
+                1,
+                &raw mut count,
+                timeout,
+                0,
+            )
+        };
+        if res == 0 || count != 1 {
+            return false;
+        }
+        let (_, id) = super::super::reactor::decode_notify_key(entry.lpCompletionKey)
+            .expect("not a socket state notification");
+        StreamOpsHandler {
+            inner: ops.0.clone(),
+        }
+        .notified(id, entry.dwNumberOfBytesTransferred);
+        true
+    }
+
+    /// A notified stream waits for input without a recv in flight, so it holds
+    /// no read buffer and leaves nothing for the close to cancel.
+    #[ntex::test]
+    async fn notified_idle_stream_has_no_recv_in_flight() {
+        let reactor = Reactor::new().unwrap();
+        let Some((io, ctl, ops, raw, mut peer)) = registered_notify(&reactor) else {
+            return;
+        };
+        let page = io.cfg().read_size_min();
+        let buf = BytesMut::with_page_size(page);
+        let ptr = buf.as_ptr();
+        drop(buf);
+
+        ctl.read();
+        assert!(!ops.0.with(|st| st.streams[ctl.id].ops.read().is_pending()));
+        let buf = BytesMut::with_page_size(page);
+        assert_eq!(buf.as_ptr(), ptr, "idle stream took a read buffer");
+        drop(buf);
+
+        // nothing to cancel, the close does not suspend
+        std::future::poll_fn(|cx| {
+            let mut fut = pin!(ctl.shutdown(false));
+            assert!(matches!(
+                fut.as_mut().poll(cx),
+                std::task::Poll::Ready(Ok(()))
+            ));
+            std::task::Poll::Ready(())
+        })
+        .await;
+        assert_closed(raw, &mut peer);
+
+        drop(ctl);
+        drop(io);
+    }
+
+    /// Available input is read in place, input that arrives later is read
+    /// once its notification is delivered.
+    #[ntex::test]
+    async fn notification_reads_new_input() {
+        let reactor = Reactor::new().unwrap();
+        let Some((io, ctl, ops, raw, mut peer)) = registered_notify(&reactor) else {
+            return;
+        };
+        std::io::Write::write_all(&mut peer, b"hello").unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(100));
+
+        ctl.read();
+        assert_eq!(
+            io.with_read_dst(|buf| buf.split_to(buf.len())),
+            b"hello".as_ref()
+        );
+        // the input present at registration may have raised a notification
+        while deliver_notification(&reactor, &ops, 50) {}
+
+        std::io::Write::write_all(&mut peer, b"world").unwrap();
+        assert!(
+            deliver_notification(&reactor, &ops, 5000),
+            "no notification for new input"
+        );
+        assert_eq!(
+            io.with_read_dst(|buf| buf.split_to(buf.len())),
+            b"world".as_ref()
+        );
+
+        // input queued along with the peer's close is read up to the eof
+        std::io::Write::write_all(&mut peer, b"bye").unwrap();
+        peer.shutdown(std::net::Shutdown::Write).unwrap();
+        assert!(deliver_notification(&reactor, &ops, 5000));
+        while deliver_notification(&reactor, &ops, 100) {}
+        assert_eq!(
+            io.with_read_dst(|buf| buf.split_to(buf.len())),
+            b"bye".as_ref()
+        );
+        assert!(io.is_read_eof(), "eof queued with the input not read");
+
+        cleanup(&ops);
+        assert_closed(raw, &mut peer);
+        drop(ctl);
+        drop(io);
+    }
+
+    /// A notification that arrives during a pause does not read, the input
+    /// stays in the socket until reading resumes.
+    #[ntex::test]
+    async fn notification_while_paused_reads_on_resume() {
+        let reactor = Reactor::new().unwrap();
+        let Some((io, ctl, ops, raw, mut peer)) = registered_notify(&reactor) else {
+            return;
+        };
+        ctl.read();
+        ctl.pause();
+
+        std::io::Write::write_all(&mut peer, b"hello").unwrap();
+        assert!(deliver_notification(&reactor, &ops, 5000));
+        assert!(io.with_read_dst(|buf| buf.is_empty()), "read while paused");
+
+        ctl.read();
+        assert_eq!(
+            io.with_read_dst(|buf| buf.split_to(buf.len())),
+            b"hello".as_ref()
+        );
+
+        cleanup(&ops);
+        assert_closed(raw, &mut peer);
+        drop(ctl);
+        drop(io);
+    }
+
+    /// Once reading stops at the read back-pressure, notifications do not
+    /// read further until the io layer resumes reading.
+    #[ntex::test]
+    async fn notification_respects_read_backpressure() {
+        let reactor = Reactor::new().unwrap();
+        let Some((io, ctl, ops, raw, mut peer)) = registered_notify(&reactor) else {
+            return;
+        };
+        let limit = io.cfg().read_backpressure();
+        let chunk = [1u8; 1022];
+        ctl.read();
+
+        let mut size = 0;
+        while size < limit {
+            std::io::Write::write_all(&mut peer, &chunk).unwrap();
+            assert!(deliver_notification(&reactor, &ops, 5000));
+            size = io.with_read_dst(|buf| buf.len());
+        }
+
+        // the stream is at the back-pressure, further input stays unread. The
+        // socket is not drained, so the writes raise one edge at most.
+        for _ in 0..8 {
+            std::io::Write::write_all(&mut peer, &chunk).unwrap();
+            while deliver_notification(&reactor, &ops, 100) {}
+        }
+        assert_eq!(
+            io.with_read_dst(|buf| buf.len()),
+            size,
+            "read past the back-pressure"
+        );
+
+        // resuming reads the queued input
+        io.with_read_dst(ntex_bytes::BytesMut::clear);
+        ctl.read();
+        assert!(
+            !io.with_read_dst(|buf| buf.is_empty()),
+            "resume did not read"
+        );
+
+        cleanup(&ops);
+        assert_closed(raw, &mut peer);
+        drop(ctl);
+        drop(io);
+    }
+
+    /// A send that completes without writing anything fails the connection,
+    /// retrying it would spin.
+    #[ntex::test]
+    async fn zero_byte_send_completion_is_write_zero() {
+        let reactor = Reactor::new().unwrap();
+        let (io, ctl, ops, raw, mut peer) = registered(&reactor);
+        let id = ctl.id;
+        ops.0
+            .with(|st| st.streams[id].ops.write_mut().fake_pending());
+
+        StreamOpsHandler {
+            inner: ops.0.clone(),
+        }
+        .completed(
+            ops::WR_OP,
+            Ok(0),
+            ops.0
+                .with(|st| st.streams[id].ops.write_overlapped().cast::<Overlapped>()),
+        );
+        let err = ntex::time::timeout(ntex::time::Seconds(5), io.flush(true))
+            .await
+            .expect("send error not reported")
+            .unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::WriteZero);
+
+        cleanup(&ops);
+        assert_closed(raw, &mut peer);
+        drop(ctl);
+        drop(io);
+    }
+
+    /// Handles completions until `done` returns `true` and no send is in
+    /// flight.
+    async fn drive_sends(reactor: &Reactor, ops: &StreamOps, id: usize, done: impl Fn() -> bool) {
+        for _ in 0..500 {
+            reactor.dispatch(0);
+            if done() && !ops.0.with(|st| st.streams[id].ops.write().is_pending()) {
+                return;
+            }
+            ntex::time::sleep(ntex::time::Millis(10)).await;
+        }
+        panic!("output not sent");
+    }
+
+    /// The rest of a partly completed send goes out before newer output.
+    #[ntex::test]
+    async fn partial_send_is_resent_before_newer_output() {
+        let reactor = Reactor::new().unwrap();
+        let (io, ctl, ops, raw, mut peer) = registered(&reactor);
+        let id = ctl.id;
+        ops.0.with(|st| {
+            st.streams[id]
+                .ops
+                .write_mut()
+                .fake_pending_with(&[b"hello ", b"world"]);
+        });
+        io.encode_slice(b"!!").unwrap();
+
+        StreamOpsHandler {
+            inner: ops.0.clone(),
+        }
+        .completed(
+            ops::WR_OP,
+            Ok(3),
+            ops.0
+                .with(|st| st.streams[id].ops.write_overlapped().cast::<Overlapped>()),
+        );
+        let mut buf = [0u8; 10];
+        std::io::Read::read_exact(&mut peer, &mut buf).unwrap();
+        assert_eq!(&buf, b"lo world!!");
+        drive_sends(&reactor, &ops, id, || true).await;
+        assert_eq!(ops.0.with(|st| st.streams[id].ops.write().unsent()), 0);
+
+        cleanup(&ops);
+        assert_closed(raw, &mut peer);
+        drop(ctl);
+        drop(io);
+    }
+
+    /// Output in more pages and bytes than one send takes is sent in order.
+    #[ntex::test]
+    async fn large_output_is_sent_in_order() {
+        const PAGE: usize = 5000;
+        const PAGES: usize = 100;
+
+        let reactor = Reactor::new().unwrap();
+        let (io, ctl, ops, raw, mut peer) = registered(&reactor);
+        let id = ctl.id;
+        let data: Vec<u8> = (0..PAGE * PAGES)
+            .map(|i| u8::try_from((i / PAGE + i % 251) % 256).unwrap())
+            .collect();
+        // output over 4 KiB is added as a separate page
+        for chunk in data.chunks(PAGE) {
+            io.encode_bytes(ntex::util::Bytes::copy_from_slice(chunk))
+                .unwrap();
+        }
+
+        let reader = std::thread::spawn(move || {
+            let mut buf = vec![0; PAGE * PAGES];
+            std::io::Read::read_exact(&mut peer, &mut buf).unwrap();
+            (peer, buf)
+        });
+        ctl.write();
+        drive_sends(&reactor, &ops, id, || reader.is_finished()).await;
+        let (mut peer, received) = reader.join().unwrap();
+        assert!(received == data, "output reordered");
+        assert_eq!(ops.0.with(|st| st.streams[id].ops.write().unsent()), 0);
+
+        cleanup(&ops);
+        assert_closed(raw, &mut peer);
+        drop(ctl);
+        drop(io);
+    }
+}

@@ -1,11 +1,37 @@
-//! ntex - framework for composable network services
+//! A framework for composable network services.
 //!
-//! ## Package feature
+//! ntex provides a single-threaded service framework, HTTP client and server
+//! implementations, a web application framework, and WebSocket support.
 //!
-//! * `openssl` - enables ssl support via `openssl` crate
-//! * `rustls` - enables ssl support via `rustls` crate
-//! * `compress` - enables compression support in http and web modules
-//! * `cookie` - enables cookie support in http and web modules
+//! The most commonly used entry points are:
+//!
+//! - [`web`] for HTTP applications and servers
+//! - [`client`] for outgoing HTTP requests
+//! - [`http`] for lower-level HTTP services and message types
+//! - [`service`](mod@service) for composing services and middleware
+//! - [`ws`] for WebSocket protocol support (enabled by the `ws` feature)
+//!
+//! ## Runtime selection
+//!
+//! ntex uses its native Neon runtime by default. Enable `tokio` or `compio` to
+//! use the corresponding runtime backend. The `neon-polling` and `neon-uring`
+//! features select a specific native I/O reactor, Windows always uses IOCP.
+//!
+//! ## Crate features
+//!
+//! - `tokio` selects the Tokio runtime backend.
+//! - `compio` selects the Compio runtime backend.
+//! - `neon-polling` and `neon-uring` select the Neon runtime with the polling
+//!   reactor on Unix or the io-uring reactor on Linux.
+//! - `ws` (default) enables WebSocket support.
+//! - `openssl` enables TLS support through OpenSSL.
+//! - `rustls` enables TLS support through rustls.
+//! - `compress` enables HTTP content compression and decompression (gzip,
+//!   deflate and zstd).
+//! - `cookie` enables HTTP cookie support.
+//! - `no-test-logging` disables automatic logging configuration in
+//!   [`test`](macro@test).
+//! - `trace` enables additional trace-level logging.
 #![deny(clippy::pedantic)]
 #![allow(
     type_alias_bounds,
@@ -16,7 +42,8 @@
     clippy::missing_panics_doc,
     clippy::must_use_candidate,
     clippy::too_many_lines,
-    clippy::type_complexity
+    clippy::type_complexity,
+    clippy::unused_async_trait_impl
 )]
 // Used for fake variadics
 #![cfg_attr(any(docsrs, docsrs_dep), feature(rustdoc_internals))]
@@ -27,7 +54,7 @@ pub use ntex_macros::{rt_main as main, rt_test as test};
 #[cfg(test)]
 pub(crate) use ntex_macros::rt_test_internal as rt_test;
 
-pub use ntex_service::{forward_poll, forward_ready, forward_shutdown};
+pub use ntex_service::{forward_bind, forward_pl_bind, forward_ready, forward_shutdown};
 
 pub mod client;
 pub mod http;
@@ -36,10 +63,14 @@ pub mod web;
 #[cfg(feature = "ws")]
 pub mod ws;
 
+pub use urly as url;
+
 pub use self::service::{
-    IntoService, IntoServiceFactory, Middleware, Pipeline, Service, ServiceCtx,
-    ServiceFactory, cfg::Cfg, cfg::SharedCfg, chain, chain_factory, fn_service,
+    BindCtx, Ctx, IntoService, IntoServiceFactory, Middleware, Service, ServiceFactory, cfg::Cfg,
+    cfg::SharedCfg, factory, fn_service, pipeline::Pipeline, pipeline::PipelineBinding,
+    pipeline::PipelineFactory, service,
 };
+pub use ntex_error::Error;
 
 pub use ntex_util::{channel, task};
 
@@ -49,16 +80,18 @@ pub mod codec {
 }
 
 pub mod connect {
-    //! Tcp connector service
+    //! TCP connector services.
     pub use ntex_net::connect::*;
 
     #[cfg(feature = "openssl")]
     pub mod openssl {
+        //! TLS connector support through OpenSSL.
         pub use ntex_tls::openssl::*;
     }
 
     #[cfg(feature = "rustls")]
     pub mod rustls {
+        //! TLS connector support through rustls.
         pub use ntex_tls::rustls::*;
     }
 }
@@ -69,27 +102,28 @@ pub mod router {
 }
 
 pub mod rt {
-    //! A runtime implementation that runs everything on the current thread.
+    //! Runtime APIs for running tasks on the current thread.
     pub use ntex_rt::*;
 
     pub use ntex_net::*;
 }
 
 pub mod service {
+    //! Service, service factory, and middleware abstractions.
     pub use ntex_service::*;
 }
 
 pub mod server {
-    //! General purpose tcp server
+    //! General-purpose TCP server APIs.
     pub use ntex_server::net::*;
-
-    pub use ntex_server::{Signal, signal};
 
     #[cfg(feature = "openssl")]
     pub use ntex_tls::openssl;
 
     #[cfg(feature = "rustls")]
     pub use ntex_tls::rustls;
+
+    pub use ntex_tls::{TlsConfig, TlsError};
 }
 
 pub mod time {
@@ -114,19 +148,21 @@ pub mod tls {
 }
 
 pub mod error {
+    //! Error types and helpers.
     pub use ntex_error::*;
 }
 
 pub mod util {
-    use std::{error::Error, io, rc::Rc};
-
+    //! Common byte, collection, future, and service utilities.
     pub use ntex_bytes::{Buf, BufMut, ByteString, Bytes, BytesMut};
     pub use ntex_bytes::{BytePage, BytePageSize, BytePages};
-    pub use ntex_util::{HashMap, HashSet, future::*, services::*};
-
-    #[doc(hidden)]
-    #[allow(deprecated)]
-    pub use ntex_util::error::*;
+    #[cfg(feature = "tracker")]
+    pub use ntex_bytes::{BytesTracker, BytesTrackerSnapshot};
+    pub use ntex_error::{ErrorMessage, ErrorMessageChained, fmt_err, fmt_err_string};
+    pub use ntex_util::{
+        Equivalent, HashMap, HashRandomState, HashSet, clone_io_error, dyn_err, dyn_rc_err,
+        future::*, hash_map, hash_set, services::*, str_rc_err,
+    };
 
     #[doc(hidden)]
     pub fn enable_test_logging() {
@@ -139,21 +175,5 @@ pub mod util {
             }
             let _ = env_logger::builder().is_test(true).try_init();
         }
-    }
-
-    pub fn dyn_rc_error<T: Error + 'static>(err: T) -> Rc<dyn Error> {
-        Rc::new(err)
-    }
-
-    pub fn str_rc_error(s: String) -> Rc<dyn Error> {
-        #[derive(thiserror::Error, Debug)]
-        #[error("{_0}")]
-        struct StringError(String);
-
-        Rc::new(StringError(s))
-    }
-
-    pub fn clone_io_error(err: &io::Error) -> io::Error {
-        io::Error::new(err.kind(), format!("{err:?}"))
     }
 }
